@@ -47,9 +47,11 @@ Written once, byte-identical on both platforms:
 - **AROS 68k** ROM pair on both; resolve P96-vs-HIDD; AROS joins the CI gate.
 - **Exit:** both platforms usable as KVM guests on real hardware; `pci.library` validated against physical devices; AROS boots.
 
-## Phase 5 — Bare metal (large)
+## Phase 5 — Standalone machine (large)
 
-In order of effort and reuse:
+**Fork in the road, decided at entry — see `adr-0001-bare-metal-vs-linux-host.md`.** This phase was originally specified as bare metal on the assumption that the CPU core would build `no_std`. Phase 0 found it does not today, and also found the gap to be roughly a day or two of mechanical work rather than a wall. So the phase opens with a choice between owning the board's drivers (bare metal, below) and borrowing them (a minimal Linux as the hardware layer, the Amithlon model, which deletes most of this phase and collapses Phase 4's KVM stage). The Phase 4 measurements decide it, alongside the Emu68-variant question. Everything in Phases 0–4 is identical either way.
+
+If bare metal, in order of effort and reuse:
 
 1. **x86 UEFI payload** — smallest step (GOP free, ACPI parsing, NVMe + xHCI from the Redox quarry); proves the whole stack on metal; the target most people can try. *"Basically usable" met for x86.*
 2. **RK3588 (the Rock 5B)** — U-Boot-derived UART/MMC/GIC/PCIe-RC bring-up; virtio-compatible host backends first, native after. *"Basically usable" met for ARM.*
@@ -68,7 +70,7 @@ In order of effort and reuse:
 ## Why this order
 
 - One host means Phases 1–3 are ~100 % shared minus two thin harness layers; both platforms advance in lockstep for the cost of one.
-- Hardware risk is front-loaded where cheap (Phase 0 checks, Phase 4 KVM) and deferred where expensive (bare metal last, after every driver already works under KVM).
+- Hardware risk is front-loaded where cheap (Phase 0 checks, Phase 4 KVM) and deferred where expensive (bare metal last, after every driver already works under KVM) — late enough that Phase 5 can still choose not to own the board drivers at all.
 - The performance question that motivated the old two-host design is answered with measurements at Phase 4, not assumptions at Phase 0 — the Emu68 variant is built only if the numbers demand it.
 - The Prometheus conformance rig lands on x86/KVM before any bare metal, so real-Amiga-usable PCI drivers don't wait on either port.
 - Every phase exit is a CI-checkable state; Copperline (chipset/blitter) and Emu68-based systems (independent CPU) remain the two oracles.

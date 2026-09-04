@@ -24,6 +24,12 @@ instruction through `m68k-rs`. Rock 5B hardware pre-checks are tracked in
 
 Nothing here boots a real ROM yet. That starts at Phase 1.
 
+One open architectural question came out of Phase 0 and is recorded in
+`docs/adr-0001-bare-metal-vs-linux-host.md`: whether the Phase 5 endgame
+is bare metal (owning each board's drivers) or a minimal Linux as the
+hardware layer (borrowing them, the Amithlon model). Phases 0–4 are
+identical either way, so the decision waits for the Phase 4 measurements.
+
 ## Workspace layout
 
 | Path | What |

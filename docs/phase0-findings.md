@@ -10,7 +10,10 @@ It does not hold today.
 `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/m68k-0.12.1`) for
 `aarch64-unknown-none`, the target the bare-metal board layers need.
 
-**Result:** the build fails with **1,735 errors**. Causes:
+**Result:** the build fails with **1,735 errors**. That number is
+misleading and is corrected below — it is cascading fallout from the
+missing `#![no_std]` attribute, not a measure of how entangled the crate
+is with `std`. Causes:
 
 - No `#![no_std]` attribute anywhere in the crate. The crate links `std`
   unconditionally; it is a hosted-only library as published.
@@ -63,6 +66,37 @@ automatic `cargo update`.
 --target aarch64-unknown-none` after temporarily adding `m68k` as a real
 dependency) whenever the pinned version changes, or periodically against
 the upstream `main` branch, to see whether `no_std` support has landed.
+
+### How big is the gap, actually? (measured, correcting the above)
+
+The 1,735-error figure sizes the *symptom*, not the work. Counting actual
+`std` references in the crate gives about 30, of which:
+
+- the majority — `std::mem::take`, `std::f64::consts::*`, `std::fmt`,
+  `std::cell`, `std::hash`, `std::sync::atomic` — exist verbatim in
+  `core` and are a find-and-replace;
+- one `std::collections::VecDeque` (`core/decode.rs`) is test-only;
+- two `std::sync::OnceLock` uses (`fpu/dd.rs`, `core/timing_060.rs`) need
+  a `no_std` once-cell or a `const` table;
+- one `std::env::var_os` diagnostic hook (`core/cpu.rs`) needs
+  `cfg`-gating;
+- roughly 20 `f64` transcendental/rounding calls in the FPU
+  (`sin`, `cos`, `sqrt`, `powf`, `floor`, `ceil`, `round`, `trunc`,
+  `sinh`, `cosh`, `tanh`, `atan`, `log10`) are the one real chunk: these
+  are not in `core` and need `libm`;
+- the `std::sync::{Arc, Mutex}` uses are confined to `core/trace_jit.rs`,
+  which is the Cranelift JIT — already `std`-only, already feature-gated,
+  and out of scope for a `no_std` interpreter.
+
+So converting the **interpreter** (not the JIT) to `no_std` + `alloc` +
+`libm` is on the order of a day or two of mechanical work, and it is
+upstreamable — Copperline and the planned vamos successor consume the
+same crate.
+
+**Consequence for the roadmap:** bare metal is gated by a chore, not a
+wall. That changes the Phase 5 calculus enough to be worth recording
+separately; see `adr-0001-bare-metal-vs-linux-host.md`, which weighs
+doing this conversion against not needing it at all.
 
 ## Skeleton `AddressBus` / hello-world guest instruction
 
