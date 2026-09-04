@@ -65,9 +65,10 @@ fn screenshot_path(name: &str) -> std::path::PathBuf {
 /// The most common RGBA pixel in `rgba` (4-byte chunks). *Not* pixel
 /// `(0,0)`: `screenshot.rs`'s `frame_stats` doc comment explains why a
 /// first attempt at this used the top-left pixel and got it backwards on
-/// a real Kickstart capture (its mouse pointer's hot spot lands exactly
-/// at `(0,0)` in this machine's DIW-relative coordinates). The dominant
-/// colour by pixel count is what "background" actually means here.
+/// a real Kickstart capture -- a since-fixed sprite-rendering bug drew a
+/// bogus shape with its corner exactly at `(0,0)` in this machine's
+/// DIW-relative coordinates. The dominant colour by pixel count is what
+/// "background" actually means here.
 fn dominant_pixel(rgba: &[u8]) -> [u8; 4] {
     let mut counts: std::collections::HashMap<[u8; 4], usize> = std::collections::HashMap::new();
     for px in rgba.chunks(4) {
@@ -208,22 +209,35 @@ fn kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger() {
 /// proposal §8.1) from a real ROM and check something meaningful and
 /// stable about the result, not just that the runner didn't crash.
 ///
-/// Kickstart 3.2.2 reaches its "insert a system disk" boot alert with no
-/// boot device present (this machine has no MIRAGE storage yet -- roadmap
-/// Phase 3): register inspection (`--inspect`'s `display state` line, see
-/// this crate's own manual investigation) shows a real, non-zero
-/// `COP1LC`, so the renderer is walking an actual copper list, not an
-/// empty one. This asserts the rendered frame has genuine non-background
-/// content -- a real mouse-pointer/icon picture, not a flat fill -- which
-/// is the first time anything in this project has confirmed the renderer
-/// draws real guest-programmed geometry rather than only synthetic test
-/// bitmaps (`render.rs`'s own unit tests). `--screenshot-frame 200` is
-/// comfortably clear of `--max-frames 250`'s boundary (see this file's
-/// AROS screenshot test for why that matters: a capture taken right at
-/// the run's own final frame can observe a register mid-write).
+/// **Corrected finding** (this test originally asserted the opposite --
+/// see the git history and `docs/screenshots.md` for the full account).
+/// `--inspect`'s `display state` line shows a real, non-zero `COP1LC`
+/// (`0x1910`), but `BPLCON0`'s plane-count field is 0 and `BPL1PT` is
+/// null: Kickstart has started a copper list but never enabled any
+/// bitplane DMA, because this machine has no boot device yet (no MIRAGE
+/// storage -- roadmap Phase 3) and `intuition.library` never opens a
+/// real screen. A first attempt at this test found what looked like real
+/// content -- a mouse pointer followed by ~239 rows of unrelated
+/// glyph-like noise -- but that was a renderer bug, not guest output:
+/// `draw_sprite0` was reading sprite 0's height from the chipset's
+/// `SPR0CTL` register, which this ROM's copper list never writes (real
+/// hardware's sprite DMA loads it autonomously from the sprite list in
+/// chip RAM instead), so it read back a stale, unrelated value that
+/// decoded to a ~255-line sprite instead of the real header's decoded
+/// zero-height (disabled) sprite. Fixed in `render.rs`'s `draw_sprite0`
+/// (reads the position/control header from `SPR0PT`/`SPR0PT+2` in chip
+/// RAM, matching real sprite-DMA fetch semantics) and pinned by
+/// `render.rs`'s own
+/// `sprite_height_comes_from_the_real_header_in_ram_not_the_stale_ctl_register`
+/// unit test. With that fixed, this ROM's captured frame is a uniform
+/// fill -- genuinely nothing on screen, the same conclusion the AROS test
+/// below reaches for the same underlying reason (no boot device).
+/// `--screenshot-frame 200` is comfortably clear of `--max-frames 250`'s
+/// boundary (see the AROS test for why that matters: a capture taken
+/// right at the run's own final frame can observe a register mid-write).
 #[test]
 #[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
-fn kickstart_3_2_2_a1200_screenshot_shows_real_content() {
+fn kickstart_3_2_2_a1200_screenshot_is_a_flat_fill_pending_mirage_storage() {
     if !Path::new(KICKSTART_A1200).exists() {
         eprintln!("SKIP: {KICKSTART_A1200} not present");
         return;
@@ -261,23 +275,11 @@ fn kickstart_3_2_2_a1200_screenshot_shows_real_content() {
 
     let background = dominant_pixel(&rgba);
     let non_background = rgba.chunks(4).filter(|px| *px != background).count();
-    assert!(
-        non_background > 0,
-        "expected real content (mouse pointer / boot-alert icons) on top \
-         of the background fill, found none -- see this crate's \
-         `screenshot.rs` and the task report for how COP1LC/BPLCON0 were \
-         used to confirm the guest actually programmed a copper list"
-    );
-    // Real hardware never fills more than a small fraction of a 752x576
-    // canvas with a mouse pointer and a short icon list; a suspiciously
-    // large non-background count would indicate the renderer painted
-    // something wrong (e.g. background/foreground inverted) rather than
-    // the alert screen's actual small graphics.
-    assert!(
-        non_background < (width * height) as usize / 10,
-        "non-background pixel count ({non_background}) looks too large \
-         for a mouse pointer and a short icon list -- possible renderer \
-         regression, not the expected boot-alert content"
+    assert_eq!(
+        non_background, 0,
+        "expected a uniform fill: Kickstart has no bitplanes enabled and \
+         (after the sprite-height fix) no visible sprite 0 either at \
+         frame 200 -- see this test's doc comment"
     );
 }
 

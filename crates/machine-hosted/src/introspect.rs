@@ -535,11 +535,23 @@ pub fn format_report(report: &Report) -> String {
 /// this just reports them without walking the list, since a blank
 /// `cop1lc`/`bplcon0` already answers "did the guest program anything at
 /// all" without needing chip RAM.
+///
+/// **`SPR0PT` only, for the sprite**: `SPR0POS`/`SPR0CTL` are deliberately
+/// not printed here even though the chipset has them. A real Kickstart
+/// 3.2.2 capture during the sprite-height investigation this line was
+/// added for showed *why*: `render.rs`'s `draw_sprite0` reads the
+/// sprite's real position/control header from chip RAM at `SPR0PT`/
+/// `SPR0PT+2` (matching real sprite-DMA fetch semantics — see that
+/// function's doc comment), not from these two chipset registers, which
+/// this machine has no DMA engine to keep in sync with the sprite list
+/// and which for a standard pointer sprite are frequently stale and
+/// unrelated to it. Printing them here would invite exactly the
+/// mis-diagnosis that investigation started from.
 pub fn format_display_state(chipset: &Chipset) -> String {
     format!(
         "display state: COP1LC {:#010x}  BPLCON0 {:#06x}  BPLCON1 {:#06x}  \
          BPL1PT {:#010x}  DIWSTRT/STOP {:#06x}/{:#06x}  DDFSTRT/STOP {:#06x}/{:#06x}  \
-         COLOR00 {:#06x}",
+         COLOR00 {:#06x}  SPR0PT {:#010x}",
         chipset.cop1lc,
         chipset.bplcon0,
         chipset.bplcon1,
@@ -549,6 +561,7 @@ pub fn format_display_state(chipset: &Chipset) -> String {
         chipset.ddfstrt,
         chipset.ddfstop,
         chipset.color[0],
+        chipset.spr0pt,
     )
 }
 

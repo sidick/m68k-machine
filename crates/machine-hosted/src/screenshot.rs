@@ -122,13 +122,17 @@ impl DisplaySurface for PngSurface {
 /// common", not `COLOR00`/pixel `(0,0)`: a first attempt at this used
 /// `pixels[0]` on the assumption `Renderer::render`'s initial `fb.fill`
 /// (background colour) would still be showing there, but a real
-/// Kickstart capture disproved that -- its software mouse pointer's hot
-/// spot lands exactly at `(0,0)` in this machine's DIW-relative
-/// coordinates, so `pixels[0]` was the *foreground* colour, not the
-/// background, and inverted this stat entirely (432293/433152 "differ
-/// from background" for a picture that is actually 432293 pixels of flat
-/// fill and 859 of pointer/icon). The dominant colour by pixel count is
-/// robust to where on the canvas the content happens to land. Logged
+/// Kickstart capture disproved that -- a since-fixed `draw_sprite0` bug
+/// (it read sprite 0's height from a stale, unrelated chipset register
+/// instead of the sprite's real header in chip RAM -- see `render.rs`'s
+/// doc comment on that function) drew a bogus, oversized sprite shape
+/// with its top-left corner exactly at `(0,0)` in this machine's
+/// DIW-relative coordinates, so `pixels[0]` was that shape's colour, not
+/// the real background, and inverted this stat entirely (432293/433152
+/// "differ from background" for a picture that was actually 432293
+/// pixels of flat fill and 859 of the bogus shape). The dominant colour
+/// by pixel count is robust to where on the canvas any drawn content
+/// happens to land, real or (as that investigation found) not. Logged
 /// alongside every capture as the "did anything actually get drawn"
 /// evidence this task asks for, and asserted on by this crate's real-ROM
 /// regression test without that test needing its own PNG decoder.

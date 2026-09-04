@@ -108,9 +108,19 @@ struct CopperState {
     ddfstrt: u16,
     ddfstop: u16,
     color: [u16; 32],
+    /// Only the pointer is shadowed here, deliberately — see
+    /// [`draw_sprite0`]'s doc comment for why `SPR0POS`/`SPR0CTL` are
+    /// *not* latched into this state the way every other display
+    /// register is: this machine has no sprite DMA engine, so those two
+    /// registers are only ever whatever a `MOVE` last happened to leave
+    /// in them, which for a standard AmigaOS pointer sprite is nothing
+    /// at all (real hardware loads them autonomously from the memory
+    /// `spr0pt` already points at). Carrying them here anyway — as
+    /// `bplcon1`/`bplcon2` above are, "latched for completeness" — would
+    /// invite exactly the bug this struct's history already had: reading
+    /// a register that looks plausible but is unrelated to the sprite
+    /// list the guest actually programmed.
     spr0pt: u32,
-    spr0pos: u16,
-    spr0ctl: u16,
 }
 
 impl CopperState {
@@ -128,8 +138,6 @@ impl CopperState {
             ddfstop: chipset.ddfstop,
             color: chipset.color,
             spr0pt: chipset.spr0pt,
-            spr0pos: chipset.spr0pos,
-            spr0ctl: chipset.spr0ctl,
         }
     }
 
@@ -171,9 +179,12 @@ impl CopperState {
 
             reg::SPR0PTH => set_ptr_hi(&mut self.spr0pt, value),
             reg::SPR0PTL => set_ptr_lo(&mut self.spr0pt, value),
-            reg::SPR0POS => self.spr0pos = value,
-            reg::SPR0CTL => self.spr0ctl = value,
-
+            // SPR0POS/SPR0CTL: deliberately not shadowed -- see
+            // CopperState's doc comment on its `spr0pt` field and
+            // draw_sprite0's doc comment for why a MOVE to either lands
+            // nowhere here (matches how a MOVE to a register nobody is
+            // watching still "happens" but has no visible effect, per
+            // this fn's own doc comment above).
             _ => {}
         }
     }
@@ -444,23 +455,46 @@ fn draw_bitplanes(state: &CopperState, ram: &[u8], geom: &Geometry, fb: &mut Fra
 /// decode the identical bit layout): `VSTART`/`VSTOP` each take their low
 /// 8 bits from one register's high byte plus one more bit from `SPR0CTL`;
 /// `HSTART`'s low bit comes from `SPR0CTL` bit 0, the rest from
-/// `SPR0POS`'s low byte.
+/// `SPR0POS`'s low byte. **The two words this decode reads come from chip
+/// RAM at `SPR0PT`/`SPR0PT+2`, not from the chipset's own `SPR0POS`/
+/// `SPR0CTL` registers.** On real hardware those registers are not
+/// independently programmed for a standard AmigaOS pointer sprite at
+/// all: sprite DMA autonomously *loads* them from exactly these two
+/// words at the start of each frame, before fetching the image data that
+/// follows. This machine has no sprite DMA engine (proposal §7.1:
+/// `SPR*` is "latched; consumed by renderer", nothing fetches on its
+/// own), so the chipset's `SPR0POS`/`SPR0CTL` fields only ever hold
+/// whatever a `MOVE` happened to leave in them — for Kickstart 3.2.2's
+/// boot-alert pointer, observed to be nothing at all (`SPR0CTL` sits at
+/// a stale, unrelated CPU-written value, never touched by the copper
+/// list that sets up the pointer). An earlier version of this function
+/// read those chipset registers directly and got exactly that failure
+/// mode: `SPR0CTL`'s stale value decoded to a ~255-line `VSTOP`, so the
+/// real ~16-line pointer image was drawn correctly for its own rows and
+/// then kept going for another 239 rows into whatever chip RAM followed
+/// it. Reading the header from the same memory real hardware would have
+/// fetched it from is the fix, and also makes this function agree with
+/// itself: it was already reading the *image* data from `SPR0PT+4`
+/// onward, memory-relative, while reading the *position* from registers
+/// that need not correspond to that same memory at all.
 ///
 /// Image data is read directly from chip RAM at `SPR0PT+4` onward (the
-/// first two words at `SPR0PT` are the position/control header this
-/// renderer already has latched from the registers, so painting starts
-/// after them) rather than from the `SPR0DATA`/`SPR0DATB` latches, which
-/// only ever hold *one* line's worth on real hardware (whichever line
-/// DMA last fetched) — reading the image from memory is what lets a
-/// multi-line pointer shape render as more than its first row.
+/// first two words at `SPR0PT` are the position/control header decoded
+/// above, so painting starts after them) rather than from the
+/// `SPR0DATA`/`SPR0DATB` latches, which only ever hold *one* line's
+/// worth on real hardware (whichever line DMA last fetched) — reading
+/// the image from memory is what lets a multi-line pointer shape render
+/// as more than its first row.
 ///
 /// Colour index 0 is transparent (the background/bitplane pixel shows
 /// through); 1-3 index `COLOR17`-`COLOR19`, sprite pair 0/1's palette
 /// bank.
 fn draw_sprite0(state: &CopperState, ram: &[u8], geom: &Geometry, fb: &mut Framebuffer) {
-    let vstart = (state.spr0pos >> 8) as u32 | (((state.spr0ctl & 0x04) as u32) << 6);
-    let vstop = (state.spr0ctl >> 8) as u32 | (((state.spr0ctl & 0x02) as u32) << 7);
-    let hstart_raw = (((state.spr0pos & 0xFF) as u32) << 1) | ((state.spr0ctl & 0x01) as u32);
+    let pos_word = read_word(ram, state.spr0pt);
+    let ctl_word = read_word(ram, state.spr0pt.wrapping_add(2));
+    let vstart = (pos_word >> 8) as u32 | (((ctl_word & 0x04) as u32) << 6);
+    let vstop = (ctl_word >> 8) as u32 | (((ctl_word & 0x02) as u32) << 7);
+    let hstart_raw = (((pos_word & 0xFF) as u32) << 1) | ((ctl_word & 0x01) as u32);
 
     if vstop <= vstart {
         return;
@@ -843,20 +877,21 @@ mod tests {
     fn sprite0_composites_over_the_picture() {
         let mut ram = ram_with(4096);
         let sprpt = 0x0300u32;
-        // Header (position/control words) is skipped by the renderer --
-        // it reads position from SPR0POS/SPR0CTL, not from here -- but
-        // real memory layout has them anyway; leave zeroed.
+        // Header (position/control words) now lives in RAM, exactly
+        // where real sprite DMA would have fetched it from -- see
+        // draw_sprite0's doc comment on why this is no longer read from
+        // the chipset's SPR0POS/SPR0CTL registers. SPR0POS high byte is
+        // VSTART, low byte is HSTART8-1: $40 in the high byte gives
+        // vstart=$40 with hstart=0 (lands in-canvas for the 16-wide
+        // framebuffer below).
+        write_word(&mut ram, sprpt, 0x4000); // position word: vstart=$40
+        write_word(&mut ram, sprpt + 2, 0x4100); // control word: vstop=$41, height 1
         write_word(&mut ram, sprpt + 4, 0b1000_0000_0000_0000); // data A, pixel 0
         write_word(&mut ram, sprpt + 6, 0b1000_0000_0000_0000); // data B, pixel 0
                                                                 // -> pixel 0 colour index = 0b11 = 3 -> COLOR19.
 
         let mut chipset = Chipset::new();
         chipset.spr0pt = sprpt;
-        // SPR0POS high byte is VSTART, low byte is HSTART8-1: $40 in the
-        // high byte gives vstart=$40 with hstart=0 (lands in-canvas for
-        // the 16-wide framebuffer below).
-        chipset.spr0pos = 0x4000;
-        chipset.spr0ctl = 0x4100; // vstop high byte 0x41 -> vstop=0x41, height 1
         chipset.color[19] = 0x00F0; // green-ish
 
         let mut pixels = std::vec![0u32; 16 * 128];
@@ -864,7 +899,7 @@ mod tests {
 
         Renderer::new().render(&chipset, &ram, &mut fb);
 
-        let vstart = (chipset.spr0pos >> 8) as usize; // 0x40
+        let vstart = 0x40usize;
         assert_eq!(
             fb.pixels[vstart * 16],
             argb_from_amiga(0x00F0),
@@ -876,24 +911,85 @@ mod tests {
     fn sprite0_pixel_zero_is_transparent() {
         let mut ram = ram_with(4096);
         let sprpt = 0x0300u32;
+        write_word(&mut ram, sprpt, 0x0500); // position word: vstart=5, hstart=0
+        write_word(&mut ram, sprpt + 2, 0x0600); // control word: vstop=6, height 1
         write_word(&mut ram, sprpt + 4, 0x0000);
         write_word(&mut ram, sprpt + 6, 0x0000);
 
         let mut chipset = Chipset::new();
         chipset.spr0pt = sprpt;
-        chipset.spr0pos = 0x0500; // vstart=5, hstart=0 (lands in-canvas)
-        chipset.spr0ctl = 0x0600; // vstop=6, height 1
         chipset.color[0] = 0x0111; // background, distinguishable from black
 
         let mut pixels = std::vec![0u32; 16 * 32];
         let mut fb = Framebuffer::new(&mut pixels, 16, 32).unwrap();
         Renderer::new().render(&chipset, &ram, &mut fb);
 
-        let vstart = (chipset.spr0pos >> 8) as usize;
+        let vstart = 5usize;
         assert_eq!(
             fb.pixels[vstart * 16],
             argb_from_amiga(0x0111),
             "transparent sprite pixel leaves the background showing"
+        );
+    }
+
+    /// Regression test (Phase 2 real-ROM investigation): pins the
+    /// rendered sprite height to the sprite's *real* extent -- decoded
+    /// from the position/control words at `SPR0PT` in chip RAM, per
+    /// hardware's own sprite-DMA-fetch semantics -- rather than to
+    /// `MAX_SPRITE_LINES`, the renderer's hostile-input safety clamp. A
+    /// real Kickstart 3.2.2 A1200 boot-alert capture hit exactly this:
+    /// the chipset's `SPR0CTL` register held a stale, unrelated value
+    /// (`$FF00`, never written by the copper list that actually sets up
+    /// the pointer) that decoded to a ~255-line `VSTOP`, so the fix's
+    /// predecessor drew the real ~16-line pointer image correctly and
+    /// then kept going for another 239 rows into whatever chip RAM
+    /// happened to follow it -- capped only by `MAX_SPRITE_LINES`, not
+    /// by anything the guest actually programmed. This test's `SPR0CTL`
+    /// chipset register is deliberately left at exactly that kind of
+    /// implausible value while the *real* header in RAM describes a
+    /// genuine one-line sprite, so a regression back to reading the
+    /// chipset register would fail it.
+    #[test]
+    fn sprite_height_comes_from_the_real_header_in_ram_not_the_stale_ctl_register() {
+        let mut ram = ram_with(4096);
+        let sprpt = 0x0300u32;
+        // Real header: vstart=2, vstop=3 -- exactly one line.
+        write_word(&mut ram, sprpt, 0x0200);
+        write_word(&mut ram, sprpt + 2, 0x0300);
+        write_word(&mut ram, sprpt + 4, 0b1000_0000_0000_0000); // data A, pixel 0
+        write_word(&mut ram, sprpt + 6, 0x0000); // data B, pixel 0
+                                                 // -> pixel 0 colour index = 0b01 = 1 -> COLOR17.
+                                                 // A second, would-be data line just past the real one-line
+                                                 // sprite: must NOT be drawn if the fix reads height from the
+                                                 // real header rather than a stale, much taller SPR0CTL.
+        write_word(&mut ram, sprpt + 8, 0b1000_0000_0000_0000);
+        write_word(&mut ram, sprpt + 10, 0x0000);
+
+        let mut chipset = Chipset::new();
+        chipset.spr0pt = sprpt;
+        // Implausibly tall if it were ever (wrongly) used for height:
+        // vstop=$FF, far past the real header's vstop=3. Left set and
+        // never written by any copper MOVE in this test, matching the
+        // real boot capture's "stale register" finding exactly.
+        chipset.spr0ctl = 0xFF00;
+        chipset.color[0] = 0x0111; // background, distinguishable from black
+        chipset.color[17] = 0x0F0F; // sprite pixel colour
+
+        let mut pixels = std::vec![0u32; 16 * 32];
+        let mut fb = Framebuffer::new(&mut pixels, 16, 32).unwrap();
+        Renderer::new().render(&chipset, &ram, &mut fb);
+
+        assert_eq!(
+            fb.pixels[2 * 16],
+            argb_from_amiga(0x0F0F),
+            "line 2 (the real sprite's only line) must be drawn"
+        );
+        assert_eq!(
+            fb.pixels[3 * 16],
+            argb_from_amiga(0x0111),
+            "line 3 is past the real sprite's one-line height and must \
+             stay background, even though SPR0CTL alone would imply \
+             height 255"
         );
     }
 
@@ -928,9 +1024,11 @@ mod tests {
     fn wild_sprite_pointer_does_not_panic() {
         let ram = ram_with(16);
         let mut chipset = Chipset::new();
+        // The header itself is now read from RAM at this wild address
+        // (out of range -> reads back 0, per read_word/read_byte's
+        // open-bus-style fallback), so vstart=vstop=0 and draw_sprite0
+        // returns before touching anything else.
         chipset.spr0pt = 0xFFFF_0000;
-        chipset.spr0pos = 0x0000;
-        chipset.spr0ctl = 0xFF00; // vstart=0, vstop=0xFF: real height, all reads out of range
 
         let mut pixels = [0u32; 16 * 16];
         let mut fb = Framebuffer::new(&mut pixels, 16, 16).unwrap();
