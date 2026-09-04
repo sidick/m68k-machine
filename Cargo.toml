@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = ["crates/machine-core"]
+
+# Workspace layout note (Phase 0):
+#
+# `crates/machine-core` is the only workspace member today. It is a
+# dependency-free `#![no_std]` library and builds for every target the
+# project cares about (hosted, for its own test suite, and
+# aarch64-unknown-none, for the bare-metal board layers that will depend on
+# it).
+#
+# The board crates (`crates/board-qemu-virt` for aarch64 and
+# `crates/board-qemu-q35` for x86-64, added by other workers) will NOT be
+# ordinary workspace members with a shared `--target`: each board is a
+# separate bare-metal binary crate built with its own `--target` (and, for
+# the UEFI board, its own linker/runtime concerns) via `cargo build -p
+# board-qemu-virt --target aarch64-unknown-none` /
+# `cargo build -p board-qemu-q35 --target x86_64-unknown-uefi`. Per-crate
+# targets differ, and a single `cargo build --workspace` cannot target both
+# at once, so board crates should either:
+#   - be added as workspace members but always built with an explicit
+#     `--target` and `-p <crate>` (never via a bare `cargo build
+#     --workspace`), or
+#   - be excluded from `members` below and built as independent crates
+#     (own `[workspace]` or path dependency on `machine-core`) if the
+#     per-target linker/runtime setup makes shared-workspace builds
+#     impractical.
+# Whichever a given board crate needs, note it in that crate's own
+# Cargo.toml when it lands.
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"

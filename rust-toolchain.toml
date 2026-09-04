@@ -1,0 +1,8 @@
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+# aarch64-unknown-none: no_std bare-metal target for machine-core and the
+# eventual RK3588/Pi 5 board layers.
+# x86_64-unknown-uefi: bare-metal target for the eventual x86 UEFI board
+# layer.
+targets = ["aarch64-unknown-none", "x86_64-unknown-uefi"]

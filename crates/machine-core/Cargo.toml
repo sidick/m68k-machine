@@ -1,0 +1,22 @@
+[package]
+name = "machine-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "no_std machine core (address bus / memory map) for the m68k Machine project"
+publish = false
+
+[dependencies]
+# Intentionally empty: machine-core is a dependency-free #![no_std] crate.
+# The m68k crate (m68k-rs) is NOT a runtime dependency: as of 0.12.1 it has
+# no no_std support (unconditional `use std::` in several modules, see
+# docs/phase0-findings.md), so it can only be used hosted, in tests.
+
+[dev-dependencies]
+# Pinned exactly: single-author crate, no no_std support yet, and this
+# machine tracks its behaviour closely enough that an unplanned upstream
+# bump could silently change guest semantics. See docs/phase0-findings.md.
+m68k = "=0.12.1"
+
+[lints.clippy]
+all = "warn"
