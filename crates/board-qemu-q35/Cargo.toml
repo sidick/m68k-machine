@@ -8,7 +8,18 @@ publish = false
 
 [dependencies]
 machine-core = { path = "../machine-core" }
-uefi = { version = "0.40", features = ["panic_handler"] }
+# `alloc` + `global_allocator`: the `uefi` crate's own boot-services-backed
+# allocator (see this crate's `main.rs` module doc comment) -- picked over
+# `board-qemu-virt`'s bump allocator because a UEFI application already has
+# one for free, and `m68k`'s `no_std` build needs *something* registered
+# regardless (see `docs/phase0-findings.md` / the workspace `Cargo.toml`'s
+# `m68k` doc comment).
+uefi = { version = "0.40", features = ["panic_handler", "alloc", "global_allocator"] }
+
+# The no_std fork (see the root Cargo.toml's [workspace.dependencies] doc
+# comment and docs/phase0-findings.md): this board can now link a real
+# CpuCore, same as board-qemu-virt.
+m68k = { workspace = true }
 
 [lints.clippy]
 all = "warn"

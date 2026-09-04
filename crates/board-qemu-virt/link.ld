@@ -12,7 +12,15 @@ ENTRY(_start)
 
 MEMORY
 {
-  RAM (rwx) : ORIGIN = 0x40080000, LENGTH = 8M
+  /* 8M was enough for the Phase 0 bus-only payload. Booting AROS embeds
+   * both ~512 KB ROM images via `include_bytes!` (.rodata) and adds a
+   * third 2 MB chip-RAM `.bss` buffer for the boot run alongside the two
+   * Phase 0 checks already keep, which alone pushes total image+.bss
+   * past 8M. QEMU virt is configured with 512M (`-m 512M` in
+   * scripts/run-qemu-virt.sh), so 16M leaves generous headroom over the
+   * ~9M actually used without reserving a meaningful fraction of real
+   * guest-visible RAM. */
+  RAM (rwx) : ORIGIN = 0x40080000, LENGTH = 16M
 }
 
 SECTIONS
