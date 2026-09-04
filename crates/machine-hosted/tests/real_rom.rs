@@ -53,6 +53,49 @@ fn kickstart_3_2_2_a1200() {
     );
 }
 
+/// The Phase 1 investigation this test documents (`docs/combined-
+/// roadmap.md` Phase 1 exit criterion): a stock retail Kickstart never
+/// writes to `SERDAT`, so `--inspect`'s guest-memory report is the only
+/// way to tell "idling because healthy" from "stuck" apart. This asserts
+/// the report actually finds a well-formed `ExecBase` and a plausible
+/// number of initialised resident modules on the real ROM, not just that
+/// the flag doesn't crash the runner.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_introspection_finds_a_healthy_exec_base() {
+    if !Path::new(KICKSTART_A1200).exists() {
+        eprintln!("SKIP: {KICKSTART_A1200} not present");
+        return;
+    }
+    let (status, stdout) = run(&[
+        "--rom",
+        KICKSTART_A1200,
+        "--max-frames",
+        "200",
+        "--max-instructions",
+        "50000000",
+        "--inspect",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+    assert!(
+        stdout.contains("introspect: ExecBase at"),
+        "expected a well-formed ExecBase to be found on a real Kickstart boot"
+    );
+    assert!(
+        !stdout.contains("no plausible ExecBase"),
+        "exec should have finished initialising by frame 200"
+    );
+    // Kickstart 3.2.2's known resident set is large (expansion, exec,
+    // graphics, dos, intuition, workbench, ...); a handful would indicate
+    // the walk stopped early (offset bug or a genuinely stalled boot).
+    assert!(
+        stdout.contains("resident modules initialised:"),
+        "expected the resident-module count line"
+    );
+}
+
 #[test]
 #[ignore = "requires the AROS ROM pair on disk; run with --ignored"]
 fn aros_68k_pair() {

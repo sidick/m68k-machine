@@ -210,7 +210,20 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         if bus.0.overlay() { "mapped" } else { "clear" }
     ));
 
-    run_guest(args, console, &mut cpu, &mut bus)
+    let report = run_guest(args, console, &mut cpu, &mut bus);
+
+    // Introspection runs after the guest has stopped moving (whatever the
+    // reason), reading whatever state it left behind -- see
+    // `introspect.rs`'s doc comment for why guest memory is the only
+    // evidence available for a stock Kickstart.
+    if args.inspect {
+        let exec_report = crate::introspect::inspect(&mut bus.0);
+        for line in crate::introspect::format_report(&exec_report).lines() {
+            console.diag(line);
+        }
+    }
+
+    report
 }
 
 fn run_guest(args: &Args, console: &mut Console, cpu: &mut CpuCore, bus: &mut Bus) -> Report {

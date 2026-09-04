@@ -50,6 +50,16 @@ pub struct Args {
     /// this file in addition to stdout.
     #[arg(long)]
     pub serial_log: Option<PathBuf>,
+
+    /// After the run ends (for any reason -- limit reached, wedge, clean
+    /// halt), print a report on Exec's guest-memory state: whether
+    /// `ExecBase` is well-formed, which resident modules initialised,
+    /// whether Kickstart guru'd, and the task-ready/task-wait picture.
+    /// The only way to tell "healthy and idle" from "stuck" apart for a
+    /// stock Kickstart, which (unlike AROS) never narrates over serial
+    /// (see `crates/machine-hosted/src/introspect.rs`).
+    #[arg(long, default_value_t = false)]
+    pub inspect: bool,
 }
 
 /// The CPU models this runner knows how to select. A thin wrapper around
