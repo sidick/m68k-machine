@@ -289,7 +289,21 @@ impl<'a> MachineBus<'a> {
                 Some(d) => Some(&mut **d),
                 None => None,
             };
-            self.gayle.read(address, device)
+            let value = self.gayle.read(address, device);
+            // Reads can raise Gayle's interrupt too, not just writes:
+            // draining the last word of a block in a multi-sector READ
+            // SECTORS makes the drive fetch the next block and assert
+            // INTRQ ("data ready"), and that happens inside a data-
+            // register *read*. Without this mirror of `write_byte`'s
+            // propagation, every per-sector interrupt after the first
+            // was lost and scsi.device stalled mid-transfer until an
+            // unrelated CIA interrupt rescued it -- or timed out and
+            // retried, which is how a multi-sector file read turned into
+            // a DOS "object not found" during boot.
+            if self.gayle.irq_pending() {
+                self.chipset.raise_int(chipset::intbit::PORTS);
+            }
+            value
         } else if (CIA_BASE..CIA_END).contains(&address) {
             self.read_cia(address)
         } else if (CUSTOM_BASE..CUSTOM_END).contains(&address) {
@@ -698,5 +712,87 @@ mod tests {
         bus.tick(frame_clocks);
 
         assert_eq!(bus.pending_irq_level(), 3, "VERTB is level 3");
+    }
+
+    /// A tiny in-memory disk for exercising Gayle through the bus.
+    struct MemDisk {
+        sectors: std::vec::Vec<[u8; gayle::SECTOR_BYTES]>,
+    }
+
+    impl gayle::BlockDevice for MemDisk {
+        fn sector_count(&self) -> u64 {
+            self.sectors.len() as u64
+        }
+        fn read_sector(&mut self, lba: u64, buf: &mut [u8; gayle::SECTOR_BYTES]) -> bool {
+            self.sectors.get(lba as usize).map(|s| *buf = *s).is_some()
+        }
+        fn write_sector(&mut self, lba: u64, buf: &[u8; gayle::SECTOR_BYTES]) -> bool {
+            match self.sectors.get_mut(lba as usize) {
+                Some(s) => {
+                    *s = *buf;
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
+    /// The per-sector "next block ready" interrupt of a multi-sector READ
+    /// SECTORS is raised while the guest *reads* the data register (the
+    /// drive asserts INTRQ the moment the next block lands in its
+    /// buffer), so the bus must sample Gayle's interrupt line on the read
+    /// path as well as the write path. When only `write_byte` propagated
+    /// it, every per-sector interrupt after the first was lost and
+    /// scsi.device stalled mid-transfer -- surfacing as file reads
+    /// failing ("object not found") partway through the AmigaOS 3.2.2
+    /// Startup-Sequence.
+    #[test]
+    fn multi_sector_read_raises_ports_interrupt_between_sectors() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut disk = MemDisk {
+            sectors: std::vec![[0u8; gayle::SECTOR_BYTES]; 4],
+        };
+        let mut bus = new_bus(&mut ram, &rom).with_hd(&mut disk);
+
+        // Enable Gayle's IDE interrupt, then issue READ SECTORS for two
+        // sectors from LBA 0.
+        bus.write_byte(gayle::reg::GAYLE_INTENA, gayle::GAYLE_IRQ_IDE);
+        bus.write_byte(gayle::reg::IDE_SELECT, 0xE0); // LBA mode, LBA 27..24 = 0
+        bus.write_byte(gayle::reg::IDE_HCYL, 0);
+        bus.write_byte(gayle::reg::IDE_LCYL, 0);
+        bus.write_byte(gayle::reg::IDE_SECTOR, 0);
+        bus.write_byte(gayle::reg::IDE_NSECTOR, 2);
+        bus.write_byte(gayle::reg::IDE_STATUS, gayle::cmd::READ_SECTORS);
+
+        let ports = 1u16 << chipset::intbit::PORTS;
+        assert_eq!(
+            bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
+            ports,
+            "first block ready raises PORTS via the command write"
+        );
+
+        // Acknowledge both latches the way the driver's INT2 server
+        // does: read IDE status (drops Gayle's INTRQ) and clear the
+        // chipset's PORTS request bit.
+        let _ = bus.read_byte(gayle::reg::IDE_STATUS);
+        bus.write_word(CUSTOM_BASE + chipset::reg::INTREQ as u32, ports);
+        assert_eq!(
+            bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
+            0
+        );
+
+        // Drain the whole first sector through data-register reads. The
+        // final read makes Gayle fetch sector two and assert INTRQ --
+        // entirely inside `read_byte`.
+        for _ in 0..gayle::SECTOR_BYTES / 2 {
+            let _ = bus.read_byte(gayle::reg::IDE_DATA);
+            let _ = bus.read_byte(gayle::reg::IDE_DATA + 1);
+        }
+        assert_eq!(
+            bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
+            ports,
+            "the second block's per-sector interrupt must reach the chipset"
+        );
     }
 }
