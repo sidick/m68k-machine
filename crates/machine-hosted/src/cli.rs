@@ -106,6 +106,39 @@ pub struct Args {
     /// watching boot progress frame by frame.
     #[arg(long)]
     pub screenshot_every: Option<u64>,
+
+    /// Floppy drive configuration this machine presents on CIA-A PRA /
+    /// CIA-B PRB (proposal §7.2; see `machine_core::cia::FloppyDrive`).
+    /// `none` (the default) is this machine's honest hardware story --
+    /// storage is MIRAGE over Zorro III (proposal §10.3), never a
+    /// floppy connector -- and is confirmed against real hardware and
+    /// Amiberry (both with zero drives attached) to still reach
+    /// Kickstart's no-boot-media screen. `empty` (a drive present with
+    /// no disk in it) is kept only as a diagnostic/compatibility mode,
+    /// not a normal configuration for this machine.
+    #[arg(long, default_value = "none")]
+    pub floppy: FloppyArg,
+}
+
+/// CLI surface for [`machine_core::cia::FloppyPresence`] -- kept as a
+/// separate type so `clap`'s `ValueEnum` derive doesn't need to live on
+/// the foreign `machine-core` type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum FloppyArg {
+    /// No physical drive at all -- the default; see the `--floppy` help.
+    None,
+    /// A drive present with no disk in it -- diagnostic/compatibility
+    /// mode only.
+    Empty,
+}
+
+impl From<FloppyArg> for machine_core::cia::FloppyPresence {
+    fn from(arg: FloppyArg) -> Self {
+        match arg {
+            FloppyArg::None => machine_core::cia::FloppyPresence::None,
+            FloppyArg::Empty => machine_core::cia::FloppyPresence::Empty,
+        }
+    }
 }
 
 /// The CPU models this runner knows how to select. A thin wrapper around

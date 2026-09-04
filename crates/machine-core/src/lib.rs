@@ -49,7 +49,7 @@ pub mod rom;
 
 use blitter::Blitter;
 use chipset::Chipset;
-use cia::{Cia, CiaId};
+use cia::{Cia, CiaId, FloppyDrive, FloppyPresence};
 
 /// Size in bytes of the chip RAM region, `$000000`-`$1FFFFF` (2 MB).
 ///
@@ -100,6 +100,11 @@ pub struct MachineBus<'a> {
     /// it is the one chipset device that reaches into chip RAM, and the
     /// bus is what owns that.
     pub blitter: Blitter,
+    /// Floppy drive status/control, supplying CIA-A PRA bits 2-5 from
+    /// CIA-B PRB writes -- see [`cia::FloppyDrive`]'s doc comment. Lives
+    /// on the bus, not on either `Cia`, because it is wired between the
+    /// two chips (CIA-B drives it, CIA-A reads it back).
+    pub floppy: FloppyDrive,
 
     /// While set, the ROM is mirrored over the bottom of the address
     /// space so the CPU's reset vector fetch from `$000000`/`$000004`
@@ -150,6 +155,14 @@ impl<'a> MachineBus<'a> {
             cia_a: Cia::new(CiaId::A),
             cia_b: Cia::new(CiaId::B),
             blitter: Blitter::new(),
+            // No physical drive: this machine's honest hardware story
+            // (proposal §3, §10.3 -- storage is MIRAGE over Zorro III,
+            // never a floppy connector), and confirmed against real
+            // hardware and Amiberry (both configured with zero drives
+            // attached) to still reach Kickstart's no-boot-media screen
+            // under both 1.3 and 3.2.3. `with_floppy` overrides this for
+            // the `--floppy empty` diagnostic mode.
+            floppy: FloppyDrive::new(FloppyPresence::None),
             overlay: true,
         }
     }
@@ -157,6 +170,14 @@ impl<'a> MachineBus<'a> {
     /// Attach an AROS extended ROM at `$E00000`.
     pub fn with_ext_rom(mut self, ext_rom: &'a [u8]) -> Self {
         self.ext_rom = ext_rom;
+        self
+    }
+
+    /// Override the default no-drive floppy configuration -- see
+    /// [`cia::FloppyPresence`].
+    pub fn with_floppy(mut self, presence: FloppyPresence) -> Self {
+        self.floppy = FloppyDrive::new(presence);
+        self.sync_floppy_status();
         self
     }
 
@@ -204,11 +225,13 @@ impl<'a> MachineBus<'a> {
     /// one call keeps that split out of the host's input code.
     pub fn mouse_button(&mut self, button: chipset::MouseButton, pressed: bool) {
         if button == chipset::MouseButton::Left {
-            // Active low: the pin is pulled to ground while pressed.
+            // Active low: the pin is pulled to ground while pressed. This
+            // is an input pin (`DDRA` bit 6 is 0), so it belongs in
+            // `pra_input`, not the output latch `pra` -- see `Cia::read`.
             if pressed {
-                self.cia_a.pra &= !CIA_A_PRA_FIR0;
+                self.cia_a.pra_input &= !CIA_A_PRA_FIR0;
             } else {
-                self.cia_a.pra |= CIA_A_PRA_FIR0;
+                self.cia_a.pra_input |= CIA_A_PRA_FIR0;
             }
         } else {
             self.chipset.mouse_button(button, pressed);
@@ -278,8 +301,25 @@ impl<'a> MachineBus<'a> {
             // CIA-A write rather than special-casing the register.
             self.overlay = self.cia_a.ovl_asserted();
         } else {
+            // Capture PRB's value before the write so the floppy model
+            // can edge-detect SELECT/MOTOR/STEP transitions between old
+            // and new -- see `FloppyDrive::on_prb_write`.
+            let is_prb = reg & 0x0F == cia::reg::PRB;
+            let prev_prb = self.cia_b.prb;
             self.cia_b.write(reg, value);
+            if is_prb {
+                self.floppy.on_prb_write(prev_prb, self.cia_b.prb);
+                self.sync_floppy_status();
+            }
         }
+    }
+
+    /// Merge the floppy model's PRA bits (2-5) into CIA-A's input pin
+    /// field, leaving the other bits (OVL/LED output latch, mouse fire
+    /// buttons) untouched.
+    fn sync_floppy_status(&mut self) {
+        self.cia_a.pra_input =
+            (self.cia_a.pra_input & !cia::FLOPPY_PRA_MASK) | self.floppy.pra_status_bits();
     }
 
     fn read_custom_word(&mut self, address: u32) -> u16 {

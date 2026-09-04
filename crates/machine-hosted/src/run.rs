@@ -198,6 +198,8 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         Some(ext) => machine_bus.with_ext_rom(ext),
         None => machine_bus,
     };
+    let machine_bus = machine_bus.with_floppy(args.floppy.into());
+    console.diag(&format!("floppy: {:?}", args.floppy));
     let mut bus = Bus(machine_bus);
 
     let mut serial_script = match &args.serial_script {
@@ -247,6 +249,7 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
             console.diag(line);
         }
         console.diag(&crate::introspect::format_display_state(&bus.0.chipset));
+        console.diag(&crate::introspect::format_disk_state(&bus.0));
     }
 
     report

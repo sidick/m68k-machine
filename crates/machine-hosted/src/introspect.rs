@@ -565,6 +565,28 @@ pub fn format_display_state(chipset: &Chipset) -> String {
     )
 }
 
+/// Summarise the floppy-relevant state (proposal §7.1/§7.2, `cia.rs`'s
+/// `FloppyDrive`): whether the disk DMA engine was ever actually armed
+/// (`DSKLEN`'s `DMAEN` bit, `DSKPT`), and the raw CIA-A/CIA-B port bytes
+/// the floppy model drives and is driven from. This is what distinguishes
+/// "trackdisk read our CIA status bits and gave up cleanly" (`DSKPT`
+/// stays `0`, `DSKLEN` never gets `DMAEN`) from "trackdisk tried a real
+/// transfer and is waiting on a `DSKBLK` completion this machine's sink
+/// registers (§7.1) never raise" -- the two very different explanations
+/// for a `trackdisk.device` task parked in `TaskWait`.
+pub fn format_disk_state(bus: &MachineBus) -> String {
+    format!(
+        "disk state: DSKLEN {:#06x}  DSKPT {:#010x}  CIA-A PRA {:#04x} DDRA {:#04x}  \
+         CIA-B PRB {:#04x} DDRB {:#04x}",
+        bus.chipset.dsklen,
+        bus.chipset.dskpt,
+        bus.cia_a.pra,
+        bus.cia_a.ddra,
+        bus.cia_b.prb,
+        bus.cia_b.ddrb,
+    )
+}
+
 fn task_line(task: Option<&TaskEntry>) -> String {
     match task {
         None => "(none)".to_string(),

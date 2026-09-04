@@ -108,10 +108,27 @@ pub enum CiaId {
 pub struct Cia {
     pub id: CiaId,
 
+    /// Output latch: the last value written to PRA, returned as-is on
+    /// read for any bit `DDRA` configures as an output. The 8520 always
+    /// latches a PRA/PRB write regardless of direction -- only whether
+    /// that latch actually drives the physical pin (and so is what a
+    /// read sees) depends on `DDRA`/`DDRB`.
     pub pra: u8,
     pub prb: u8,
     pub ddra: u8,
     pub ddrb: u8,
+    /// External pin levels for whichever PRA bits `DDRA` currently
+    /// configures as inputs: the mouse-button fire pins and (§ this
+    /// module's `FloppyDrive`) the disk status pins. Idle-high (`0xFF`)
+    /// out of reset, matching every one of those pins being an
+    /// active-low signal nothing is currently pulling down.
+    pub pra_input: u8,
+    /// External pin levels for `DDRB`-input-configured PRB bits. Nothing
+    /// in this machine drives PRB as an input today (every disk-control
+    /// line is a CIA output), but the field exists so `read()` applies
+    /// the same direction-aware rule to both ports rather than
+    /// special-casing PRA.
+    pub prb_input: u8,
 
     /// Timer A/B current values and latches.
     pub timer_a: u16,
@@ -170,6 +187,8 @@ impl Cia {
             prb: 0,
             ddra: 0,
             ddrb: 0,
+            pra_input: 0xFF,
+            prb_input: 0xFF,
             timer_a: 0xFFFF,
             timer_b: 0xFFFF,
             latch_a: 0xFFFF,
@@ -205,8 +224,15 @@ impl Cia {
     /// Read a register (0-15).
     pub fn read(&mut self, reg: u8) -> u8 {
         match reg & 0x0F {
-            reg::PRA => self.pra,
-            reg::PRB => self.prb,
+            // A bit `DDRA`/`DDRB` configures as output (1) reads back the
+            // output latch; a bit configured as input (0) reads the
+            // actual external pin level instead. Before this, PRA/PRB
+            // were plain latches that ignored DDR entirely, which is
+            // exactly why the disk-status pins (PRA 2-5, always inputs)
+            // could never report anything but whatever software last
+            // happened to write there.
+            reg::PRA => (self.pra & self.ddra) | (self.pra_input & !self.ddra),
+            reg::PRB => (self.prb & self.ddrb) | (self.prb_input & !self.ddrb),
             reg::DDRA => self.ddra,
             reg::DDRB => self.ddrb,
             reg::TALO => self.timer_a as u8,
@@ -499,6 +525,233 @@ fn step_timer(count: &mut u16, latch: u16) -> bool {
 /// same wire format.
 fn encode_keyboard_byte(raw: u8) -> u8 {
     !raw.rotate_left(1)
+}
+
+// ---- Floppy drive status (CIA-A PRA 2-5 / CIA-B PRB) -----------------
+//
+// Disk presence is not sensed through DSKBYTR/DSKLEN/DSKPT at all (the
+// proposal's "no disk; sink" for those registers is correct on its own
+// terms) -- it is sensed entirely through these CIA port pins, all
+// active low (Amiga Hardware Reference Manual's CIA port table):
+//
+//   CIA-A PRA (inputs): bit 2 DSKCHNG, bit 3 DSKPROT, bit 4 DSKTRACK0,
+//   bit 5 DSKRDY.
+//   CIA-B PRB (outputs): bit 0 DSKSTEP, bit 1 DSKDIREC, bit 2 DSKSIDE,
+//   bits 3-6 DSKSEL0-DSKSEL3, bit 7 DSKMOTOR.
+//
+// Without a model of these, `trackdisk.device` waits forever for a
+// DSKRDY transition that never comes (Phase 1's `--inspect` shows it
+// parked on signal 0x400) and Kickstart never reaches its no-boot-media
+// screen. Cross-checked against Copperline's `floppy::mod` (GPL-3, read
+// for understanding, never copied) for the two behaviours that are not
+// obvious from the bit table alone: the motor relay is a latch clocked
+// by the drive's own SELECT falling edge (not MTR's level), and an
+// external drive answers a motor-off select cycle by shifting its
+// 32-bit ID out through DSKRDY, one bit per deselect, MSB first.
+
+/// CIA-B PRB bit for DSKSTEP: active low, and the mechanism moves on the
+/// falling edge (a pulse), not the level.
+const CIAB_DSKSTEP: u8 = 1 << 0;
+/// CIA-B PRB bit for DSKDIREC, latched at the DSKSTEP falling edge: 0 =
+/// step inward (toward higher cylinder numbers), 1 = step outward
+/// (toward track 0).
+const CIAB_DSKDIREC: u8 = 1 << 1;
+/// CIA-B PRB bit for DSKSEL0 (df0's select line, active low). This
+/// machine models a single drive bay; DSKSEL1-3 (other units in a
+/// daisy chain this machine never has) are not wired to anything.
+const CIAB_DSKSEL0: u8 = 1 << 3;
+/// CIA-B PRB bit for DSKMOTOR: active low, 0 = motor commanded on.
+const CIAB_DSKMOTOR: u8 = 1 << 7;
+
+const CIAA_DSKCHANGE: u8 = 1 << 2;
+const CIAA_DSKPROT: u8 = 1 << 3;
+const CIAA_DSKTRACK0: u8 = 1 << 4;
+const CIAA_DSKRDY: u8 = 1 << 5;
+/// Mask of the four PRA bits `FloppyDrive` drives. The rest of PRA
+/// (OVL, LED, the joystick/mouse fire buttons) is somebody else's
+/// concern.
+pub const FLOPPY_PRA_MASK: u8 = CIAA_DSKCHANGE | CIAA_DSKPROT | CIAA_DSKTRACK0 | CIAA_DSKRDY;
+
+/// Head travel limit: a real 3.5" DD mechanism has 80 cylinders (0-79).
+const MAX_CYLINDER: u8 = 79;
+
+/// Which floppy configuration `FloppyDrive` presents, selectable via
+/// `machine-hosted`'s `--floppy` flag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FloppyPresence {
+    /// No physical drive at all. This machine's honest hardware story
+    /// (proposal §3, §10.3): storage is MIRAGE over Zorro III, this
+    /// machine has no floppy connector to begin with. The default --
+    /// confirmed against real hardware (an Amiga with no drive attached
+    /// still reaches the no-boot-media screen) and against Amiberry
+    /// configured the same way, under both Kickstart 1.3 and 3.2.3.
+    None,
+    /// A drive is present with no disk in it. Kept as a selectable
+    /// diagnostic/compatibility mode, not the default: it is a fiction
+    /// for a machine with no floppy hardware, and the "no drive"
+    /// configuration already reaches the same no-boot-media screen on
+    /// real hardware.
+    Empty,
+}
+
+impl FloppyPresence {
+    /// The 32-bit drive ID a DSKRDY shift sequence clocks out while the
+    /// motor is off and the drive selected: `$00000000` for no drive
+    /// (an unpopulated select line simply never answers), `$FFFFFFFF`
+    /// for a standard 3.5" DD drive (Amiga Hardware Reference Manual;
+    /// matches Copperline's `STANDARD_EXTERNAL_DRIVE_ID`).
+    fn drive_id(self) -> u32 {
+        match self {
+            FloppyPresence::None => 0x0000_0000,
+            FloppyPresence::Empty => 0xFFFF_FFFF,
+        }
+    }
+}
+
+/// A single floppy drive bay (df0), supplying CIA-A PRA bits 2-5 from
+/// CIA-B PRB writes. See this module's floppy-status doc comment above
+/// for the polarity references and the oracle this was cross-checked
+/// against.
+pub struct FloppyDrive {
+    presence: FloppyPresence,
+    motor_on: bool,
+    selected: bool,
+    /// Head position, 0-79. Only cylinder 0 is externally observable
+    /// (DSKTRACK0), but the full range is tracked so a recalibration
+    /// seek away from and back to 0 behaves plausibly.
+    cylinder: u8,
+
+    /// True while the drive is clocking its 32-bit ID out through
+    /// DSKRDY: entered on a motor on->off transition, left on the next
+    /// off->on transition. Only reachable under `FloppyPresence::Empty`
+    /// -- `None` has no drive, let alone an ID circuit, to run it.
+    id_mode: bool,
+    /// Next bit to emit, 0-31 MSB first; clamped at 32 once exhausted,
+    /// which reads as 0 forever after (a real shift register run past
+    /// its length).
+    id_bit: u8,
+    /// The select-deactivate edge that follows immediately from
+    /// entering ID mode is the very edge that carried the motor-off
+    /// command; it does not itself clock a bit out. Only later deselect
+    /// edges do -- this flag absorbs that first one.
+    id_hold_first_edge: bool,
+}
+
+impl FloppyDrive {
+    pub fn new(presence: FloppyPresence) -> Self {
+        Self {
+            presence,
+            motor_on: false,
+            selected: false,
+            cylinder: 0,
+            id_mode: false,
+            id_bit: 0,
+            id_hold_first_edge: false,
+        }
+    }
+
+    pub fn presence(&self) -> FloppyPresence {
+        self.presence
+    }
+
+    /// Apply a CIA-B PRB write, given the value before and after, and
+    /// update motor/select/step/ID-shift state from the edges between
+    /// them. A no-op under `FloppyPresence::None`: nothing answers the
+    /// select line, so there is no edge behaviour to model.
+    pub fn on_prb_write(&mut self, prev: u8, val: u8) {
+        if self.presence == FloppyPresence::None {
+            return;
+        }
+
+        let was_selected = prev & CIAB_DSKSEL0 == 0;
+        let selected = val & CIAB_DSKSEL0 == 0;
+        self.selected = selected;
+
+        if !was_selected && selected {
+            // The motor relay is a latch clocked by the drive's own
+            // SELECT falling edge, not the level of MTR: MTR asserted
+            // (low) on either side of this edge starts the motor, and
+            // only MTR deasserted (high) on both sides stops it. This is
+            // why trackdisk deselects, changes MTR, then reselects to
+            // change motor state, and why a stray PRB write restoring an
+            // old MTR-high shadow value right after starting the motor
+            // does not stop it again.
+            let motor_next = (prev & CIAB_DSKMOTOR == 0) || (val & CIAB_DSKMOTOR == 0);
+            if motor_next {
+                self.id_mode = false;
+                self.id_bit = 0;
+            } else if self.motor_on {
+                // An on->off transition: start clocking the ID out.
+                self.id_mode = true;
+                self.id_bit = 0;
+                self.id_hold_first_edge = true;
+            }
+            self.motor_on = motor_next;
+        } else if was_selected && !selected && self.id_mode && !self.motor_on {
+            if self.id_hold_first_edge {
+                self.id_hold_first_edge = false;
+            } else {
+                self.id_bit = self.id_bit.saturating_add(1).min(32);
+            }
+        }
+
+        // DSKSTEP is active low; the mechanism moves on the falling
+        // edge, latching whatever DSKDIREC reads in the same write (not
+        // the prior PRB state) -- some trackloaders set direction and
+        // pulse step in a single write.
+        let step_falling_edge = (prev & CIAB_DSKSTEP != 0) && (val & CIAB_DSKSTEP == 0);
+        if selected && step_falling_edge {
+            let inward = val & CIAB_DSKDIREC == 0;
+            if inward {
+                self.cylinder = self.cylinder.saturating_add(1).min(MAX_CYLINDER);
+            } else {
+                self.cylinder = self.cylinder.saturating_sub(1);
+            }
+        }
+    }
+
+    /// The four CIA-A PRA bits (2-5) this drive currently drives,
+    /// already in PRA bit position with the active-low convention
+    /// applied (bit set = deasserted / idle).
+    pub fn pra_status_bits(&self) -> u8 {
+        if self.presence == FloppyPresence::None || !self.selected {
+            // Unselected, or no drive to answer selection at all: these
+            // status lines are shared across every drive bay in the
+            // daisy chain and only the selected drive pulls them low, so
+            // an unselected (or nonexistent) drive leaves them at their
+            // pulled-up idle level -- all four deasserted.
+            return FLOPPY_PRA_MASK;
+        }
+
+        let mut bits = 0u8;
+        // DSKCHNG stays asserted (0) always: this drive never has a
+        // disk in it, so there is no insert event to ever clear the
+        // change latch.
+        // DSKPROT: no disk, nothing to write-protect -- deasserted.
+        bits |= CIAA_DSKPROT;
+        if self.cylinder != 0 {
+            bits |= CIAA_DSKTRACK0;
+        }
+        let rdy_asserted = self.id_mode && !self.motor_on && self.id_shift_bit();
+        if !rdy_asserted {
+            bits |= CIAA_DSKRDY;
+        }
+        bits
+    }
+
+    fn id_shift_bit(&self) -> bool {
+        shift_id_bit(self.presence.drive_id(), self.id_bit)
+    }
+}
+
+/// The bit a 32-bit drive-ID shift register presents at `index` (0-31,
+/// MSB first; any `index >= 32` reads 0, as a real shift register run
+/// past its length would).
+fn shift_id_bit(id: u32, index: u8) -> bool {
+    if index >= 32 {
+        return false;
+    }
+    id & (1 << (31 - index)) != 0
 }
 
 #[cfg(test)]
@@ -876,5 +1129,223 @@ mod tests {
         assert_eq!(cia.icr_mask, (1 << icr::TA) | (1 << icr::TB));
         cia.write(reg::ICR, 1 << icr::TA);
         assert_eq!(cia.icr_mask, 1 << icr::TB);
+    }
+
+    // ---- Port direction semantics -------------------------------------
+
+    #[test]
+    fn pra_read_returns_latch_for_output_bits_and_pin_for_input_bits() {
+        let mut cia = Cia::new(CiaId::A);
+        // Bits 0-3 output, 4-7 input.
+        cia.write(reg::DDRA, 0x0F);
+        cia.write(reg::PRA, 0xAA);
+        cia.pra_input = 0x55;
+
+        // Low nibble comes from the latch (0xAA & 0x0F = 0x0A), high
+        // nibble from the pin field (0x55 & 0xF0 = 0x50).
+        assert_eq!(cia.read(reg::PRA), 0x5A);
+    }
+
+    #[test]
+    fn prb_read_applies_the_same_direction_rule_as_pra() {
+        let mut cia = Cia::new(CiaId::B);
+        cia.write(reg::DDRB, 0xF0);
+        cia.write(reg::PRB, 0xFF);
+        cia.prb_input = 0x00;
+
+        assert_eq!(cia.read(reg::PRB), 0xF0, "high nibble output, low input");
+    }
+
+    #[test]
+    fn writing_pra_always_latches_regardless_of_ddr() {
+        // The 8520 latches every PRA write whether or not DDRA currently
+        // configures that bit as an output; only readback depends on
+        // direction. Configure all-input, write, then flip to
+        // all-output and confirm the earlier write is still there.
+        let mut cia = Cia::new(CiaId::A);
+        cia.write(reg::DDRA, 0x00);
+        cia.write(reg::PRA, 0x3C);
+        cia.write(reg::DDRA, 0xFF);
+        assert_eq!(cia.read(reg::PRA), 0x3C);
+    }
+
+    // ---- FloppyDrive: presence and port wiring -------------------------
+
+    #[test]
+    fn no_drive_reads_idle_regardless_of_selection() {
+        let mut drive = FloppyDrive::new(FloppyPresence::None);
+        assert_eq!(drive.pra_status_bits(), FLOPPY_PRA_MASK);
+
+        // Select df0, drop the motor -- a real drive would start
+        // answering; nothing does here.
+        drive.on_prb_write(0xFF, !CIAB_DSKSEL0 & !CIAB_DSKMOTOR);
+        assert_eq!(
+            drive.pra_status_bits(),
+            FLOPPY_PRA_MASK,
+            "no drive never drives the status lines low"
+        );
+    }
+
+    #[test]
+    fn unselected_empty_drive_also_reads_idle() {
+        let mut drive = FloppyDrive::new(FloppyPresence::Empty);
+        // Never select it.
+        drive.on_prb_write(0xFF, !CIAB_DSKMOTOR);
+        assert_eq!(drive.pra_status_bits(), FLOPPY_PRA_MASK);
+    }
+
+    #[test]
+    fn empty_drive_always_asserts_dskchng_and_deasserts_dskprot_when_selected() {
+        let mut drive = FloppyDrive::new(FloppyPresence::Empty);
+        drive.on_prb_write(0xFF, !CIAB_DSKSEL0);
+        let bits = drive.pra_status_bits();
+        assert_eq!(bits & CIAA_DSKCHANGE, 0, "DSKCHNG asserted: no disk, ever");
+        assert_eq!(
+            bits & CIAA_DSKPROT,
+            CIAA_DSKPROT,
+            "DSKPROT deasserted: nothing to protect"
+        );
+    }
+
+    // ---- FloppyDrive: stepping and track 0 ------------------------------
+
+    fn select_and_step(drive: &mut FloppyDrive, inward: bool, times: u32) {
+        // Base: selected (SEL0 low), DIREC high (outward). Clear DIREC
+        // for inward -- DSKDIREC low is what `on_prb_write` reads as
+        // "inward".
+        let mut step_high = !CIAB_DSKSEL0;
+        if inward {
+            step_high &= !CIAB_DSKDIREC;
+        }
+        let step_low = step_high & !CIAB_DSKSTEP;
+        for _ in 0..times {
+            drive.on_prb_write(step_high, step_low); // falling edge: steps
+            drive.on_prb_write(step_low, step_high); // rising edge: no-op
+        }
+    }
+
+    #[test]
+    fn stepping_inward_then_outward_reaches_and_leaves_track0() {
+        let mut drive = FloppyDrive::new(FloppyPresence::Empty);
+        // Select the drive first so DSKTRACK0 is observable at all.
+        drive.on_prb_write(0xFF, !CIAB_DSKSEL0);
+        assert_eq!(
+            drive.pra_status_bits() & CIAA_DSKTRACK0,
+            0,
+            "starts at cylinder 0"
+        );
+
+        select_and_step(&mut drive, true, 5);
+        assert_ne!(
+            drive.pra_status_bits() & CIAA_DSKTRACK0,
+            0,
+            "off track 0 after stepping inward"
+        );
+
+        select_and_step(&mut drive, false, 10); // more than enough to reach 0
+        assert_eq!(
+            drive.pra_status_bits() & CIAA_DSKTRACK0,
+            0,
+            "back at track 0 after stepping outward past it"
+        );
+    }
+
+    #[test]
+    fn step_pulses_while_deselected_do_not_move_the_head() {
+        let mut drive = FloppyDrive::new(FloppyPresence::Empty);
+        // Deselected throughout (SEL0 stays high).
+        drive.on_prb_write(0xFF, !CIAB_DSKSTEP);
+        drive.on_prb_write(!CIAB_DSKSTEP, 0xFF);
+        drive.on_prb_write(0xFF, !CIAB_DSKSEL0); // now select
+        assert_eq!(
+            drive.pra_status_bits() & CIAA_DSKTRACK0,
+            0,
+            "still at cylinder 0: the earlier pulses never reached a selected drive"
+        );
+    }
+
+    // ---- FloppyDrive: drive-ID shift sequence ---------------------------
+
+    #[test]
+    fn shift_id_bit_reads_msb_first() {
+        // A pattern that is not the same read forwards and backwards, so
+        // ordering is actually being tested: 1000...0001 with a single
+        // extra 1 near the top (0x8000_0001 alone can't distinguish MSB-
+        // from LSB-first at the interior bits, so also probe one there).
+        let id = 0x8100_0001u32; // bits 31, 24, 0 set
+        assert!(shift_id_bit(id, 0), "bit 31 (MSB) first");
+        assert!(shift_id_bit(id, 7), "bit 24 next");
+        assert!(!shift_id_bit(id, 1));
+        assert!(shift_id_bit(id, 31), "bit 0 (LSB) last");
+        assert!(!shift_id_bit(id, 32), "past the register: reads 0");
+        assert!(!shift_id_bit(id, 255), "stays 0, does not wrap or panic");
+    }
+
+    /// Deselect the drive, then reselect it, motor held off (DSKMOTOR
+    /// high) throughout -- the two-write cycle a real probe uses to
+    /// advance the ID shift register by one bit, per the
+    /// `FloppyDrive::on_prb_write` doc comment.
+    fn deselect_then_reselect(drive: &mut FloppyDrive) {
+        let selected = !CIAB_DSKSEL0;
+        let deselected = 0xFFu8;
+        drive.on_prb_write(selected, deselected);
+        drive.on_prb_write(deselected, selected);
+    }
+
+    #[test]
+    fn empty_drive_shifts_its_32_bit_id_out_through_dskrdy() {
+        let mut drive = FloppyDrive::new(FloppyPresence::Empty);
+        // Select with motor commanded on (MOTOR bit low) to spin it up,
+        // matching a real probe's opening sequence.
+        drive.on_prb_write(0xFF, !CIAB_DSKSEL0 & !CIAB_DSKMOTOR);
+        assert!(drive.motor_on);
+
+        // Deselect, set MTR high, reselect: the SELECT falling edge on
+        // that reselect is what latches the motor off (MTR read high on
+        // both sides of it) and arms ID mode. The reselect edge itself
+        // is the hold-first-edge case, so DSKRDY is not yet meaningful;
+        // only subsequent deselect/reselect cycles clock bits out.
+        drive.on_prb_write(!CIAB_DSKSEL0 & !CIAB_DSKMOTOR, 0xFF); // deselect, MTR high
+        drive.on_prb_write(0xFF, !CIAB_DSKSEL0); // reselect, MTR stays high
+        assert!(!drive.motor_on, "motor latched off on the reselect edge");
+
+        // Immediately after arming, DSKRDY reflects bit 0 of $FFFFFFFF
+        // (asserted -- every bit of an all-ones ID is 1), and stays
+        // asserted through the register's 32-bit length. $FFFFFFFF keeps
+        // DSKRDY asserted at every valid index, so this proves
+        // exhaustion, not per-bit ordering (that is
+        // `shift_id_bit_reads_msb_first`, below).
+        assert_eq!(drive.pra_status_bits() & CIAA_DSKRDY, 0);
+
+        // 33 deselect/reselect cycles walk the register past its end:
+        // the first is absorbed by the arming transition itself (see
+        // `on_prb_write`'s doc comment on `id_hold_first_edge`), and the
+        // other 32 each clock one more bit of the 32-bit register.
+        for _ in 0..32 {
+            deselect_then_reselect(&mut drive);
+            let bits = drive.pra_status_bits();
+            assert_eq!(bits & CIAA_DSKRDY, 0, "still within $FFFFFFFF's 32 bits");
+        }
+
+        // One cycle further: past the register's length, exhausted, and
+        // must stay that way rather than wrapping back to bit 0.
+        deselect_then_reselect(&mut drive);
+        assert_ne!(
+            drive.pra_status_bits() & CIAA_DSKRDY,
+            0,
+            "exhausted shift register must not keep reporting ready"
+        );
+        deselect_then_reselect(&mut drive);
+        assert_ne!(
+            drive.pra_status_bits() & CIAA_DSKRDY,
+            0,
+            "stays exhausted, does not wrap"
+        );
+    }
+
+    #[test]
+    fn no_drive_id_is_all_zero() {
+        assert_eq!(FloppyPresence::None.drive_id(), 0);
+        assert_eq!(FloppyPresence::Empty.drive_id(), 0xFFFF_FFFF);
     }
 }
