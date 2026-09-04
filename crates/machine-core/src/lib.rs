@@ -40,6 +40,7 @@
 // convenience and only run hosted, so `no_std` is relaxed for `cargo test`.
 #![cfg_attr(not(test), no_std)]
 
+pub mod autoconfig;
 pub mod blitter;
 pub mod chipset;
 pub mod cia;
@@ -48,6 +49,7 @@ pub mod gayle;
 pub mod render;
 pub mod rom;
 
+use autoconfig::AutoConfig;
 use blitter::Blitter;
 use chipset::Chipset;
 use cia::{Cia, CiaId, FloppyDrive, FloppyPresence};
@@ -110,6 +112,9 @@ pub struct MachineBus<'a> {
     /// Gayle and its IDE interface — the bring-up storage device (see
     /// [`gayle`]). Absent unless a board layer attaches one.
     pub gayle: Gayle,
+    /// The Zorro AUTOCONFIG chain (§9). Every expansion this machine
+    /// offers is discovered through it.
+    pub autoconfig: AutoConfig,
     /// The disk behind Gayle's IDE port, supplied by the board layer
     /// since this crate has no file I/O of its own.
     hd: Option<&'a mut dyn BlockDevice>,
@@ -181,6 +186,7 @@ impl<'a> MachineBus<'a> {
             // the `--floppy empty` diagnostic mode.
             floppy: FloppyDrive::new(FloppyPresence::None),
             gayle: Gayle::new(),
+            autoconfig: AutoConfig::new(),
             hd: None,
             overlay: true,
         }
@@ -282,6 +288,8 @@ impl<'a> MachineBus<'a> {
 
         if (CHIP_RAM_BASE..CHIP_RAM_END).contains(&address) {
             self.chip_ram[(address - CHIP_RAM_BASE) as usize]
+        } else if AutoConfig::responds_to(address) {
+            self.autoconfig.read(address)
         } else if Gayle::responds_to(address) {
             // Reborrow the device rather than moving it out: Gayle
             // needs it only for the duration of this access.
@@ -437,6 +445,8 @@ impl<'a> MachineBus<'a> {
         // table at $000000 before clearing OVL.
         if (CHIP_RAM_BASE..CHIP_RAM_END).contains(&address) {
             self.chip_ram[(address - CHIP_RAM_BASE) as usize] = value;
+        } else if AutoConfig::responds_to(address) {
+            self.autoconfig.write(address, value);
         } else if Gayle::responds_to(address) {
             let device: Option<&mut dyn BlockDevice> = match &mut self.hd {
                 Some(d) => Some(&mut **d),
