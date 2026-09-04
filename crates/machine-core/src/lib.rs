@@ -44,9 +44,10 @@ pub mod autoconfig;
 pub mod blitter;
 pub mod chipset;
 pub mod cia;
+pub mod cirrus;
 pub mod display;
 pub mod gayle;
-pub mod picasso2;
+pub mod graffity;
 pub mod render;
 pub mod rom;
 
@@ -55,6 +56,7 @@ use blitter::Blitter;
 use chipset::Chipset;
 use cia::{Cia, CiaId, FloppyDrive, FloppyPresence};
 use gayle::{BlockDevice, Gayle};
+use graffity::Graffity;
 
 /// Size in bytes of the chip RAM region, `$000000`-`$1FFFFF` (2 MB).
 ///
@@ -119,6 +121,18 @@ pub struct MachineBus<'a> {
     /// The disk behind Gayle's IDE port, supplied by the board layer
     /// since this crate has no file I/O of its own.
     hd: Option<&'a mut dyn BlockDevice>,
+
+    /// The Graffity graphics card, when the board layer has attached
+    /// one via [`Self::with_graphics`]. Absent by default -- with no
+    /// card, nothing about today's boot path changes, since neither its
+    /// two AUTOCONFIG boards nor this field's routing branch exist.
+    graphics: Option<Graffity<'a>>,
+    /// Which AUTOCONFIG chain index is Graffity's VRAM aperture, once
+    /// registered.
+    graphics_vram_board: Option<usize>,
+    /// Which AUTOCONFIG chain index is Graffity's register window, once
+    /// registered.
+    graphics_regs_board: Option<usize>,
 
     /// While set, the ROM is mirrored over the bottom of the address
     /// space so the CPU's reset vector fetch from `$000000`/`$000004`
@@ -189,6 +203,9 @@ impl<'a> MachineBus<'a> {
             gayle: Gayle::new(),
             autoconfig: AutoConfig::new(),
             hd: None,
+            graphics: None,
+            graphics_vram_board: None,
+            graphics_regs_board: None,
             overlay: true,
         }
     }
@@ -196,6 +213,23 @@ impl<'a> MachineBus<'a> {
     /// Attach a disk to Gayle's IDE port.
     pub fn with_hd(mut self, hd: &'a mut dyn BlockDevice) -> Self {
         self.hd = Some(hd);
+        self
+    }
+
+    /// Attach a Graffity graphics card over caller-owned VRAM (borrowed,
+    /// like chip RAM and the ROMs -- this crate has no allocator) and
+    /// register its two AUTOCONFIG boards on the chain. Absent a call to
+    /// this, the chain and every address this card would occupy are
+    /// untouched, which is what keeps today's boot path identical with
+    /// no card attached.
+    pub fn with_graphics(mut self, vram: &'a mut [u8]) -> Self {
+        let card = Graffity::new(vram);
+        let (vram_spec, regs_spec) = card.board_specs();
+        // VRAM offered first, then the register window -- the Picasso
+        // II shape (graffity module docs).
+        self.graphics_vram_board = self.autoconfig.add_board(vram_spec);
+        self.graphics_regs_board = self.autoconfig.add_board(regs_spec);
+        self.graphics = Some(card);
         self
     }
 
@@ -331,8 +365,32 @@ impl<'a> MachineBus<'a> {
             rom::read_mirrored(self.ext_rom, rom::EXT_ROM_BASE, address)
         } else if (ROM_BASE..ROM_END).contains(&address) && !self.rom.is_empty() {
             rom::read_mirrored(self.rom, ROM_BASE, address)
+        } else if let Some((is_vram, offset)) = self.graphics_target(address) {
+            match &mut self.graphics {
+                Some(card) if is_vram => card.vram_read(offset),
+                Some(card) => card.reg_read(offset),
+                None => OPEN_BUS_BYTE,
+            }
         } else {
             OPEN_BUS_BYTE
+        }
+    }
+
+    /// Whether `address` falls inside one of Graffity's two configured
+    /// AUTOCONFIG windows, and if so, which aperture and the offset
+    /// within it. `None` whenever no card is attached (`board_at` can
+    /// never resolve to either of `graphics_{vram,regs}_board`, since
+    /// they are never `Some` without a card) or the address belongs to
+    /// some other board entirely.
+    fn graphics_target(&self, address: u32) -> Option<(bool, u32)> {
+        let idx = self.autoconfig.board_at(address)?;
+        let base = self.autoconfig.placement(idx)?.base;
+        if Some(idx) == self.graphics_vram_board {
+            Some((true, address - base))
+        } else if Some(idx) == self.graphics_regs_board {
+            Some((false, address - base))
+        } else {
+            None
         }
     }
 
@@ -471,6 +529,14 @@ impl<'a> MachineBus<'a> {
                 (current & 0xFF00) | value as u16
             };
             self.write_custom_word(aligned, merged);
+        } else if let Some((is_vram, offset)) = self.graphics_target(address) {
+            if let Some(card) = &mut self.graphics {
+                if is_vram {
+                    card.vram_write(offset, value);
+                } else {
+                    card.reg_write(offset, value);
+                }
+            }
         }
         // ROM and open-bus writes: discarded.
     }
@@ -805,5 +871,96 @@ mod tests {
             ports,
             "the second block's per-sector interrupt must reach the chipset"
         );
+    }
+
+    // ---- Graffity routing --------------------------------------------
+
+    /// Configure both of Graffity's boards through the AUTOCONFIG
+    /// window, the way `expansion.library` actually would: VRAM
+    /// (offered first) gets the low byte, the register window the next.
+    fn configure_graffity(bus: &mut MachineBus, vram_base_byte: u8, regs_base_byte: u8) {
+        bus.write_byte(
+            autoconfig::AUTOCONFIG_BASE + autoconfig::ec::BASEADDRESS,
+            vram_base_byte,
+        );
+        bus.write_byte(
+            autoconfig::AUTOCONFIG_BASE + autoconfig::ec::BASEADDRESS,
+            regs_base_byte,
+        );
+    }
+
+    #[test]
+    fn no_card_leaves_the_chain_empty_and_the_bus_unchanged() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom);
+
+        // Nothing was ever offered to the chain, so it must behave
+        // exactly as it does today with no card in the machine at all.
+        assert_eq!(bus.autoconfig.board_at(0x0020_0000), None);
+        assert_eq!(
+            bus.read_byte(autoconfig::AUTOCONFIG_BASE),
+            OPEN_BUS_BYTE,
+            "AUTOCONFIG window still reads open bus"
+        );
+        assert_eq!(bus.read_byte(0x0020_0000), OPEN_BUS_BYTE);
+        bus.write_byte(0x0020_0000, 0xAB);
+        assert_eq!(bus.read_byte(0x0020_0000), OPEN_BUS_BYTE, "still unwritten");
+    }
+
+    #[test]
+    fn with_graphics_registers_both_boards_vram_first() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut vram = std::vec![0u8; 0x0020_0000]; // 2 MB
+        let mut bus = new_bus(&mut ram, &rom).with_graphics(&mut vram);
+
+        // The VRAM aperture (product 34) is offered to the chain before
+        // the register window (product 33) -- the Picasso II shape.
+        // er_Product is logical byte 1, so its high nybble sits at
+        // physical offset 4 (`4*N` for N=1); every nybble but er_Type is
+        // complemented (autoconfig module docs).
+        assert_eq!(
+            bus.read_byte(autoconfig::AUTOCONFIG_BASE + 4) >> 4,
+            (!graffity::PRODUCT_VRAM) >> 4,
+            "er_Product high nybble for the first board answering is VRAM's"
+        );
+    }
+
+    #[test]
+    fn configured_graffity_routes_vram_and_register_windows_to_the_chip() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut vram = std::vec![0u8; 0x0020_0000]; // 2 MB
+        let mut bus = new_bus(&mut ram, &rom).with_graphics(&mut vram);
+
+        // VRAM at $20xxxx, 2 MB long -- so it spans $200000-$3FFFFF.
+        // Register window at $50xxxx, well clear of it and of chip RAM,
+        // the AUTOCONFIG window, Gayle, the CIAs and the custom chips.
+        configure_graffity(&mut bus, 0x20, 0x50);
+        assert_eq!(
+            bus.autoconfig.placement(0).map(|p| p.base),
+            Some(0x0020_0000)
+        );
+        assert_eq!(
+            bus.autoconfig.placement(1).map(|p| p.base),
+            Some(0x0050_0000)
+        );
+
+        // A byte in the VRAM window reaches VRAM.
+        bus.write_byte(0x0020_1000, 0xCD);
+        assert_eq!(bus.read_byte(0x0020_1000), 0xCD);
+
+        // A register access in the register window reaches the chip:
+        // CRTC index/data, the same protocol the chip model exercises
+        // directly.
+        bus.write_byte(0x0050_03D4, 0x0F); // CRTC_INDEX_COLOR
+        bus.write_byte(0x0050_03D5, 0x77); // CRTC_DATA_COLOR
+        assert_eq!(bus.read_byte(0x0050_03D5), 0x77);
+
+        // An address between the two configured windows -- past VRAM's
+        // 2 MB, short of the register window's base -- is still open
+        // bus, unaffected by the card being present at all.
+        assert_eq!(bus.read_byte(0x0045_0000), OPEN_BUS_BYTE);
     }
 }

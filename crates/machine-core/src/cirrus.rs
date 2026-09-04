@@ -1,30 +1,21 @@
-//! Picasso II — a Village Tronic Zorro II RTG board around a Cirrus
-//! Logic CL-GD5426, and this machine's first graphics card.
+//! The Cirrus Logic CL-GD542x register model — the chip underneath this
+//! machine's graphics cards.
 //!
-//! Chosen because P96 already ships a `.card` driver for it and both
-//! Copperline and Amiberry model it, so there are two independent
-//! oracles to check against. That is the same argument that put Gayle
-//! ahead of MIRAGE: present a register map an existing driver already
-//! speaks, and no m68k code of ours is needed to get a screen. The
-//! proposal's own virtual Zorro III framebuffer card (§8.2) remains the
-//! production path and still has to be built.
-//!
-//! # Two boards, one device
-//!
-//! The card takes **two** AUTOCONFIG entries: product 11 is the linear
-//! VRAM aperture and product 12 the 64 KB VGA-register window. Both are
-//! backed by this one device, which is why the AUTOCONFIG chain had to
-//! support several boards and shared backing from the start. The
-//! original and the II+ share those product numbers and differ only by
-//! serial, which is how P96 tells a CL-GD5426 from the II+'s CL-GD5428.
+//! Chosen because P96 already ships a `.card` driver for boards built on
+//! it and both Copperline and Amiberry model it, so there are two
+//! independent oracles to check against. That is the same argument that
+//! put Gayle ahead of MIRAGE: present a register map an existing driver
+//! already speaks, and no m68k code of ours is needed to get a screen.
+//! The proposal's own virtual Zorro III framebuffer card (§8.2) remains
+//! the production path and still has to be built.
 //!
 //! # Deliberately not a VGA card
 //!
-//! No VGA text mode, no font or attribute machinery, no BIOS. The board
-//! powers up behind the Amiga's native video and the RTG driver
-//! programs a packed-pixel mode from scratch, so text rendering is
-//! never exercised. That is a large scope reduction and it is the same
-//! call Copperline makes for the same reason.
+//! No VGA text mode, no font or attribute machinery, no BIOS. A board
+//! built on this chip powers up behind the Amiga's native video and the
+//! RTG driver programs a packed-pixel mode from scratch, so text
+//! rendering is never exercised. That is a large scope reduction and it
+//! is the same call Copperline makes for the same reason.
 //!
 //! # Chip and board are kept separate
 //!
@@ -33,28 +24,9 @@
 //! knows nothing about AUTOCONFIG, product numbers or window layout —
 //! P96 itself draws exactly this line, shipping one shared
 //! `CirrusGD542X.chip` under thin board-specific `.card` drivers
-//! (`PicassoII.card`, `Graffity.card`, ...). [`Picasso2`] is the thin
-//! wrapper that gives that chip the Picasso II's board identity and
-//! public API; a future board built on the same silicon (Graffity, say)
-//! would wrap the same chip type rather than duplicating it.
-
-/// Village Tronic's registered expansion manufacturer ID.
-pub const MANUFACTURER: u16 = 2167;
-
-/// Linear VRAM aperture. (Product 13 is the segmented configuration the
-/// physical board's jumper selects; unsupported here, as elsewhere.)
-pub const PRODUCT_VRAM: u8 = 11;
-/// VGA-register and monitor-switch window.
-pub const PRODUCT_REGS: u8 = 12;
-
-/// Serial of the original Picasso II (CL-GD5426).
-pub const SERIAL_PICASSO2: u32 = 0x0002_0000;
-/// Serial of the Picasso II+ (CL-GD5428). P96 distinguishes the
-/// revisions by serial, not by product number.
-pub const SERIAL_PICASSO2_PLUS: u32 = 0x0010_0000;
-
-/// Size of the VGA-register aperture.
-pub const REGS_WINDOW_BYTES: u32 = 0x0001_0000;
+//! (`PicassoII.card`, `Graffity.card`, ...). A board module (e.g.
+//! [`crate::graffity`]) wraps this chip with its own AUTOCONFIG identity
+//! and window layout rather than duplicating the register model.
 
 /// Which CL-GD542x revision this board presents.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -73,17 +45,6 @@ impl ChipRevision {
         match self {
             ChipRevision::Gd5426 => 0x90,
             ChipRevision::Gd5428 => 0x98,
-        }
-    }
-
-    /// The AUTOCONFIG serial that goes with this revision. Board-level —
-    /// P96 tells the two boards apart by serial, not anything the chip
-    /// itself reports — kept here only because [`ChipRevision`] is
-    /// shared between the two; the chip model never calls this.
-    pub fn serial(self) -> u32 {
-        match self {
-            ChipRevision::Gd5426 => SERIAL_PICASSO2,
-            ChipRevision::Gd5428 => SERIAL_PICASSO2_PLUS,
         }
     }
 }
@@ -617,59 +578,6 @@ impl<'a> Cirrus542x<'a> {
     }
 }
 
-/// The Picasso II board: a [`Cirrus542x`] chip given the Picasso II's
-/// AUTOCONFIG identity and public API. See the module docs for why the
-/// chip model itself carries none of this.
-pub struct Picasso2<'a> {
-    pub revision: ChipRevision,
-    chip: Cirrus542x<'a>,
-}
-
-impl<'a> Picasso2<'a> {
-    /// Build a card over caller-owned VRAM.
-    pub fn new(revision: ChipRevision, vram: &'a mut [u8]) -> Self {
-        Self {
-            revision,
-            chip: Cirrus542x::new(revision, vram),
-        }
-    }
-
-    pub fn vram_len(&self) -> usize {
-        self.chip.vram_len()
-    }
-
-    /// Read a byte of VRAM through the linear aperture.
-    pub fn vram_read(&self, offset: usize) -> u8 {
-        self.chip.vram_read(offset)
-    }
-
-    /// Write a byte of VRAM through the linear aperture.
-    pub fn vram_write(&mut self, offset: usize, value: u8) {
-        self.chip.vram_write(offset, value);
-    }
-
-    /// Read a VGA register, by offset within the register window.
-    pub fn reg_read(&mut self, offset: u32) -> u8 {
-        self.chip.reg_read(offset)
-    }
-
-    /// Write a VGA register.
-    pub fn reg_write(&mut self, offset: u32, value: u8) {
-        self.chip.reg_write(offset, value);
-    }
-
-    /// The mode the driver has programmed, or `None` while the card is
-    /// not displaying anything the renderer can present.
-    pub fn decoded_mode(&self) -> Option<DecodedMode> {
-        self.chip.decoded_mode()
-    }
-
-    /// Look up a palette entry, expanded to eight bits per gun.
-    pub fn palette_argb(&self, index: u8) -> u32 {
-        self.chip.palette_argb(index)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,20 +591,18 @@ mod tests {
         c.reg_write(port::SEQ_DATA, idx::SR_LOCK_UNLOCKED);
     }
 
-    // ---- board identity, preserved from before the chip/board split ----
+    // ---- chip identity ----------------------------------------------
 
     #[test]
-    fn revisions_report_their_own_part_id_and_serial() {
+    fn revisions_report_their_own_part_id() {
         assert_eq!(ChipRevision::Gd5426.part_id(), 0x90);
         assert_eq!(ChipRevision::Gd5428.part_id(), 0x98);
-        assert_eq!(ChipRevision::Gd5426.serial(), SERIAL_PICASSO2);
-        assert_eq!(ChipRevision::Gd5428.serial(), SERIAL_PICASSO2_PLUS);
     }
 
     #[test]
     fn vram_roundtrips_and_clamps() {
         let mut vram = [0u8; 64];
-        let mut card = Picasso2::new(ChipRevision::Gd5426, &mut vram);
+        let mut card = chip(&mut vram);
         card.vram_write(0, 0xAB);
         assert_eq!(card.vram_read(0), 0xAB);
         // Past the end reads open bus and a write is discarded, rather
@@ -708,9 +614,9 @@ mod tests {
     #[test]
     fn palette_full_intensity_is_actually_full() {
         let mut vram = [0u8; 16];
-        let mut card = Picasso2::new(ChipRevision::Gd5426, &mut vram);
+        let mut card = chip(&mut vram);
         // Program it through the real DAC-data sequence rather than
-        // poking the field directly, now that it lives on the chip.
+        // poking the field directly.
         card.reg_write(port::DAC_WRITE_INDEX, 1);
         card.reg_write(port::DAC_DATA, 0x3F);
         card.reg_write(port::DAC_DATA, 0x3F);
