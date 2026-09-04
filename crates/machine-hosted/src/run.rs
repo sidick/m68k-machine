@@ -246,6 +246,7 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         for line in crate::introspect::format_report(&exec_report).lines() {
             console.diag(line);
         }
+        console.diag(&crate::introspect::format_display_state(&bus.0.chipset));
     }
 
     report
@@ -277,6 +278,16 @@ fn run_guest(
 
     let mut last_exception: Option<(&'static str, u32)> = None;
     let mut exception_streak: u64 = 0;
+
+    // Only built when asked for: a plain boot run never touches the
+    // renderer, matching `--screenshot`'s doc comment on `Args`.
+    let mut screenshot_job = args.screenshot.as_ref().map(|path| {
+        crate::screenshot::ScreenshotJob::new(
+            path.clone(),
+            args.screenshot_frame,
+            args.screenshot_every,
+        )
+    });
 
     let outcome = 'outer: loop {
         let trace = args.trace;
@@ -344,6 +355,10 @@ fn run_guest(
                     bus.0.chipset.intena,
                     bus.0.chipset.intreq,
                 ));
+            }
+
+            if let Some(job) = screenshot_job.as_mut() {
+                job.maybe_capture(frames, args.max_frames, &mut bus.0, console);
             }
 
             if total_instructions >= args.max_instructions {
@@ -437,6 +452,9 @@ fn run_guest(
                 drain_serial(bus, console);
 
                 let frames = bus.0.chipset.frames;
+                if let Some(job) = screenshot_job.as_mut() {
+                    job.maybe_capture(frames, args.max_frames, &mut bus.0, console);
+                }
                 if frames >= last_progress_frame + PROGRESS_EVERY_FRAMES {
                     last_progress_frame = frames;
                     console.diag(&format!(

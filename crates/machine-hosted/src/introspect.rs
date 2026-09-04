@@ -24,6 +24,7 @@
 //! `$128`) and both fall out of the derivation below, which is why the
 //! rest are trusted.
 
+use machine_core::chipset::Chipset;
 use machine_core::MachineBus;
 
 /// Byte offsets into `struct ExecBase` (`exec/execbase.h`), derived by
@@ -520,6 +521,35 @@ pub fn format_report(report: &Report) -> String {
     }
 
     out
+}
+
+/// Summarise the display-relevant chipset registers the Phase 2 renderer
+/// reads (`render.rs`'s `CopperState`/`Geometry::decode`) -- the
+/// diagnostic for "the screenshot is blank" investigations this crate's
+/// `--screenshot` flag motivates: distinguishes "the renderer has
+/// nothing to draw because the guest never programmed the display" from
+/// "the guest programmed real geometry and the renderer got it wrong",
+/// per the Phase 2 task brief's "dig one level" guidance. `chipset`'s
+/// registers are latched copies (`chipset.rs`), so this is exactly what
+/// the renderer's own copper walk would see if it ran from `cop1lc` --
+/// this just reports them without walking the list, since a blank
+/// `cop1lc`/`bplcon0` already answers "did the guest program anything at
+/// all" without needing chip RAM.
+pub fn format_display_state(chipset: &Chipset) -> String {
+    format!(
+        "display state: COP1LC {:#010x}  BPLCON0 {:#06x}  BPLCON1 {:#06x}  \
+         BPL1PT {:#010x}  DIWSTRT/STOP {:#06x}/{:#06x}  DDFSTRT/STOP {:#06x}/{:#06x}  \
+         COLOR00 {:#06x}",
+        chipset.cop1lc,
+        chipset.bplcon0,
+        chipset.bplcon1,
+        chipset.bplpt[0],
+        chipset.diwstrt,
+        chipset.diwstop,
+        chipset.ddfstrt,
+        chipset.ddfstop,
+        chipset.color[0],
+    )
 }
 
 fn task_line(task: Option<&TaskEntry>) -> String {

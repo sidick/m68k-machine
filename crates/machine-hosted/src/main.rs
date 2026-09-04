@@ -11,6 +11,7 @@ mod console;
 mod introspect;
 mod rom_image;
 mod run;
+mod screenshot;
 mod serial_script;
 
 use std::process::ExitCode;

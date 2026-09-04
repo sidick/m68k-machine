@@ -81,6 +81,31 @@ pub struct Args {
     /// normal boot run.
     #[arg(long)]
     pub trigger_illegal_after_frames: Option<u64>,
+
+    /// Capture a rendered frame (Phase 2's stop-gap planar renderer,
+    /// proposal §8.1: copper-walked `BPL`/`DIW`/`DDF`/`COLOR` state, not
+    /// P96) to this PNG file once the guest reaches `--screenshot-frame`.
+    /// With `--screenshot-every` also set, this becomes the base name for
+    /// a numbered sequence instead of a single file. Omit for a normal
+    /// run: the renderer is never driven unless a screenshot is asked
+    /// for, so a plain boot run pays nothing for it.
+    #[arg(long)]
+    pub screenshot: Option<PathBuf>,
+
+    /// Which chipset frame (VERTB boundary, `Chipset::frames`) to capture
+    /// for `--screenshot`. Default is comfortably inside the default
+    /// `--max-frames` while still late enough for Kickstart/AROS to have
+    /// had time to program something (or conclusively not have).
+    #[arg(long, default_value_t = 300)]
+    pub screenshot_frame: u64,
+
+    /// With `--screenshot` set, additionally capture every this many
+    /// frames from `--screenshot-frame` onward (through `--max-frames`),
+    /// each to its own numbered file (`name-000300.png`,
+    /// `name-000350.png`, ...) instead of a single capture -- useful for
+    /// watching boot progress frame by frame.
+    #[arg(long)]
+    pub screenshot_every: Option<u64>,
 }
 
 /// The CPU models this runner knows how to select. A thin wrapper around

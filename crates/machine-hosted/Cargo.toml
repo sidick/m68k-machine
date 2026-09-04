@@ -28,5 +28,14 @@ m68k = "=0.12.1"
 # not apply here.
 clap = { version = "4", features = ["derive"] }
 
+# `--screenshot` output format (crates/machine-hosted/src/screenshot.rs).
+# Pure Rust (image-rs org, MIT/Apache-2.0), no C toolchain requirement, and
+# encoder-only usage here pulls in nothing beyond zlib-family compression
+# crates -- see screenshot.rs's module doc comment for why PNG over PPM
+# (worth one small dependency for viewer/CI-artifact convenience) and this
+# crate over `image` (which would pull in a dozen unused codecs). Hosted-
+# only, like clap above: no bare-metal build depends on this crate.
+png = "0.18.1"
+
 [lints.clippy]
 all = "warn"
