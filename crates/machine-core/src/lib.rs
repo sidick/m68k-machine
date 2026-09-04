@@ -46,6 +46,7 @@ pub mod chipset;
 pub mod cia;
 pub mod display;
 pub mod gayle;
+pub mod picasso2;
 pub mod render;
 pub mod rom;
 
