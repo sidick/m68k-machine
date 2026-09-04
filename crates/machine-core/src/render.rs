@@ -603,11 +603,11 @@ struct Geometry {
     /// Bitplanes to composite, already clamped into `1..=MAX_PLANES` (or
     /// `0` for "no bitplane DMA" — see [`Geometry::decode_band`]).
     planes: u8,
-    /// Whether `BPLCON0`'s interlace bit is set. Both fields are rendered
-    /// into the same, taller framebuffer (see [`draw_bitplanes`]) rather
-    /// than tracking long/short field state — this renderer runs once per
-    /// frame from latched register state, not once per field, so there is
-    /// no separate short-field bitplane pointer to render from.
+    /// Whether `BPLCON0`'s interlace bit is set. Both fields are woven
+    /// into the same, taller framebuffer as interleaved output rows, each
+    /// field reading from its own advancing bitplane pointer — see
+    /// [`draw_bitplanes`]'s doc comment on interlace for how the odd
+    /// field's starting offset and per-field row skip are derived.
     lace: bool,
     /// Output framebuffer pixels per colour clock -- always
     /// [`OUTPUT_PX_PER_CCK`], regardless of hires/lores; see that
@@ -799,14 +799,51 @@ fn advance_plane_ptr(ptr: u32, words: u32, modulo: i16) -> u32 {
 /// Paint the bitplanes into `fb`, one output row at a time, using
 /// whichever [`BandState`] in `bands` is in force at each row's vertical
 /// position (see [`Bands`]'s doc comment for why that can differ from row
-/// to row). Both interlace fields render into the same full-height frame:
-/// since this renderer has only one latched register walk per call (not
-/// one per field), it simply draws twice as many consecutive fetched
-/// lines rather than tracking which field is "current" — a deliberate
-/// simplification, not a claim of exact long/short field weaving. `lace`
-/// is taken as the union across every band (any band requesting
-/// interlace doubles the row count for the whole picture) since it is a
-/// display-mode bit, not something that varies meaningfully mid-frame.
+/// to row). `lace` is taken as the union across every band (any band
+/// requesting interlace doubles the row count for the whole picture)
+/// since it is a display-mode bit, not something that varies meaningfully
+/// mid-frame.
+///
+/// **Interlace.** On real hardware an interlaced screen is two distinct
+/// passes over chip RAM, not one: the even field starts fetching at
+/// `BPLxPT` exactly as programmed, the odd field starts one physical row
+/// further into the same buffer, and each field's own modulo is
+/// programmed large enough to skip its partner's rows so the two fields'
+/// data, read back to back, weave into one full-height picture rather
+/// than each independently repeating the same half-height image (Amiga
+/// Hardware Reference Manual, interlace/`BPLxMOD` chapters). AROS's
+/// no-boot-media screen is the concrete case this fixes: `BPL1MOD`/
+/// `BPL2MOD = $50` (80 bytes) on a 40-word (80-byte) row means each
+/// field's own per-line advance is `ddf_words*2 (the normal fetch) +
+/// modulo` = 160 bytes = two rows' worth, so a single field only ever
+/// touches every other memory row -- exactly the classic interlaced
+/// layout, where consecutive memory rows hold consecutive *physical* scan
+/// lines and alternate between the two fields. The bug this replaces drew
+/// `field_rows*2` rows from *one* continuously-advancing pointer, which
+/// does not skip anything: it duplicates the first `field_rows` rows'
+/// worth of image once, then keeps reading straight on past the picture
+/// into whatever chip RAM follows it for the second half -- precisely the
+/// "picture twice, noise in between" symptom this fixes.
+///
+/// [`odd_field_bplpt`] derives the odd field's starting offset from
+/// `ddf_words` — the fetched row's own byte width — rather than a
+/// hard-coded constant, so it is correct for any screen's row stride, not
+/// just AROS's 40-word one.
+///
+/// **Field order** is fixed (the even field — `BPLxPT` exactly as
+/// programmed — always occupies output rows 0, 2, 4, ...; the odd field
+/// rows 1, 3, 5, ...) rather than keyed off `Chipset`'s `VPOSR`
+/// long/short-field toggle (`lof`). Two reasons: `lof` is a private field
+/// of `Chipset` with no accessor, and this renderer's file-ownership
+/// boundary for this change is `render.rs` alone, so reading it would
+/// mean touching a file outside that boundary for a purely cosmetic
+/// choice; and a fixed order is strictly *more* stable for this
+/// renderer's actual audience (a boot/Guru screen, effectively static
+/// frame to frame) than toggling with `lof` would be — toggling trades a
+/// one-row jitter every frame for hardware fidelity that a static picture
+/// cannot show the benefit of. If a future caller needs field order to
+/// track real `lof` (e.g. for genlock framing), `Chipset` would need a
+/// public accessor first; nothing here forecloses that.
 ///
 /// **Vertical extent** is the union of every band's own `DIWSTRT`/
 /// `DIWSTOP`-decoded range rather than one band's alone: real lists
@@ -818,12 +855,14 @@ fn advance_plane_ptr(ptr: u32, words: u32, modulo: i16) -> u32 {
 /// for why: `bplpt` is seeded once from `state` (the fully-walked
 /// [`CopperState`], i.e. wherever `BPLxPT` was last `MOVE`d) and then
 /// advanced by this function row by row exactly as real fetch hardware
-/// advances it, regardless of which band a given row falls in. A row
+/// advances it, regardless of which band a given row falls in — one
+/// running pointer per field, both seeded from that same `state.bplpt`
+/// (the odd field additionally offset by [`odd_field_bplpt`]). A row
 /// whose band has `planes == 0`, or whose `DMACON` does not have both
 /// `DMAEN` and `BPLEN` set ([`bitplane_dma_enabled`]), does not advance
-/// the pointers at all — real bitplane DMA is not fetching during a
-/// blanked band, or while the guest hasn't turned bitplane DMA on at
-/// all, either — and is instead painted solid with that band's own
+/// that row's field pointers at all — real bitplane DMA is not fetching
+/// during a blanked band, or while the guest hasn't turned bitplane DMA
+/// on at all, either — and is instead painted solid with that band's own
 /// `COLOR00`, so a later band's background (Kickstart's "planes off,
 /// blanking below the picture" band, for instance) shows correctly even
 /// though [`Renderer::render`]'s upfront fill only covers band 0's
@@ -869,14 +908,27 @@ fn draw_bitplanes(state: &CopperState, ram: &[u8], bands: &Bands, fb: &mut Frame
     // real VSTOP never gets close to this.
     let total_rows = total_rows.min(crate::display::MAX_HEIGHT as u32 * 2);
 
-    let mut bplpt = state.bplpt;
+    // Two independently-advancing pointer sets, one per field -- see this
+    // fn's doc comment on interlace. In the non-interlaced case `field[1]`
+    // is simply never touched (every row uses field index 0), so this
+    // costs nothing when `lace` is false.
+    let mut bplpt = [state.bplpt, state.bplpt];
+    if lace {
+        let top_band = bands.band_index_for_line(y0);
+        let top_geom = Geometry::decode_band(&bands.state[top_band]);
+        bplpt[1] = odd_field_bplpt(state.bplpt, top_geom.ddf_words);
+    }
     let mut words = [[0u16; MAX_DDF_WORDS as usize]; MAX_PLANES];
 
     for row in 0..total_rows {
-        // Interlace replays the same band structure for each field by
-        // folding the row back into one field's line range (see this
-        // fn's doc comment on `lace`).
-        let band_line = y0 + (row % field_rows);
+        // Interleave: even output rows are the even field's next line,
+        // odd output rows the odd field's next line (see this fn's doc
+        // comment on field order). Non-interlaced: `field` is always 0
+        // and `field_line` is just `row`, identical to the pre-interlace
+        // behaviour.
+        let field = if lace { (row & 1) as usize } else { 0 };
+        let field_line = if lace { row / 2 } else { row };
+        let band_line = y0 + field_line;
         let y = y0 + row;
 
         let bidx = bands.band_index_for_line(band_line);
@@ -890,8 +942,8 @@ fn draw_bitplanes(state: &CopperState, ram: &[u8], bands: &Bands, fb: &mut Frame
         {
             // This row's band has no bitplane DMA in effect -- paint its
             // own background across the whole row (see this fn's doc
-            // comment) and do not advance bplpt: real fetch hardware
-            // is not running during this band either.
+            // comment) and do not advance this field's bplpt: real fetch
+            // hardware is not running during this band either.
             let argb = argb_from_amiga(bstate.color[0]);
             for x in 0..fb.width {
                 fb.put(x, y as usize, argb);
@@ -905,14 +957,14 @@ fn draw_bitplanes(state: &CopperState, ram: &[u8], bands: &Bands, fb: &mut Frame
                 .enumerate()
                 .take(geom.ddf_words as usize)
             {
-                *slot = read_word(ram, bplpt[p].wrapping_add((w * 2) as u32));
+                *slot = read_word(ram, bplpt[field][p].wrapping_add((w * 2) as u32));
             }
             let modulo = if p % 2 == 0 {
                 bstate.bpl1mod as i16
             } else {
                 bstate.bpl2mod as i16
             };
-            bplpt[p] = advance_plane_ptr(bplpt[p], geom.ddf_words, modulo);
+            bplpt[field][p] = advance_plane_ptr(bplpt[field][p], geom.ddf_words, modulo);
         }
 
         let total_px = geom.ddf_words * 16;
@@ -939,6 +991,20 @@ fn draw_bitplanes(state: &CopperState, ram: &[u8], bands: &Bands, fb: &mut Frame
             fb.put(x as usize, y as usize, argb);
         }
     }
+}
+
+/// Starting bitplane pointers for interlace's odd field: `even`, each
+/// advanced by one row's worth of fetched bytes (`ddf_words` words, i.e.
+/// `ddf_words * 2` bytes per plane). Derived from the row's own fetch
+/// width rather than a hard-coded constant so it is correct for any
+/// screen's row stride (see [`draw_bitplanes`]'s doc comment on
+/// interlace for why one row's stride is exactly the right offset: on
+/// real hardware the odd field starts fetching one physical row after the
+/// even field, and consecutive rows in a normal (row-major) bitmap buffer
+/// are exactly one row's byte width apart).
+fn odd_field_bplpt(even: [u32; 6], ddf_words: u32) -> [u32; 6] {
+    let row_bytes = ddf_words * 2;
+    even.map(|ptr| ptr.wrapping_add(row_bytes))
 }
 
 /// Composite the software mouse pointer from sprite 0 over `fb`.
@@ -2211,5 +2277,153 @@ mod tests {
         let mut pixels = [0u32; 16 * 16];
         let mut fb = Framebuffer::new(&mut pixels, 16, 16).unwrap();
         Renderer::new().render(&chipset, &ram, &mut fb);
+    }
+
+    /// [`odd_field_bplpt`] must derive its offset from the row's own
+    /// fetch width, not a hard-coded constant -- checked at two different
+    /// `ddf_words` values (a small, arbitrary one, and 40, AROS's real
+    /// 4-plane hires row width) so a hypothetical `+80`-style shortcut
+    /// would fail the first case even though it happens to pass the
+    /// second.
+    #[test]
+    fn odd_field_offset_is_derived_from_the_row_stride_not_a_constant() {
+        let even: [u32; 6] = [0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000];
+
+        let odd = odd_field_bplpt(even, 5); // 5 words/row = 10 bytes/row
+        assert_eq!(
+            odd,
+            [0x100A, 0x200A, 0x300A, 0x400A, 0x500A, 0x600A],
+            "offset must be exactly one row's byte width (ddf_words*2), for an arbitrary stride"
+        );
+
+        let odd_aros = odd_field_bplpt(even, 40); // AROS's real 4-plane hires row: 40 words = 80 bytes
+        assert_eq!(
+            odd_aros,
+            [0x1050, 0x2050, 0x3050, 0x4050, 0x5050, 0x6050],
+            "same derivation at AROS's real row width (80 bytes), not a coincidental match"
+        );
+    }
+
+    /// The concrete bug this feature fixes: an interlaced screen must
+    /// render as one woven picture at full vertical resolution, not the
+    /// same half-height field drawn twice with the second copy reading
+    /// off into unrelated memory. Two planes' worth of chip RAM here (one
+    /// per field, laid out as consecutive physical scan lines the way a
+    /// real interlaced bitmap is) hold *distinguishable* content -- the
+    /// even field's rows are all lit, the odd field's all clear -- so
+    /// asserting the two alternate strictly by output-row parity is a
+    /// direct check of the interleave itself, not just "some pixel
+    /// changed somewhere."
+    ///
+    /// `BPL1MOD = ddf_words*2` (matching this test's one-word, 2-byte
+    /// row) reproduces the AROS shape described in this module's
+    /// [`draw_bitplanes`] doc comment: each field's own per-line advance
+    /// (`ddf_words*2` fetch + that same modulo) is two rows' worth, so a
+    /// single field only touches every other memory row -- exactly
+    /// AROS's real `BPL1MOD/BPL2MOD = $50` on its 40-word row, scaled
+    /// down to a one-word row so the test fixture stays tiny.
+    #[test]
+    fn interlaced_screen_alternates_between_its_two_fields_by_output_row() {
+        let mut ram = ram_with(4096);
+        // Physical scan-line order in memory, one word (2 bytes) apart:
+        // even field reads 0x0200, 0x0204, 0x0208, 0x020C (its own line
+        // 0..3); odd field reads 0x0202, 0x0206, 0x020A, 0x020E (offset
+        // one row in, per odd_field_bplpt). Even rows lit, odd rows
+        // clear -- deliberately different so the two fields cannot be
+        // confused for one another.
+        let lit = 0b1000_0000_0000_0000u16;
+        write_word(&mut ram, 0x0200, lit);
+        write_word(&mut ram, 0x0202, 0x0000);
+        write_word(&mut ram, 0x0204, lit);
+        write_word(&mut ram, 0x0206, 0x0000);
+        write_word(&mut ram, 0x0208, lit);
+        write_word(&mut ram, 0x020A, 0x0000);
+        write_word(&mut ram, 0x020C, lit);
+        write_word(&mut ram, 0x020E, 0x0000);
+
+        let mut chipset = Chipset::new();
+        chipset.bplpt[0] = 0x0200;
+        chipset.bplcon0 = 0x1004; // 1 plane, lores, LACE (bit 2) set
+        chipset.dmacon = 0x8300; // SETCLR | DMAEN | BPLEN: bitplane DMA on
+        chipset.bpl1mod = 2; // ddf_words*2 -- see this fn's doc comment
+        chipset.diwstrt = 0x0081; // vstart 0, hstart 0x81
+        chipset.diwstop = 0x04C1; // vstop 4 (byte < 0x80 -> +0x100 not needed here... see below)
+        chipset.ddfstrt = 0x0038;
+        chipset.ddfstop = 0x0038; // one word/line
+        chipset.color[0] = 0x0000; // background/clear: black
+        chipset.color[1] = 0x0FFF; // lit: white
+
+        let geom_x0 = ((chipset.diwstrt & 0xFF) as u32 / 2) * 2;
+        let width = geom_x0 as usize + 8;
+        let height = 10usize; // field_rows(4) * 2 = 8 interlaced rows, plus headroom
+        let mut pixels = std::vec![0u32; width * height];
+        let mut fb = Framebuffer::new(&mut pixels, width, height).unwrap();
+
+        Renderer::new().render(&chipset, &ram, &mut fb);
+
+        let lit_argb = argb_from_amiga(0x0FFF);
+        let clear_argb = argb_from_amiga(0x0000);
+        for row in 0..8usize {
+            let expected = if row % 2 == 0 { lit_argb } else { clear_argb };
+            assert_eq!(
+                fb.pixels[row * width + geom_x0 as usize],
+                expected,
+                "output row {row}: even rows must be the even field's lit data, \
+                 odd rows the odd field's clear data -- not the same field's \
+                 data repeated"
+            );
+        }
+    }
+
+    /// Non-interlaced screens must render exactly as before this change:
+    /// `field` stays 0 for every row (a single, sequentially-advancing
+    /// bitplane pointer, no odd-field offset applied at all), so three
+    /// consecutive rows' worth of distinct data must come back in the
+    /// same top-to-bottom order they were written, unlike the interlaced
+    /// case above where alternate rows come from a different pointer
+    /// entirely.
+    #[test]
+    fn non_interlaced_screen_reads_rows_sequentially_unaffected_by_the_interlace_path() {
+        let mut ram = ram_with(4096);
+        // Three distinct one-word rows, 2 bytes (ddf_words*2, no modulo)
+        // apart -- the plain sequential layout a non-interlaced screen
+        // has always used.
+        write_word(&mut ram, 0x0200, 0b1000_0000_0000_0000); // row 0: lit
+        write_word(&mut ram, 0x0202, 0b0000_0000_0000_0000); // row 1: clear
+        write_word(&mut ram, 0x0204, 0b1000_0000_0000_0000); // row 2: lit
+
+        let mut chipset = Chipset::new();
+        chipset.bplpt[0] = 0x0200;
+        chipset.bplcon0 = 0x1000; // 1 plane, lores, LACE clear
+        chipset.dmacon = 0x8300; // SETCLR | DMAEN | BPLEN: bitplane DMA on
+        chipset.bpl1mod = 0;
+        chipset.diwstrt = 0x0081; // vstart 0, hstart 0x81
+        chipset.diwstop = 0x03C1; // vstop 3
+        chipset.ddfstrt = 0x0038;
+        chipset.ddfstop = 0x0038; // one word/line
+        chipset.color[0] = 0x0000;
+        chipset.color[1] = 0x0FFF;
+
+        let geom_x0 = ((chipset.diwstrt & 0xFF) as u32 / 2) * 2;
+        let width = geom_x0 as usize + 8;
+        let mut pixels = std::vec![0u32; width * 6];
+        let mut fb = Framebuffer::new(&mut pixels, width, 6).unwrap();
+
+        Renderer::new().render(&chipset, &ram, &mut fb);
+
+        let lit = argb_from_amiga(0x0FFF);
+        let clear = argb_from_amiga(0x0000);
+        assert_eq!(fb.pixels[geom_x0 as usize], lit, "row 0 lit, as written");
+        assert_eq!(
+            fb.pixels[width + geom_x0 as usize],
+            clear,
+            "row 1 clear, as written -- not the even field's row 1 from an \
+             interlace pointer that doesn't exist here"
+        );
+        assert_eq!(
+            fb.pixels[2 * width + geom_x0 as usize],
+            lit,
+            "row 2 lit, as written"
+        );
     }
 }
