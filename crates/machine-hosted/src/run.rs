@@ -77,9 +77,12 @@ const EXCEPTION_STORM_THRESHOLD: u64 = 1_000;
 
 /// Why the run ended.
 pub enum Outcome {
-    /// The guest executed STOP with no interrupt pending and stayed
-    /// stopped -- a deliberate, well-defined halt. Real Kickstart never
-    /// does this; it is how the synthetic smoke-test ROM signals "done".
+    /// The guest executed STOP with SR's interrupt mask at 7 -- every
+    /// maskable level (1-6, all this chipset ever requests) shut out, so
+    /// nothing can ever resume it. Real Kickstart never does this; it is
+    /// how the synthetic smoke-test ROM signals "done". Any other STOP
+    /// (Kickstart's idle dispatcher uses mask 0) is not this outcome --
+    /// see `run_guest`'s handling of `CycleBatchExit::Stopped`.
     CleanHalt,
     /// A bound the caller asked for (`--max-frames`/`--max-instructions`)
     /// was hit before any other outcome. Expected for real ROMs at this
@@ -234,6 +237,7 @@ fn run_guest(args: &Args, console: &mut Console, cpu: &mut CpuCore, bus: &mut Bu
         let result = cpu.run_for_cycles_with_hook(bus, RUN_BATCH_CYCLES, |cpu, bus, cycles| {
             bus.0.tick(cycles.max(0) as u32);
             cpu.set_irq(bus.0.pending_irq_level());
+            drain_serial(bus, console);
 
             total_instructions += 1;
             let pc = cpu.ppc;
@@ -313,7 +317,64 @@ fn run_guest(args: &Args, console: &mut Console, cpu: &mut CpuCore, bus: &mut Bu
                 continue 'outer;
             }
             CycleBatchExit::Stopped => {
-                break 'outer Outcome::CleanHalt;
+                // STOP is not HALT: it loads SR from its operand and
+                // suspends fetch until an *unmasked* interrupt arrives
+                // (68000UM4 §6.2), then resumes -- it is Kickstart's idle
+                // dispatcher parking until the next VERTB/CIA tick, not a
+                // request to end the run. SR mask 7 is the one STOP no
+                // level 1-6 source (all this chipset ever requests) can
+                // ever satisfy, which is exactly the synthetic smoke-test
+                // ROM's contract (`tests/smoke.rs`'s `STOP_SR = 0x2700`) --
+                // that, and only that, is a real clean halt.
+                if cpu.int_mask & 0x0700 == 0x0700 {
+                    break 'outer Outcome::CleanHalt;
+                }
+
+                // Check the frame bound *before* ticking rather than
+                // after: one tick here can cross several frame boundaries
+                // at once (`RUN_BATCH_CYCLES` is far more than one
+                // frame's clocks), and the interrupt it raises deserves a
+                // chance to actually reach the CPU on the next
+                // `run_for_cycles_with_hook` call before this loop gives
+                // up on the run. Enforcing the bound here first (rather
+                // than after ticking, which could overshoot straight past
+                // it) means a run that is genuinely making progress is
+                // never cut off mid-wake, while a run that stays stopped
+                // forever still terminates -- the *next* time this arm is
+                // reached with the CPU still stopped, the bound has
+                // caught up.
+                let frames = bus.0.chipset.frames;
+                if frames >= args.max_frames {
+                    break 'outer Outcome::LimitReached("max-frames");
+                }
+
+                // The machine clock must keep advancing while stopped, or
+                // the interrupt that would wake it can never fire:
+                // `run_for_cycles_with_hook`'s docs are explicit that its
+                // hook "is not called for ... an already-stopped CPU", so
+                // nothing else in this loop ticks the bus while `stopped`
+                // stays set. Tick it here instead, resample the IPL the
+                // same way the hook does, and let the outer loop's next
+                // `run_for_cycles_with_hook` call resume the CPU --
+                // `run_for_cycles_inner` services a newly serviceable
+                // interrupt (including waking a stopped core) before its
+                // first fetch on every call.
+                bus.0.tick(RUN_BATCH_CYCLES as u32);
+                cpu.set_irq(bus.0.pending_irq_level());
+                drain_serial(bus, console);
+
+                let frames = bus.0.chipset.frames;
+                if frames >= last_progress_frame + PROGRESS_EVERY_FRAMES {
+                    last_progress_frame = frames;
+                    console.diag(&format!(
+                        "progress: frame {frames}, PC {:#010x} (stopped), overlay {}, INTENA {:#06x}, INTREQ {:#06x}",
+                        cpu.pc,
+                        if bus.0.overlay() { "mapped" } else { "clear" },
+                        bus.0.chipset.intena,
+                        bus.0.chipset.intreq,
+                    ));
+                }
+                continue 'outer;
             }
             CycleBatchExit::AlineTrap { opcode } => {
                 if track_exception(
@@ -384,6 +445,22 @@ fn run_guest(args: &Args, console: &mut Console, cpu: &mut CpuCore, bus: &mut Bu
         frames: bus.0.chipset.frames,
         final_pc: cpu.pc,
         overlay_cleared: !bus.0.overlay(),
+    }
+}
+
+/// Drain any bytes the guest has written to `SERDAT` since the last call
+/// and hand them to the console as guest output.
+///
+/// Phase 1's only observable evidence of reaching the boot menu is this
+/// serial channel (roadmap Phase 1 exit criterion, `docs/combined-
+/// roadmap.md`): `Chipset::write` already buffers `SERDAT` bytes
+/// (`crates/machine-core/src/chipset.rs`'s `push_serial_byte`/
+/// `take_serial_byte`), but nothing drained that buffer before this --
+/// `Console::guest_byte` existed and was already wired for exactly this,
+/// just never called.
+fn drain_serial(bus: &mut Bus, console: &mut Console) {
+    while let Some(byte) = bus.0.chipset.take_serial_byte() {
+        console.guest_byte(byte);
     }
 }
 

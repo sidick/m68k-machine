@@ -67,6 +67,35 @@ automatic `cargo update`.
 dependency) whenever the pinned version changes, or periodically against
 the upstream `main` branch, to see whether `no_std` support has landed.
 
+## m68k-rs `STOP` and interrupt-resume contract
+
+Learned the hard way in Phase 1, when Kickstart appeared to halt after
+2.3M instructions and was in fact idling correctly. Recorded here
+because nothing in the crate's docs collects it in one place and the
+failure it causes looks like a guest bug rather than a host one.
+
+- `CpuCore::stop(new_sr)` calls `set_sr(new_sr)` — which sets
+  `int_mask` from `sr & 0x0700` — then sets the stop bit. `cpu.int_mask`
+  is public and pre-shifted into bits 8-10, and is the reliable way to
+  tell a genuinely unwakeable `STOP` (mask `0x0700`, since this machine
+  never raises level 7) from one waiting for its next interrupt.
+- Every `run_for_cycles_with_hook` call services a newly serviceable
+  interrupt **before its first fetch**, including waking an
+  already-stopped core. That is the resume mechanism.
+- **But while the core is stopped, the run loop returns
+  `CycleBatchExit::Stopped` without calling the host hook at all.** The
+  crate's own doc says the hook "is not called for surfaced traps, STOP,
+  interrupt entry, or an already-stopped CPU". So a host that ticks its
+  devices only from inside the hook freezes its entire machine the
+  moment the guest executes `STOP` — the clock stops, so no interrupt
+  can ever be raised, so the core never wakes. The host must tick the
+  bus and resample `set_irq` itself, once per `Stopped` exit, before the
+  next `run_for_cycles_with_hook` call.
+- Relatedly, the hook does not auto-dispatch A-line/F-line/TRAP/BKPT/
+  illegal traps; they surface to the host for HLE interception. A
+  bus-accurate consumer must call the matching `take_*_exception` to
+  deliver the real hardware exception.
+
 ### How big is the gap, actually? (measured, correcting the above)
 
 The 1,735-error figure sizes the *symptom*, not the work. Counting actual

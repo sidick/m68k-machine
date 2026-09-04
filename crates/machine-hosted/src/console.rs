@@ -34,19 +34,11 @@ impl Console {
 
     /// One byte the guest wrote to `SERDAT`.
     ///
-    /// # Integration point
-    ///
-    /// `machine_core::chipset::Chipset` does not yet expose a way to
-    /// observe `SERDAT` writes — `Chipset::write` discards them (see
-    /// `crates/machine-core/src/chipset.rs`'s `_ => {}` arm), and
-    /// `SERDATR`'s read side is hardwired to report "transmit buffer
-    /// empty" rather than reflecting any transmitted byte. This method
-    /// exists so that once a concurrent worker adds a
-    /// `take_serial_byte() -> Option<u8>`-style drain hook to `Chipset`,
-    /// wiring it in `main.rs`'s run loop is a one-line change: call it
-    /// once per instruction (or once per `tick`) and feed anything it
-    /// returns to this method. Nothing calls this method today.
-    #[allow(dead_code)]
+    /// Fed from `run.rs`'s `drain_serial`, which drains
+    /// `Chipset::take_serial_byte` once per bus tick (both in the normal
+    /// per-instruction hook and while the CPU is stopped) -- this is
+    /// Phase 1's only observable evidence of reaching the boot menu
+    /// (roadmap Phase 1 exit criterion).
     pub fn guest_byte(&mut self, byte: u8) {
         if byte == b'\n' {
             self.flush_guest_line();

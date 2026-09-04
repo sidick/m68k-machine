@@ -912,6 +912,37 @@ mod tests {
         assert_eq!(first, third, "and flips back");
     }
 
+    /// Pins the property `machine-hosted`'s run loop depends on when the
+    /// 68k core is in `STOP`: `m68k-rs`'s `run_for_cycles_with_hook` does
+    /// not call the per-instruction hook while already stopped (its own
+    /// doc comment says so), so the host ticks the bus directly in one
+    /// large chunk instead of one instruction's worth at a time. That
+    /// must still raise VERTB every frame boundary crossed, not just the
+    /// first — otherwise a STOP that spans multiple frames' worth of
+    /// cycles in a single `tick` call would silently swallow every VERTB
+    /// but the last.
+    #[test]
+    fn vertb_fires_for_every_frame_crossed_in_one_large_tick() {
+        let mut c = Chipset::new();
+        c.write(
+            reg::INTENA,
+            0x8000 | (1 << intbit::INTEN) | (1 << intbit::VERTB),
+        );
+        let frame_clocks = PAL_LINES_PER_FRAME * PAL_COLOUR_CLOCKS_PER_LINE * 4;
+
+        // One tick spanning a little over five frames, matching how a
+        // stopped CPU is resynced: one multi-frame chunk, not one
+        // instruction-hook call per frame.
+        let advance = c.tick(frame_clocks * 5 + 10, 4);
+        assert_eq!(c.frames, 5, "all five frame boundaries counted");
+        assert!(advance.frame_wrapped);
+        assert_eq!(
+            c.pending_level(),
+            3,
+            "VERTB must still be pending after a multi-frame tick"
+        );
+    }
+
     #[test]
     fn ntsc_frame_is_262_lines() {
         let mut c = Chipset::new();
