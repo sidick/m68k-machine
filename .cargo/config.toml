@@ -1,0 +1,19 @@
+# Target-scoped cargo config (Phase 0).
+#
+# Each section here applies only when building for that specific
+# `--target`, so it is safe for the whole workspace: it does not affect
+# hosted builds (`cargo test -p machine-core`, etc.) or any other target.
+#
+# aarch64-unknown-none (crates/board-qemu-virt): the target has no
+# unwinding support, so `panic = "abort"` is required for a no_std binary
+# to link. This is deliberately NOT a `[profile.*] panic = "abort"` in the
+# root Cargo.toml, which would apply workspace-wide and break `cargo test`
+# (the test harness needs unwinding). Scoping it to the target via
+# rustflags here affects only aarch64-unknown-none builds.
+#
+# The linker script (link.ld) is wired in separately, by
+# crates/board-qemu-virt/build.rs (which copies it into OUT_DIR and emits
+# `cargo:rustc-link-arg=-Tlink.ld`), not here, so it resolves correctly
+# regardless of the directory cargo is invoked from.
+[target.aarch64-unknown-none]
+rustflags = ["-C", "panic=abort"]

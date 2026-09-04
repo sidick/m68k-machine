@@ -1,0 +1,14 @@
+[package]
+name = "board-qemu-q35"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "x86-64 UEFI board layer for the m68k Machine project, targeting QEMU's q35 machine"
+publish = false
+
+[dependencies]
+machine-core = { path = "../machine-core" }
+uefi = { version = "0.40", features = ["panic_handler"] }
+
+[lints.clippy]
+all = "warn"

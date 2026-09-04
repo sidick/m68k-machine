@@ -1,0 +1,33 @@
+[package]
+name = "board-qemu-virt"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "aarch64 bare-metal board layer for QEMU's `virt` machine (Phase 0 smoke payload)"
+publish = false
+
+# Canonical build command (run from the workspace root; a crate-local
+# .cargo/config.toml would NOT apply here since cargo reads config from the
+# invocation directory, not the crate directory):
+#
+#   cargo build -p board-qemu-virt --target aarch64-unknown-none
+#
+# The linker script (link.ld) is wired in by build.rs, which copies it into
+# OUT_DIR and emits `cargo:rustc-link-arg=-Tlink.ld` +
+# `cargo:rustc-link-search`, so it resolves regardless of invocation
+# directory. `panic = "abort"` for this target is supplied by the
+# workspace-root `.cargo/config.toml`'s `[target.aarch64-unknown-none]`
+# rustflags, scoped to that target only so it never affects hosted builds
+# or `cargo test`.
+#
+# Run under QEMU: scripts/run-qemu-virt.sh
+
+[[bin]]
+name = "board-qemu-virt"
+path = "src/main.rs"
+
+[dependencies]
+machine-core = { path = "../machine-core" }
+
+[lints.clippy]
+all = "warn"

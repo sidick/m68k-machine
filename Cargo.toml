@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/machine-core"]
+members = ["crates/machine-core", "crates/board-qemu-q35", "crates/board-qemu-virt"]
 
 # Workspace layout note (Phase 0):
 #
