@@ -11,12 +11,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Hosted build/lint/test: machine-core's own suite, plus clippy for the
-  # two bare-metal board crates (built with their explicit --target, since
-  # they cannot be built for the host -- see Cargo.toml's workspace-layout
-  # note and rust-toolchain.toml).
+  # Hosted build/lint/test: machine-core's and machine-hosted's own
+  # suites, plus clippy for the two bare-metal board crates (built with
+  # their explicit --target, since they cannot be built for the host --
+  # see Cargo.toml's workspace-layout note and rust-toolchain.toml).
   test:
-    name: test (fmt, clippy, machine-core)
+    name: test (fmt, clippy, machine-core, machine-hosted)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,10 +44,16 @@ jobs:
 
       # NOT `cargo test --workspace`: the board crates are bare-metal-only
       # (no_std, custom target, no host runner) and would fail to build
-      # for the default host target. machine-core is the only crate with a
-      # hosted test suite today.
+      # for the default host target. machine-core and machine-hosted are
+      # the crates with a hosted test suite today.
       - name: cargo test -p machine-core
         run: cargo test -p machine-core
+
+      - name: cargo clippy -p machine-hosted
+        run: cargo clippy -p machine-hosted --all-targets -- -D warnings
+
+      - name: cargo test -p machine-hosted
+        run: cargo test -p machine-hosted
 
   # aarch64 harness: build board-qemu-virt, boot it under QEMU's `virt`
   # machine, and grep its serial output for the Phase 0 marker line.
@@ -131,6 +137,87 @@ jobs:
         with:
           name: qemu-q35-serial-log
           path: q35-serial.log
+          if-no-files-found: ignore
+
+  # AROS 68k smoke boot: build machine-hosted, boot the vendored,
+  # freely-redistributable AROS 68k ROM pair (assets/aros/ -- see
+  # docs/ci.md and assets/aros/PROVENANCE.md for why this is vendored
+  # in-repo rather than fetched, its licence, and how to refresh it
+  # deliberately) bounded, and assert the guest reached exec and produced
+  # serial output. This is the Phase 1 roadmap gate ("ROM pair loads,
+  # exec starts, serial output reached") -- Kickstart is NOT part of this
+  # job or this workflow, since it is not redistributable; see docs/ci.md
+  # for that split.
+  aros-smoke:
+    name: aros-smoke (AROS 68k ROM pair)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync toolchain from rust-toolchain.toml
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build machine-hosted
+        run: cargo build -p machine-hosted --release
+
+      # --max-frames bounds the run so it always terminates (see
+      # crates/machine-hosted/src/cli.rs); a real ROM at this phase is
+      # expected to hit that bound rather than cleanly HALT (see run.rs's
+      # `Outcome` docs), so exit code 1 ("LIMIT REACHED") is the normal,
+      # passing outcome here -- only exit codes other than 0 (clean halt)
+      # or 1 (bounded) indicate a real failure (wedge or setup error).
+      # `set +e`/`set -e` bracket just the run so that expected non-zero
+      # exit doesn't trip `set -e` before the status is inspected.
+      - name: Run AROS smoke boot
+        run: |
+          set +e
+          ./target/release/machine-hosted \
+            --rom assets/aros/aros-amiga-m68k-rom.bin \
+            --ext-rom assets/aros/aros-amiga-m68k-ext.bin \
+            --max-frames 300 \
+            --serial-log aros-serial.log
+          status=$?
+          set -e
+          echo "machine-hosted exit code: $status"
+          if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
+            echo "error: expected exit 0 (clean halt) or 1 (bounded run), got $status" >&2
+            exit 1
+          fi
+
+      # Markers chosen to prove the full Phase 1 exit criterion --
+      # "ROM pair loads, exec starts, serial output reached" -- without
+      # being so specific to this AROS build that a routine nightly
+      # version bump (a changed $VER string, a reordered ROMInfo line)
+      # breaks CI spuriously:
+      #   - "PHASE1 HOSTED: reached overlay-cleared" is this runner's own
+      #     marker (crates/machine-hosted/src/run.rs), not AROS's, so it
+      #     is stable regardless of AROS version: the CPU left the ROM
+      #     overlay and is running from RAM-mapped exec.
+      #   - "callroms done" is exec's own boot-time trace once it has
+      #     finished walking and initialising ROM resident modules --
+      #     present in every AROS nightly that gets this far, and a much
+      #     more direct proxy for "exec started" than any address or
+      #     version string.
+      #   - "'chip memory'" is exec's MemHeader listing reaching serial,
+      #     the concrete "serial output reached" evidence, without
+      #     pinning to the exact byte ranges (which move if the machine's
+      #     memory map ever changes) or ROM revision numbers (which
+      #     change every nightly).
+      - name: Check AROS serial output
+        run: |
+          ./scripts/check-serial-markers.sh aros-serial.log \
+            "PHASE1 HOSTED: reached overlay-cleared" \
+            "GUEST | callroms done" \
+            "'chip memory'"
+
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aros-smoke-serial-log
+          path: aros-serial.log
           if-no-files-found: ignore
 
   # m68k cross-toolchain smoke check: compiles a trivial AmigaOS C program
