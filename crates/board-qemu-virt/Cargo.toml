@@ -29,5 +29,11 @@ path = "src/main.rs"
 [dependencies]
 machine-core = { path = "../machine-core" }
 
+# The no_std fork (see the root Cargo.toml's [workspace.dependencies] doc
+# comment and docs/phase0-findings.md): this is the first board layer that
+# can actually link a CpuCore, now that upstream's no-no_std blocker is
+# worked around by the fork.
+m68k = { workspace = true }
+
 [lints.clippy]
 all = "warn"

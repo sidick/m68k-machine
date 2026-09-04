@@ -40,9 +40,15 @@ SECTIONS
     __bss_end = .;
   } > RAM
 
-  /* 64 KB stack, immediately after .bss; grows down from __stack_top. */
+  /* 1 MB stack, immediately after .bss; grows down from __stack_top.
+   * Was 64 KB in the Phase 0 bus-only payload; that overflowed silently
+   * (no MMU guard page on this MMU-off payload, so overflow corrupts
+   * whatever memory follows rather than faulting) once this crate started
+   * calling into the `m68k` fork's interpreter, whose decode/dispatch and
+   * FPU paths carry much deeper, unoptimized-debug-build stack frames
+   * than the bus-only checks ever needed. */
   . = ALIGN(16);
-  . = . + 0x10000;
+  . = . + 0x100000;
   __stack_top = .;
 
   /DISCARD/ : {

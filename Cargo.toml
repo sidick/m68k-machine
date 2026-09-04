@@ -32,3 +32,21 @@ members = ["crates/machine-core", "crates/machine-hosted", "crates/board-qemu-q3
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# The project owner's personal `no_std`-capable fork (docs/phase0-findings.md;
+# upstream `m68k` 0.12.1 has no no_std support and the owner is not
+# upstreaming this fork for now). Pinned by `rev`, not `branch`: a branch
+# moves under us, and this project already pins the published crate exactly
+# for the same reason -- an unplanned change in CPU semantics landing under
+# the test suite (or, now, under bare-metal execution) must be a deliberate,
+# reviewed step, not something that happens because someone else pushed to
+# `feat/no-std`. Defined once here so every consumer (machine-core's
+# hosted-only dev-dependency, machine-hosted's runtime dependency, and
+# board-qemu-virt's new runtime dependency) shares one pin instead of three
+# copies that could drift.
+#
+# `default-features = false`: the fork's default features pull in std-only
+# pieces (see the fork's Cargo.toml); this project only wants the core
+# interpreter, which works no_std + libm.
+m68k = { git = "https://github.com/sidick/m68k-rs", rev = "5d27b8c083e1e6db6c13596f96c36dcc5f347e7f", default-features = false }

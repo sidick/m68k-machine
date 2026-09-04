@@ -13,10 +13,12 @@ publish = false
 # docs/phase0-findings.md), so it can only be used hosted, in tests.
 
 [dev-dependencies]
-# Pinned exactly: single-author crate, no no_std support yet, and this
-# machine tracks its behaviour closely enough that an unplanned upstream
-# bump could silently change guest semantics. See docs/phase0-findings.md.
-m68k = "=0.12.1"
+# The project's `no_std`-capable fork, pinned by `rev` in
+# [workspace.dependencies] (see the root Cargo.toml) so this crate, the
+# hosted runner, and board-qemu-virt all share one pin. Still only a
+# dev-dependency here: the bus does not need a CPU, and machine-core stays
+# dependency-free in its normal build. See docs/phase0-findings.md.
+m68k = { workspace = true }
 
 [lints.clippy]
 all = "warn"

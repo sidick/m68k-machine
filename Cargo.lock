@@ -82,6 +82,7 @@ dependencies = [
 name = "board-qemu-virt"
 version = "0.1.0"
 dependencies = [
+ "m68k",
  "machine-core",
 ]
 
@@ -179,6 +180,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
 name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -187,8 +194,10 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 [[package]]
 name = "m68k"
 version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1e596886511cf8e15e844b7a2448874f91d288eb22370c5f200b8f5e9bdfa3c"
+source = "git+https://github.com/sidick/m68k-rs?rev=5d27b8c083e1e6db6c13596f96c36dcc5f347e7f#5d27b8c083e1e6db6c13596f96c36dcc5f347e7f"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "machine-core"
