@@ -39,5 +39,17 @@ clap = { version = "4", features = ["derive"] }
 # only, like clap above: no bare-metal build depends on this crate.
 png = "0.18.1"
 
+[dev-dependencies]
+# **New dev-only dependency, flagged prominently per this crate's task
+# constraints.** Used solely by `tests/blitter_differential.rs` (`#[ignore]`d,
+# does not run under a plain `cargo test`) to parse Copperline's JSON-RPC
+# control-protocol responses (`custom.dump`'s nested register map in
+# particular). Hand-rolling a JSON parser for that nested shape would be
+# more code and more bug surface than pulling in the ecosystem-standard
+# parser for a test-only, non-shipping dependency; it does not touch
+# `machine-hosted`'s binary, `machine-core`, or either bare-metal board
+# build.
+serde_json = "1"
+
 [lints.clippy]
 all = "warn"
