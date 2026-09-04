@@ -64,6 +64,58 @@ pub enum RomKind {
     Unknown,
 }
 
+/// Why an identified image is not directly usable as this machine's
+/// Kickstart. Distinct from `identify()` returning `None`: that means no
+/// header could be parsed at all, whereas every variant here comes with
+/// a full [`RomInfo`] — the image *was* read, just not one this machine
+/// can run as given.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unsupported {
+    /// Version 34 and below: Kickstart 1.x. This machine hangs storage,
+    /// network and display entirely off Zorro III AUTOCONFIG cards
+    /// (proposal §9), and Z3 AUTOCONFIG was never present in any
+    /// 68000-class Kickstart — expansion.library there configures Zorro
+    /// II only (proposal §11.1). No 1.x ROM can reach a usable state on
+    /// this machine, so this check is sound in the direction it's used.
+    ///
+    /// It is *not* sufficient in the other direction: version alone does
+    /// not prove Z3 support for anything above this gate. A 3.1 A500 ROM
+    /// (V40) is 68000-class and Zorro-II-only, while the A1200 3.1 ROM
+    /// (also V40) does Z3 — same version, different machine variant.
+    /// Passing this check only means "not provably 1.x-class"; it is not
+    /// a positive identification of Z3 capability.
+    TooOldForZorroIII,
+    /// Valid header and checksum, but no reset vector (`bootable` is
+    /// false) — a library/extension ROM meant to be mapped alongside a
+    /// main ROM, not booted itself. The AROS extended ROM is exactly
+    /// this: expected and benign when loaded with `--ext-rom`, not an
+    /// error.
+    ExtensionRom,
+}
+
+impl Unsupported {
+    /// A short, human-readable explanation suitable for a runner to
+    /// print directly. `&'static str`, not `String`: this crate has no
+    /// `alloc`.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Unsupported::TooOldForZorroIII => {
+                "this ROM is Kickstart 1.x (V34 or below). This machine's storage, \
+                 network and display are all Zorro III AUTOCONFIG cards, and Zorro \
+                 III AUTOCONFIG did not exist in any 68000-class Kickstart, so this \
+                 ROM cannot reach a usable state here (see proposal §11.1). Use the \
+                 A1200 3.2 ROM instead."
+            }
+            Unsupported::ExtensionRom => {
+                "this ROM has no reset vector, so it is an extension/library ROM \
+                 (like the AROS ext ROM), not something the CPU can boot on its \
+                 own. Load it with --ext-rom alongside a bootable main ROM instead \
+                 of on its own."
+            }
+        }
+    }
+}
+
 /// What identification could determine about an image.
 #[derive(Clone, Copy, Debug)]
 pub struct RomInfo {
@@ -79,7 +131,10 @@ pub struct RomInfo {
     /// internal version (e.g. `51.8`); the resident-derived value is the
     /// one that matches what the running OS reports.
     pub exec_rev: (u16, u16),
-    /// Image size in bytes.
+    /// Image size in bytes, i.e. `image.len()` of the buffer passed to
+    /// [`identify`] (the doubled length for a doubled image — see
+    /// [`RomInfo::doubled`] — not the logical 256 KB/512 KB the header
+    /// declares).
     pub size: usize,
     /// Whether the ROM's own checksum validates.
     pub checksum_ok: bool,
@@ -92,57 +147,268 @@ pub struct RomInfo {
     /// at that address to jump to — it is a library archive to be mapped
     /// alongside a main ROM, not something the CPU resets into.
     pub bootable: bool,
+    /// True when the buffer was longer than one logical image and every
+    /// copy inside it was byte-identical (see [`identify`]'s doubled-image
+    /// handling). This is an ordinary distribution form for 256 KB
+    /// Kickstarts stored in a 512 KB EEPROM footprint, not corruption —
+    /// `rev`/`exec_rev`/etc. above come from the first copy.
+    pub doubled: bool,
+    /// Whether this image is directly usable as this machine's
+    /// Kickstart. `Err` carries the reason; see [`Unsupported`].
+    pub supported: Result<(), Unsupported>,
 }
 
-/// Identify a ROM image, or return `None` if it has no usable header.
+/// Identify a ROM image, or return `None` if it has no usable header —
+/// not even once byte-swap correction (see [`is_byte_swapped`]) is taken
+/// into account by the caller.
 ///
 /// Deliberately tolerant: a failed checksum is reported in [`RomInfo`]
 /// rather than rejected, because a user-supplied or hand-patched ROM
 /// should still boot and say so, not be silently refused. Likewise an
 /// image with no reset vector (the AROS ext ROM) is still identified,
-/// just marked `bootable: false` rather than treated as broken.
+/// just marked `bootable: false` / `supported: Err(ExtensionRom)` rather
+/// than treated as broken.
 ///
 /// Header layout: magic longword at offset 0 (also encodes the expected
 /// image size), the `JMP`'s target (the boot PC) at offset `$04`, and
 /// version/revision words at offset `$0C`. amitools' romtool
 /// (`~/src/amitools/amitools/rom`) is the reference implementation and
 /// agrees with this machine's ROM set.
+///
+/// Two layouts beyond a single correctly-sized image are accepted:
+///
+/// - **Doubled**: the buffer is an exact multiple of the size the magic
+///   declares, and every copy inside it is byte-identical. This is how
+///   256 KB Kickstarts are ordinarily distributed for a 512 KB EEPROM
+///   footprint (the image mirrored twice), not corruption — see
+///   [`RomInfo::doubled`]. A multiple whose copies are *not* identical is
+///   rejected (`None`): that is genuine corruption, not this layout.
+/// - **Byte-swapped**: see [`is_byte_swapped`] and [`unswap_in_place`].
+///   `identify()` does not correct this itself (it has no buffer to write
+///   a correction into — `image` is `&[u8]`, and this crate has no
+///   `alloc` to copy into); a swapped image's header is read via
+///   word-swapped accessors just enough to report `rev`/`boot_pc`/
+///   `checksum_ok` for diagnostics, with `kind` left [`RomKind::Unknown`]
+///   (the id-string scan that would tell Kickstart from AROS apart is not
+///   worth reimplementing byte-swap-aware for a value this transient —
+///   the caller is expected to correct and re-identify, at which point
+///   the normal scan runs). `supported` is always `Ok(())` for a
+///   byte-swapped image: swapping is lossless and the caller is expected
+///   to apply it (`unswap_in_place`) and call `identify` again to get the
+///   authoritative, fully-parsed `RomInfo` for the corrected bytes.
 pub fn identify(image: &[u8]) -> Option<RomInfo> {
     let magic = read_u32(image, 0)?;
-    let expected_size = match magic {
-        KICK_MAGIC_512K => 512 * 1024,
-        KICK_MAGIC_256K => 256 * 1024,
-        _ => return None,
-    };
-    // A real image's magic and length agree; anything else has no usable
-    // header (romtool's `check_size` + `check_header`, taken together).
-    if image.len() != expected_size {
+
+    if let Some(expected_size) = magic_size(magic) {
+        if image.len() == expected_size {
+            return Some(build_info(image, image, false));
+        }
+        // Size disagrees with the magic's own declaration: accept it only
+        // if every logical copy inside the buffer is identical (romtool's
+        // `check_size` would reject this outright; a doubled distribution
+        // image is the one legitimate reason real files look like this).
+        if let Some(first_copy) = doubled_copy(image, expected_size) {
+            return Some(build_info(image, first_copy, true));
+        }
         return None;
     }
 
+    // Header didn't parse directly. Check whether it reads correctly once
+    // each 16-bit word's bytes are swapped back — a byte-swapped dump,
+    // not a different or corrupt ROM (see `is_byte_swapped`).
+    let swapped_magic = swap_header_u32(magic);
+    if let Some(expected_size) = magic_size(swapped_magic) {
+        if image.len() == expected_size {
+            return Some(build_swapped_info(image));
+        }
+    }
+    None
+}
+
+/// Whether `image` reads as a valid Kickstart-format header once every
+/// 16-bit word's two bytes are swapped back — i.e. whether it is a
+/// byte-swapped dump of a real ROM rather than an unrelated or corrupt
+/// file. Cheap and side-effect-free: only the first longword is
+/// examined, so a caller can check this before deciding whether
+/// [`unswap_in_place`] is worth doing.
+///
+/// A file already reading directly is not reported as swapped even if,
+/// coincidentally, its swapped form also happened to look like a header.
+pub fn is_byte_swapped(image: &[u8]) -> bool {
+    let Some(magic) = read_u32(image, 0) else {
+        return false;
+    };
+    if magic_size(magic).is_some() {
+        return false;
+    }
+    match magic_size(swap_header_u32(magic)) {
+        Some(expected_size) => image.len() == expected_size,
+        None => false,
+    }
+}
+
+/// Correct a byte-swapped ROM dump in place: every 16-bit word's two
+/// bytes are swapped back to their original order (word positions
+/// unchanged). Some dumping paths transpose the two bytes of each 16-bit
+/// ROM word in transit; the result is a word-order artefact of *how the
+/// image was read*, not a different ROM, so this correction is lossless
+/// — applying it twice restores the original bytes exactly (it is its
+/// own inverse).
+///
+/// Typical use: `is_byte_swapped(&buf)` (or a first `identify(&buf)`
+/// returning `None`) signals the need, `unswap_in_place(&mut buf)`
+/// applies it, then `identify(&buf)` again produces the authoritative,
+/// fully-parsed [`RomInfo`] — with the normal id-string `kind` scan,
+/// resident-derived `exec_rev`, etc., none of which the swapped-header
+/// fast path in [`identify`] attempts.
+///
+/// Operates in place because this crate has no allocator: there is no
+/// way to hand back a corrected copy, only to mutate the caller's own
+/// buffer.
+pub fn unswap_in_place(image: &mut [u8]) {
+    let (chunks, _remainder) = image.as_chunks_mut::<2>();
+    for chunk in chunks {
+        chunk.swap(0, 1);
+    }
+}
+
+/// Map a header magic to the image size it declares, or `None` if it
+/// isn't one of the two magics this machine recognises.
+fn magic_size(magic: u32) -> Option<usize> {
+    match magic {
+        KICK_MAGIC_512K => Some(512 * 1024),
+        KICK_MAGIC_256K => Some(256 * 1024),
+        _ => None,
+    }
+}
+
+/// If `image` is an exact multiple of `expected_size` and every
+/// `expected_size`-sized chunk within it is byte-identical, return the
+/// first chunk (the one logical copy to parse a header from). Returns
+/// `None` when the lengths don't divide evenly or the copies disagree —
+/// both cases are left to the caller to treat as unparseable/corrupt,
+/// not silently patched over.
+fn doubled_copy(image: &[u8], expected_size: usize) -> Option<&[u8]> {
+    if expected_size == 0 || !image.len().is_multiple_of(expected_size) {
+        return None;
+    }
+    let copies = image.len() / expected_size;
+    if copies < 2 {
+        return None;
+    }
+    let first = &image[..expected_size];
+    let all_match = image
+        .chunks_exact(expected_size)
+        .all(|chunk| chunk == first);
+    if all_match {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+/// Swap the bytes of each 16-bit half of `v` independently, leaving the
+/// half-word order unchanged. This is the transform a byte-swapped dump
+/// applies to every aligned `u32` header field: unlike [`u32::swap_bytes`]
+/// (which would also reverse the two halves against each other), a real
+/// byte-swapped ROM only has each *word* transposed by the swapped-endian
+/// read path that produced the dump, not the whole longword.
+fn swap_header_u32(v: u32) -> u32 {
+    let hi = ((v >> 16) as u16).swap_bytes() as u32;
+    let lo = (v as u16).swap_bytes() as u32;
+    (hi << 16) | lo
+}
+
+/// Read a `u16` header field from a byte-swapped image, undoing the swap
+/// for that one word. Valid at any even offset, which every header field
+/// this module reads happens to be.
+fn read_u16_swapped(image: &[u8], off: usize) -> Option<u16> {
+    read_u16(image, off).map(u16::swap_bytes)
+}
+
+/// Read a `u32` header field from a byte-swapped image (see
+/// [`read_u16_swapped`]; a longword is just its two halves swapped
+/// independently, per [`swap_header_u32`]).
+fn read_u32_swapped(image: &[u8], off: usize) -> Option<u32> {
+    read_u32(image, off).map(swap_header_u32)
+}
+
+/// Classify support for a fully-parsed (non-byte-swapped) image: the V34
+/// Zorro III gate first (see [`Unsupported::TooOldForZorroIII`]), then
+/// bootability. Order matters only for which reason wins when both could
+/// apply; in practice no 1.x ROM in this machine's set also lacks a reset
+/// vector, so it hasn't come up.
+fn classify_support(rev: (u16, u16), bootable: bool) -> Result<(), Unsupported> {
+    if rev.0 <= 34 {
+        Err(Unsupported::TooOldForZorroIII)
+    } else if !bootable {
+        Err(Unsupported::ExtensionRom)
+    } else {
+        Ok(())
+    }
+}
+
+/// Build a [`RomInfo`] for a directly-parsed or doubled image.
+/// `header_region` is the one logical copy to read fields from (equal to
+/// `full_image` unless `doubled`); `full_image` is what `size` reports.
+fn build_info(full_image: &[u8], header_region: &[u8], doubled: bool) -> RomInfo {
     let rev = (
-        read_u16(image, ROM_REV_OFFSET)?,
-        read_u16(image, ROM_REV_OFFSET + 2)?,
+        read_u16(header_region, ROM_REV_OFFSET).unwrap_or(0),
+        read_u16(header_region, ROM_REV_OFFSET + 2).unwrap_or(0),
     );
     let header_exec_rev = (
-        read_u16(image, EXEC_REV_OFFSET)?,
-        read_u16(image, EXEC_REV_OFFSET + 2)?,
+        read_u16(header_region, EXEC_REV_OFFSET).unwrap_or(0),
+        read_u16(header_region, EXEC_REV_OFFSET + 2).unwrap_or(0),
     );
-    let boot_pc = read_u32(image, 4)?;
-    let bootable = read_u16(image, MAGIC_RESET_OFFSET) == Some(MAGIC_RESET_OPCODE);
-    let checksum_ok = verify_checksum(image);
-    let exec_rev = find_exec_library_version(image).unwrap_or(header_exec_rev);
-    let kind = detect_kind(image);
+    let boot_pc = read_u32(header_region, 4).unwrap_or(0);
+    let bootable = read_u16(header_region, MAGIC_RESET_OFFSET) == Some(MAGIC_RESET_OPCODE);
+    let checksum_ok = verify_checksum(header_region);
+    let exec_rev = find_exec_library_version(header_region).unwrap_or(header_exec_rev);
+    let kind = detect_kind(header_region);
+    let supported = classify_support(rev, bootable);
 
-    Some(RomInfo {
+    RomInfo {
         kind,
+        rev,
+        exec_rev,
+        size: full_image.len(),
+        checksum_ok,
+        boot_pc,
+        bootable,
+        doubled,
+        supported,
+    }
+}
+
+/// Build a [`RomInfo`] for an image only readable via byte-swapped
+/// accessors. See [`identify`]'s doc comment for what is and isn't
+/// attempted here (no id-string scan, no resident-derived exec_rev) and
+/// why `supported` is always `Ok(())`: correction is the caller's job,
+/// not a reason to refuse the image.
+fn build_swapped_info(image: &[u8]) -> RomInfo {
+    let rev = (
+        read_u16_swapped(image, ROM_REV_OFFSET).unwrap_or(0),
+        read_u16_swapped(image, ROM_REV_OFFSET + 2).unwrap_or(0),
+    );
+    let exec_rev = (
+        read_u16_swapped(image, EXEC_REV_OFFSET).unwrap_or(0),
+        read_u16_swapped(image, EXEC_REV_OFFSET + 2).unwrap_or(0),
+    );
+    let boot_pc = read_u32_swapped(image, 4).unwrap_or(0);
+    let bootable = read_u16_swapped(image, MAGIC_RESET_OFFSET) == Some(MAGIC_RESET_OPCODE);
+    let checksum_ok = verify_checksum_swapped(image);
+
+    RomInfo {
+        kind: RomKind::Unknown,
         rev,
         exec_rev,
         size: image.len(),
         checksum_ok,
         boot_pc,
         bootable,
-    })
+        doubled: false,
+        supported: Ok(()),
+    }
 }
 
 /// Classify an image by scanning for identifying strings. Version range
@@ -175,6 +441,28 @@ fn verify_checksum(image: &[u8]) -> bool {
         let val = u32::from_be_bytes(*chunk);
         let (next, carry) = sum.overflowing_add(val);
         sum = if carry { next.wrapping_add(1) } else { next };
+    }
+    sum == 0xFFFF_FFFF
+}
+
+/// As [`verify_checksum`], but for an image only readable via
+/// byte-swapped accessors: each aligned longword is reconstructed with
+/// [`read_u32_swapped`] before folding it into the running sum. Because
+/// the checksum is a plain sum (order-independent) over the same set of
+/// 4-byte-aligned positions either way, this yields exactly the checksum
+/// the real (corrected) image would report — it's how
+/// [`build_swapped_info`] can give an honest `checksum_ok` for
+/// diagnostics without materialising a corrected copy.
+fn verify_checksum_swapped(image: &[u8]) -> bool {
+    let mut sum: u32 = 0;
+    let mut off = 0usize;
+    while off + 4 <= image.len() {
+        let Some(val) = read_u32_swapped(image, off) else {
+            return false;
+        };
+        let (next, carry) = sum.overflowing_add(val);
+        sum = if carry { next.wrapping_add(1) } else { next };
+        off += 4;
     }
     sum == 0xFFFF_FFFF
 }
@@ -502,6 +790,136 @@ mod tests {
         assert_eq!(info.exec_rev, (51, 8));
     }
 
+    #[test]
+    fn version_34_and_below_is_too_old_for_zorro_iii() {
+        // Kickstart 1.3, 34.5 — the exact real-world case (KICK13.ROM /
+        // kickstart-34.5.rom), synthesised so the gate is tested even
+        // without those files present.
+        let image = synthetic_256k((34, 5), (34, 2), 0x00FC_00D2);
+        let info = identify(&image).expect("valid header");
+        assert_eq!(
+            info.supported,
+            Err(Unsupported::TooOldForZorroIII),
+            "V34 must be gated as too old for Zorro III"
+        );
+    }
+
+    #[test]
+    fn version_above_34_is_not_gated_by_age_alone() {
+        let image = synthetic_256k((40, 63), (40, 10), 0x00F8_00D2);
+        let info = identify(&image).expect("valid header");
+        assert_eq!(info.supported, Ok(()));
+    }
+
+    #[test]
+    fn extension_rom_is_unsupported_but_distinct_from_too_old() {
+        let mut image = synthetic_256k((46, 11), (46, 11), 0x00F8_0002);
+        image[MAGIC_RESET_OFFSET..MAGIC_RESET_OFFSET + 2].copy_from_slice(&[0, 0]);
+        balance_checksum(&mut image);
+        let info = identify(&image).expect("header is otherwise valid");
+        assert_eq!(info.supported, Err(Unsupported::ExtensionRom));
+    }
+
+    #[test]
+    fn unsupported_reasons_carry_static_text() {
+        assert!(!Unsupported::TooOldForZorroIII.reason().is_empty());
+        assert!(!Unsupported::ExtensionRom.reason().is_empty());
+    }
+
+    // ---- doubled-image tests ----------------------------------------
+
+    #[test]
+    fn doubled_image_is_accepted_and_identified_from_first_copy() {
+        let single = synthetic_256k((47, 115), (47, 13), 0x00F8_00D2);
+        let mut doubled = single.clone();
+        doubled.extend_from_slice(&single);
+
+        let info = identify(&doubled).expect("doubled image should still identify");
+        assert!(info.doubled);
+        assert_eq!(info.rev, (47, 115));
+        assert_eq!(info.exec_rev, (47, 13));
+        assert!(info.checksum_ok);
+        // `size` reports the buffer actually passed in, not the logical
+        // 256 KB the header declares.
+        assert_eq!(info.size, 512 * 1024);
+    }
+
+    #[test]
+    fn non_doubled_image_is_not_marked_doubled() {
+        let image = synthetic_256k((47, 115), (47, 13), 0x00F8_00D2);
+        let info = identify(&image).expect("valid header");
+        assert!(!info.doubled);
+    }
+
+    #[test]
+    fn mismatched_halves_are_rejected_as_corruption() {
+        let single = synthetic_256k((47, 115), (47, 13), 0x00F8_00D2);
+        let mut mismatched = single.clone();
+        mismatched.extend_from_slice(&single);
+        // Corrupt one byte in the second half only: the two copies now
+        // disagree, which must NOT be accepted as a doubled image.
+        let half = mismatched.len() / 2;
+        mismatched[half + 0x1000] ^= 0xFF;
+        assert!(
+            identify(&mismatched).is_none(),
+            "mismatched halves must be rejected, not silently accepted as doubled"
+        );
+    }
+
+    // ---- byte-swap tests ---------------------------------------------
+
+    #[test]
+    fn is_byte_swapped_detects_a_swapped_header() {
+        let mut image = synthetic_256k((47, 115), (47, 13), 0x00F8_00D2);
+        assert!(!is_byte_swapped(&image));
+        unswap_in_place(&mut image);
+        assert!(is_byte_swapped(&image));
+    }
+
+    #[test]
+    fn unswap_in_place_is_its_own_inverse() {
+        let original = synthetic_256k((47, 115), (47, 13), 0x00F8_00D2);
+        let mut roundtrip = original.clone();
+        unswap_in_place(&mut roundtrip);
+        assert_ne!(roundtrip, original, "swapping once must change the bytes");
+        unswap_in_place(&mut roundtrip);
+        assert_eq!(
+            roundtrip, original,
+            "swapping twice must restore the original bytes exactly"
+        );
+    }
+
+    #[test]
+    fn swapped_image_identifies_supported_and_unswaps_to_original_identification() {
+        let original = synthetic_256k((47, 115), (47, 13), 0x00F8_00D2);
+        let mut swapped = original.clone();
+        unswap_in_place(&mut swapped);
+
+        // identify() alone (no correction yet) can still read the header
+        // via the swapped fast path, and never refuses it.
+        let swapped_info = identify(&swapped).expect("swapped header still identifies");
+        assert_eq!(swapped_info.rev, (47, 115));
+        assert_eq!(swapped_info.supported, Ok(()));
+
+        // The intended sequence: detect, correct in place, re-identify.
+        assert!(is_byte_swapped(&swapped));
+        unswap_in_place(&mut swapped);
+        assert_eq!(
+            swapped, original,
+            "unswapping must byte-for-byte match the source"
+        );
+        let corrected_info = identify(&swapped).expect("corrected image still identifies");
+        assert_eq!(corrected_info.rev, identify(&original).unwrap().rev);
+        assert_eq!(
+            corrected_info.exec_rev,
+            identify(&original).unwrap().exec_rev
+        );
+        assert_eq!(
+            corrected_info.checksum_ok,
+            identify(&original).unwrap().checksum_ok
+        );
+    }
+
     // ---- real ROM image tests --------------------------------------
     //
     // These read fixed absolute paths to non-redistributable ROM images
@@ -615,5 +1033,98 @@ mod tests {
         assert_eq!(info.exec_rev, (47, 7));
         assert!(info.bootable);
         assert!(info.checksum_ok);
+    }
+
+    #[test]
+    fn real_kickstart_1_3_doubled_is_too_old_for_zorro_iii() {
+        // KICK13.ROM: Kickstart 1.3, 34.5, distributed as a 256 KB image
+        // doubled to fill a 512 KB file (see module-level doc comment).
+        let Some(image) = load_rom("/Users/simond/src/external/Copperline/test-assets/KICK13.ROM")
+        else {
+            return;
+        };
+        assert_eq!(image.len(), 512 * 1024);
+        let info = identify(&image).expect("doubled 1.3 image should still identify");
+        assert!(info.doubled, "KICK13.ROM is a 256K image doubled to 512K");
+        assert_eq!(info.size, 512 * 1024);
+        assert_eq!(info.rev, (34, 5));
+        assert_eq!(info.supported, Err(Unsupported::TooOldForZorroIII));
+    }
+
+    #[test]
+    fn real_kickstart_34_5_doubled_is_too_old_for_zorro_iii() {
+        // Same 34.5 image under a different filename/source; same doubled
+        // layout and the same rejection reason.
+        let Some(image) = load_rom("/Users/simond/src/amibake/assets/roms/kickstart-34.5.rom")
+        else {
+            return;
+        };
+        assert_eq!(image.len(), 512 * 1024);
+        let info = identify(&image).expect("doubled 34.5 image should still identify");
+        assert!(info.doubled);
+        assert_eq!(info.rev, (34, 5));
+        assert_eq!(info.supported, Err(Unsupported::TooOldForZorroIII));
+    }
+
+    #[test]
+    fn real_kickstart_46_143_is_byte_swapped_and_corrects_to_a_valid_checksum() {
+        let Some(mut image) =
+            load_rom("/Users/simond/src/amibake/assets/roms/kickstart-46.143.rom")
+        else {
+            return;
+        };
+
+        // As distributed, this file's header only reads correctly once
+        // byte-swapped: `identify` on the raw bytes still succeeds (via
+        // the swapped fast path) and never refuses the image.
+        assert!(is_byte_swapped(&image));
+        let swapped_info = identify(&image).expect("swapped header still identifies");
+        assert_eq!(swapped_info.rev, (46, 143));
+        assert_eq!(swapped_info.supported, Ok(()));
+
+        // The payoff: correcting in place and re-identifying gives a
+        // fully-parsed ROM whose *own* checksum validates — proof the
+        // correction is right, not merely plausible.
+        unswap_in_place(&mut image);
+        assert!(
+            !is_byte_swapped(&image),
+            "corrected image is no longer swapped"
+        );
+        let info = identify(&image).expect("corrected image should have a valid header");
+        assert_eq!(info.kind, RomKind::Kickstart);
+        assert_eq!(info.rev, (46, 143));
+        assert!(info.checksum_ok, "corrected image's checksum must validate");
+        assert!(info.bootable);
+        assert_eq!(info.supported, Ok(()));
+    }
+
+    #[test]
+    fn swapping_a_real_known_good_rom_round_trips_to_identical_identification() {
+        // A1200.47.115.rom is already correct (not swapped); prove the
+        // swap/unswap machinery is lossless against a real, large,
+        // non-synthetic image, not just the small synthetic fixtures.
+        let Some(original) =
+            load_rom("/Users/simond/src/amirfb/nondistribution/roms/A1200.47.115.rom")
+        else {
+            return;
+        };
+        let original_info = identify(&original).expect("valid header");
+
+        let mut roundtrip = original.clone();
+        unswap_in_place(&mut roundtrip);
+        assert!(is_byte_swapped(&roundtrip));
+        unswap_in_place(&mut roundtrip);
+        assert_eq!(
+            roundtrip, original,
+            "double-swapping a real ROM must restore it exactly"
+        );
+
+        let roundtrip_info = identify(&roundtrip).expect("valid header after round trip");
+        assert_eq!(roundtrip_info.kind, original_info.kind);
+        assert_eq!(roundtrip_info.rev, original_info.rev);
+        assert_eq!(roundtrip_info.exec_rev, original_info.exec_rev);
+        assert_eq!(roundtrip_info.checksum_ok, original_info.checksum_ok);
+        assert_eq!(roundtrip_info.bootable, original_info.bootable);
+        assert_eq!(roundtrip_info.supported, original_info.supported);
     }
 }
