@@ -40,10 +40,13 @@
 // convenience and only run hosted, so `no_std` is relaxed for `cargo test`.
 #![cfg_attr(not(test), no_std)]
 
+pub mod blitter;
 pub mod chipset;
 pub mod cia;
+pub mod display;
 pub mod rom;
 
+use blitter::Blitter;
 use chipset::Chipset;
 use cia::{Cia, CiaId};
 
@@ -92,6 +95,10 @@ pub struct MachineBus<'a> {
     pub chipset: Chipset,
     pub cia_a: Cia,
     pub cia_b: Cia,
+    /// The blitter lives on the bus rather than in [`Chipset`] because
+    /// it is the one chipset device that reaches into chip RAM, and the
+    /// bus is what owns that.
+    pub blitter: Blitter,
 
     /// While set, the ROM is mirrored over the bottom of the address
     /// space so the CPU's reset vector fetch from `$000000`/`$000004`
@@ -141,6 +148,7 @@ impl<'a> MachineBus<'a> {
             chipset: Chipset::new(),
             cia_a: Cia::new(CiaId::A),
             cia_b: Cia::new(CiaId::B),
+            blitter: Blitter::new(),
             overlay: true,
         }
     }
@@ -274,12 +282,35 @@ impl<'a> MachineBus<'a> {
     }
 
     fn read_custom_word(&mut self, address: u32) -> u16 {
-        self.chipset.read((address - CUSTOM_BASE) as u16 & 0x1FE)
+        let offset = (address - CUSTOM_BASE) as u16 & 0x1FE;
+        if blitter::reg::is_blitter(offset) {
+            return self.blitter.read(offset);
+        }
+        let value = self.chipset.read(offset);
+        // BBUSY/BZERO live in the blitter but are read through DMACONR.
+        if offset == chipset::reg::DMACONR {
+            return value | self.blitter.dmaconr_bits();
+        }
+        value
     }
 
     fn write_custom_word(&mut self, address: u32, value: u16) {
-        self.chipset
-            .write((address - CUSTOM_BASE) as u16 & 0x1FE, value);
+        let offset = (address - CUSTOM_BASE) as u16 & 0x1FE;
+        if blitter::reg::is_blitter(offset) {
+            if self.blitter.write(offset, value) {
+                self.run_blitter();
+            }
+            return;
+        }
+        self.chipset.write(offset, value);
+    }
+
+    /// Run an armed blit to completion and raise the blitter-finished
+    /// interrupt. Synchronous by design — see [`blitter`]'s module docs.
+    fn run_blitter(&mut self) {
+        if self.blitter.execute(self.chip_ram) {
+            self.chipset.raise_int(chipset::intbit::BLIT);
+        }
     }
 
     /// Read one big-endian 16-bit word.
