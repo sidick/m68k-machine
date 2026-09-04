@@ -37,6 +37,13 @@
 // convenience and only run hosted, so `no_std` is relaxed for `cargo test`.
 #![cfg_attr(not(test), no_std)]
 
+pub mod chipset;
+pub mod cia;
+pub mod rom;
+
+use chipset::Chipset;
+use cia::{Cia, CiaId};
+
 /// Size in bytes of the chip RAM region, `$000000`-`$1FFFFF` (2 MB).
 ///
 /// 2 MB matches the ECS Agnus chip RAM ID that Kickstart's memory probe
@@ -76,7 +83,41 @@ pub const OPEN_BUS_BYTE: u8 = 0xFF;
 pub struct MachineBus<'a> {
     chip_ram: &'a mut [u8; CHIP_RAM_SIZE],
     rom: &'a [u8],
+    /// AROS extended ROM at `$E00000`, empty when booting a single ROM.
+    ext_rom: &'a [u8],
+
+    pub chipset: Chipset,
+    pub cia_a: Cia,
+    pub cia_b: Cia,
+
+    /// While set, the ROM is mirrored over the bottom of the address
+    /// space so the CPU's reset vector fetch from `$000000`/`$000004`
+    /// lands in ROM. Real hardware does this with Gary, driven by CIA-A
+    /// PRA bit 0 (OVL), which is high out of reset; the OS clears it
+    /// early in the strap once it no longer needs ROM at zero.
+    overlay: bool,
 }
+
+/// The address range the ROM overlay covers while OVL is asserted:
+/// `$000000`-`$07FFFF`, the size of one ROM image.
+pub const OVERLAY_END: u32 = 0x0008_0000;
+
+/// CIA address decode: the window both chips mirror across.
+pub const CIA_BASE: u32 = 0x00A0_0000;
+pub const CIA_END: u32 = 0x00C0_0000;
+
+/// Custom chip register window, `$DFF000`-`$DFFFFF`.
+pub const CUSTOM_BASE: u32 = 0x00DF_F000;
+pub const CUSTOM_END: u32 = 0x00E0_0000;
+
+/// CPU clocks per colour clock and per E-clock tick.
+///
+/// The machine presents a 68040 (proposal §6.2) but drives its timers
+/// from the frame clock rather than a cycle-accurate model, so these are
+/// ratios chosen to make the guest's notion of time correct, not a
+/// claim about real 68040 bus timing.
+pub const CPU_CLOCKS_PER_COLOUR_CLOCK: u32 = 4;
+pub const CPU_CLOCKS_PER_ECLOCK: u32 = 40;
 
 impl<'a> MachineBus<'a> {
     /// Build a bus over caller-owned chip RAM and ROM storage.
@@ -85,23 +126,128 @@ impl<'a> MachineBus<'a> {
     /// slice makes the ROM window behave as open bus (reads all `$FF`)
     /// since there is nothing to mirror.
     pub fn new(chip_ram: &'a mut [u8; CHIP_RAM_SIZE], rom: &'a [u8]) -> Self {
-        Self { chip_ram, rom }
+        Self {
+            chip_ram,
+            rom,
+            ext_rom: &[],
+            chipset: Chipset::new(),
+            cia_a: Cia::new(CiaId::A),
+            cia_b: Cia::new(CiaId::B),
+            overlay: true,
+        }
+    }
+
+    /// Attach an AROS extended ROM at `$E00000`.
+    pub fn with_ext_rom(mut self, ext_rom: &'a [u8]) -> Self {
+        self.ext_rom = ext_rom;
+        self
+    }
+
+    /// Whether the ROM overlay is currently mapped over low memory.
+    pub fn overlay(&self) -> bool {
+        self.overlay
+    }
+
+    /// Advance time by `cpu_clocks`, ticking the frame clock and both
+    /// CIAs. Call this from the CPU's `sync` hook so device time and
+    /// guest time stay in step.
+    pub fn tick(&mut self, cpu_clocks: u32) {
+        self.chipset.tick(cpu_clocks, CPU_CLOCKS_PER_COLOUR_CLOCK);
+
+        if self.cia_a.tick(cpu_clocks, CPU_CLOCKS_PER_ECLOCK) {
+            self.chipset.raise_int(chipset::intbit::PORTS);
+        }
+        if self.cia_b.tick(cpu_clocks, CPU_CLOCKS_PER_ECLOCK) {
+            self.chipset.raise_int(chipset::intbit::EXTER);
+        }
+    }
+
+    /// The 68k interrupt level currently being requested, 0 for none.
+    pub fn pending_irq_level(&self) -> u8 {
+        self.chipset.pending_level()
     }
 
     /// Read one byte. Open-bus addresses return [`OPEN_BUS_BYTE`].
     pub fn read_byte(&mut self, address: u32) -> u8 {
+        // Overlay first: while OVL is asserted the ROM answers for low
+        // memory ahead of chip RAM.
+        if self.overlay && address < OVERLAY_END {
+            return rom::read_mirrored(self.rom, 0, address);
+        }
+
         if (CHIP_RAM_BASE..CHIP_RAM_END).contains(&address) {
             self.chip_ram[(address - CHIP_RAM_BASE) as usize]
+        } else if (CIA_BASE..CIA_END).contains(&address) {
+            self.read_cia(address)
+        } else if (CUSTOM_BASE..CUSTOM_END).contains(&address) {
+            // Custom registers are word-wide; a byte access returns the
+            // corresponding half of the word.
+            let word = self.read_custom_word(address & !1);
+            if address & 1 == 0 {
+                (word >> 8) as u8
+            } else {
+                word as u8
+            }
+        } else if (rom::EXT_ROM_BASE..rom::EXT_ROM_BASE + rom::EXT_ROM_WINDOW_SIZE as u32)
+            .contains(&address)
+            && !self.ext_rom.is_empty()
+        {
+            rom::read_mirrored(self.ext_rom, rom::EXT_ROM_BASE, address)
         } else if (ROM_BASE..ROM_END).contains(&address) && !self.rom.is_empty() {
-            let offset = (address - ROM_BASE) as usize % self.rom.len();
-            self.rom[offset]
+            rom::read_mirrored(self.rom, ROM_BASE, address)
         } else {
             OPEN_BUS_BYTE
         }
     }
 
-    /// Read one big-endian 16-bit word, composed from two byte reads.
+    /// Decode a CIA access. CIA-A occupies odd addresses, CIA-B even
+    /// ones, and the register index comes from address bits 8-12.
+    fn cia_select(address: u32) -> (bool, u8) {
+        let is_cia_a = address & 1 != 0;
+        let reg = ((address >> 8) & 0x0F) as u8;
+        (is_cia_a, reg)
+    }
+
+    fn read_cia(&mut self, address: u32) -> u8 {
+        let (is_cia_a, reg) = Self::cia_select(address);
+        if is_cia_a {
+            self.cia_a.read(reg)
+        } else {
+            self.cia_b.read(reg)
+        }
+    }
+
+    fn write_cia(&mut self, address: u32, value: u8) {
+        let (is_cia_a, reg) = Self::cia_select(address);
+        if is_cia_a {
+            self.cia_a.write(reg, value);
+            // PRA bit 0 drives the ROM overlay; re-read it after every
+            // CIA-A write rather than special-casing the register.
+            self.overlay = self.cia_a.ovl_asserted();
+        } else {
+            self.cia_b.write(reg, value);
+        }
+    }
+
+    fn read_custom_word(&mut self, address: u32) -> u16 {
+        self.chipset.read((address - CUSTOM_BASE) as u16 & 0x1FE)
+    }
+
+    fn write_custom_word(&mut self, address: u32, value: u16) {
+        self.chipset
+            .write((address - CUSTOM_BASE) as u16 & 0x1FE, value);
+    }
+
+    /// Read one big-endian 16-bit word.
+    ///
+    /// Custom-chip registers are word-wide devices, so a word access
+    /// there is one register read rather than two byte reads — some
+    /// registers would otherwise be sampled twice.
     pub fn read_word(&mut self, address: u32) -> u16 {
+        if !(self.overlay && address < OVERLAY_END) && (CUSTOM_BASE..CUSTOM_END).contains(&address)
+        {
+            return self.read_custom_word(address);
+        }
         let hi = self.read_byte(address) as u16;
         let lo = self.read_byte(address.wrapping_add(1)) as u16;
         (hi << 8) | lo
@@ -118,14 +264,39 @@ impl<'a> MachineBus<'a> {
     /// open bus are silently discarded (real ROM cannot be written, and a
     /// real open-bus write simply has nothing latch it).
     pub fn write_byte(&mut self, address: u32, value: u8) {
+        // A write under the overlay still reaches chip RAM: the overlay
+        // only redirects reads, since there is nothing behind ROM to
+        // write to and the OS relies on being able to build its vector
+        // table at $000000 before clearing OVL.
         if (CHIP_RAM_BASE..CHIP_RAM_END).contains(&address) {
             self.chip_ram[(address - CHIP_RAM_BASE) as usize] = value;
+        } else if (CIA_BASE..CIA_END).contains(&address) {
+            self.write_cia(address, value);
+        } else if (CUSTOM_BASE..CUSTOM_END).contains(&address) {
+            // Byte writes to a word-wide register: merge into the
+            // existing value rather than dropping the other half.
+            let aligned = address & !1;
+            let current = self.read_custom_word(aligned);
+            let merged = if address & 1 == 0 {
+                (current & 0x00FF) | ((value as u16) << 8)
+            } else {
+                (current & 0xFF00) | value as u16
+            };
+            self.write_custom_word(aligned, merged);
         }
         // ROM and open-bus writes: discarded.
     }
 
-    /// Write one big-endian 16-bit word, decomposed into two byte writes.
+    /// Write one big-endian 16-bit word.
+    ///
+    /// As with [`MachineBus::read_word`], custom-chip registers take a
+    /// single word write — decomposing into bytes would apply the
+    /// set/clear convention twice on registers like `INTENA`.
     pub fn write_word(&mut self, address: u32, value: u16) {
+        if (CUSTOM_BASE..CUSTOM_END).contains(&address) {
+            self.write_custom_word(address, value);
+            return;
+        }
         self.write_byte(address, (value >> 8) as u8);
         self.write_byte(address.wrapping_add(1), value as u8);
     }
@@ -194,6 +365,12 @@ mod tests {
         let rom = [0u8; ROM_WINDOW_SIZE];
         let mut bus = new_bus(&mut ram, &rom);
 
+        // Low memory is behind the ROM overlay out of reset, so drop OVL
+        // before testing chip RAM there (a guest does the same thing
+        // early in the strap).
+        bus.write_byte(0x00BF_E001, 0x00);
+        assert!(!bus.overlay());
+
         bus.write_byte(0x0000_0010, 0xAB);
         assert_eq!(bus.read_byte(0x0000_0010), 0xAB);
 
@@ -240,5 +417,83 @@ mod tests {
     // hosted test binary links std, so a plain Vec is fine here.
     fn alloc_vec_zeroed(len: usize) -> std::vec::Vec<u8> {
         std::vec![0u8; len]
+    }
+
+    #[test]
+    fn overlay_maps_rom_at_zero_until_ovl_is_cleared() {
+        let mut ram = boxed_chip_ram();
+        let mut rom = [0u8; ROM_WINDOW_SIZE];
+        rom[0] = 0x11;
+        rom[1] = 0x14;
+        let mut bus = new_bus(&mut ram, &rom);
+
+        // Out of reset the CPU's vector fetch from $0 must see ROM, not
+        // chip RAM -- this is what lets an unmodified ROM boot.
+        assert!(bus.overlay());
+        assert_eq!(bus.read_word(0x0000_0000), 0x1114);
+
+        // Writes still land in chip RAM underneath the overlay.
+        bus.write_word(0x0000_0000, 0xDEAD);
+        assert_eq!(
+            bus.read_word(0x0000_0000),
+            0x1114,
+            "overlay still reads ROM"
+        );
+
+        // Clearing OVL via CIA-A PRA reveals the chip RAM underneath.
+        bus.write_byte(0x00BF_E001, 0x00);
+        assert!(!bus.overlay());
+        assert_eq!(bus.read_word(0x0000_0000), 0xDEAD);
+    }
+
+    #[test]
+    fn custom_register_word_access_is_a_single_register_write() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom);
+
+        // INTENA uses the set/clear convention; a word write must apply
+        // it once, not once per byte half.
+        bus.write_word(0x00DF_F09A, 0x8000 | (1 << chipset::intbit::VERTB));
+        assert_eq!(
+            bus.read_word(0x00DF_F01C),
+            1 << chipset::intbit::VERTB,
+            "INTENAR should read back the enabled source"
+        );
+    }
+
+    #[test]
+    fn cia_decode_splits_odd_and_even_addresses() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom);
+
+        // $BFE001 is CIA-A PRA, $BFD000 is CIA-B PRA.
+        bus.write_byte(0x00BF_E001, 0x00);
+        bus.write_byte(0x00BF_D000, 0x5A);
+        assert_eq!(bus.cia_a.pra, 0x00);
+        assert_eq!(bus.cia_b.pra, 0x5A);
+    }
+
+    #[test]
+    fn vertb_fires_once_per_frame_and_requests_level_3() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom);
+
+        // Enable VERTB and the master enable.
+        bus.write_word(
+            0x00DF_F09A,
+            0x8000 | (1 << chipset::intbit::INTEN) | (1 << chipset::intbit::VERTB),
+        );
+        assert_eq!(bus.pending_irq_level(), 0);
+
+        // One full frame's worth of CPU clocks.
+        let frame_clocks = chipset::PAL_LINES_PER_FRAME
+            * chipset::PAL_COLOUR_CLOCKS_PER_LINE
+            * CPU_CLOCKS_PER_COLOUR_CLOCK;
+        bus.tick(frame_clocks);
+
+        assert_eq!(bus.pending_irq_level(), 3, "VERTB is level 3");
     }
 }

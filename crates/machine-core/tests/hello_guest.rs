@@ -57,22 +57,20 @@ fn hello_guest_moveq_and_nops() {
         .unwrap();
     let mut rom = [0u8; machine_core::ROM_WINDOW_SIZE];
 
-    // m68k-rs's `CpuCore::reset` reads the initial SSP/PC from absolute
-    // addresses $000000/$000004 (`AddressBus::read_long(0)` /
-    // `read_long(4)`), which on real hardware are ROM addresses only
-    // because Gary overlays ROM at $000000 until the first FC-space
-    // access after reset switches it back to RAM. This skeleton bus has
-    // no overlay logic yet, so the vectors are written straight into
-    // chip RAM (address 0), which is where the CPU will actually read
-    // them from; PC points at the guest program in the ROM window.
+    // `CpuCore::reset` reads the initial SSP/PC from absolute addresses
+    // $000000/$000004. On real hardware those reads land in ROM because
+    // Gary overlays ROM over low memory out of reset; the bus now models
+    // that overlay (CIA-A PRA bit 0), so the vectors go at the start of
+    // the ROM image where a real Kickstart keeps them, and the CPU picks
+    // them up through the overlay exactly as it would on hardware.
     let initial_ssp: u32 = CHIP_RAM_SIZE as u32;
-    let program_addr: u32 = ROM_BASE;
-    chip_ram[0..4].copy_from_slice(&initial_ssp.to_be_bytes());
-    chip_ram[4..8].copy_from_slice(&program_addr.to_be_bytes());
+    let program_addr: u32 = ROM_BASE + 8;
+    rom[0..4].copy_from_slice(&initial_ssp.to_be_bytes());
+    rom[4..8].copy_from_slice(&program_addr.to_be_bytes());
 
-    rom[0..2].copy_from_slice(&MOVEQ_42_D0.to_be_bytes());
-    rom[2..4].copy_from_slice(&NOP.to_be_bytes());
-    rom[4..6].copy_from_slice(&NOP.to_be_bytes());
+    rom[8..10].copy_from_slice(&MOVEQ_42_D0.to_be_bytes());
+    rom[10..12].copy_from_slice(&NOP.to_be_bytes());
+    rom[12..14].copy_from_slice(&NOP.to_be_bytes());
 
     let machine_bus = MachineBus::new(&mut chip_ram, &rom);
     let mut bus = Bus(machine_bus);
