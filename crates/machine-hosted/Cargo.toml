@@ -1,0 +1,32 @@
+[package]
+name = "machine-hosted"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Hosted std runner for the m68k Machine: boots a ROM image over machine-core through m68k-rs"
+publish = false
+
+[[bin]]
+name = "machine-hosted"
+path = "src/main.rs"
+
+[dependencies]
+machine-core = { path = "../machine-core" }
+
+# Pinned exactly, same rationale as machine-core's dev-dependency: single-
+# author crate, no no_std support yet (docs/phase0-findings.md), and this
+# project tracks its guest-visible behaviour closely enough that an
+# unplanned bump could silently change CPU semantics under us.
+m68k = "=0.12.1"
+
+# clap over hand-rolling: this binary has seven flags including a couple
+# of optional paths and numeric limits with defaults, which is exactly the
+# case clap's derive macro removes the most boilerplate (and bug surface —
+# help text, `--flag=value` vs `--flag value`, missing-argument errors) for.
+# It is a hosted-only crate (this binary is std, never no_std), so the
+# dependency-weight argument that keeps machine-core dependency-free does
+# not apply here.
+clap = { version = "4", features = ["derive"] }
+
+[lints.clippy]
+all = "warn"
