@@ -733,13 +733,22 @@ impl Geometry {
         let diw_x0 = (hstart_raw / 2) * px_per_cck;
         let diw_x1 = ((hstop_raw / 2) * px_per_cck).max(diw_x0);
 
-        let divisor: u32 = if hires { 4 } else { 8 };
-        // Hires fetches one extra word per line versus lores' "+1" -- see
-        // this fn's doc comment on why getting this constant wrong (not
-        // just the divisor) produces a row-by-row-compounding shear.
-        let extra_words: u32 = if hires { 2 } else { 1 };
+        // Bitplane fetch runs in 8-colour-clock units, two words per unit
+        // per plane in hires and one in lores. A DDFSTOP that falls part
+        // way through a unit is still honoured at the following unit
+        // boundary, and one further unit drains the pipeline — hence the
+        // round-up and the trailing unit.
+        //
+        // The arithmetic has to be done in units rather than directly in
+        // words: dividing the colour-clock span by 4 and adding 2 gives
+        // the right answer only when DDFSTOP happens to land on a unit
+        // boundary. Kickstart's $D4 does, which is why its screens render
+        // correctly under the simpler formula; AROS programs $D0, which
+        // does not, and came out one word short per row — a shortfall
+        // that compounds down the frame into a diagonal shear.
         let ddf_words = if b.ddfstop >= b.ddfstrt {
-            (((b.ddfstop - b.ddfstrt) as u32) / divisor + extra_words).min(MAX_DDF_WORDS)
+            let units = ((b.ddfstop - b.ddfstrt) as u32).div_ceil(8) + 1;
+            (units * if hires { 2 } else { 1 }).min(MAX_DDF_WORDS)
         } else {
             0
         };
@@ -1817,19 +1826,35 @@ mod tests {
         let mut state = base_state();
         state.bplcon0 = 0x8000; // hires, 0 planes (irrelevant to ddf_words)
 
+        // Kickstart's window, and the one case where a naive
+        // span/4 + 2 also happens to be right: $D4 lands exactly on an
+        // 8-colour-clock fetch-unit boundary.
         state.ddfstrt = 0x003C;
         state.ddfstop = 0x00D4;
         assert_eq!(
             Geometry::decode(&state).ddf_words,
             40,
-            "(0xD4-0x3C)/4 + 2, the standard 640-pixel hires screen"
+            "the standard 640-pixel hires screen"
+        );
+
+        // AROS's window. $D0 falls part way through a fetch unit, which
+        // is still honoured at the next boundary, so this is also 40
+        // words -- not the 39 that span/4 + 2 yields. Getting this one
+        // word short under-advances every row's bitplane pointer by two
+        // bytes and shears the picture progressively down the frame.
+        state.ddfstrt = 0x003C;
+        state.ddfstop = 0x00D0;
+        assert_eq!(
+            Geometry::decode(&state).ddf_words,
+            40,
+            "a mid-unit DDFSTOP rounds up to the same fetch width"
         );
 
         // A degenerate but legal window (DDFSTRT == DDFSTOP): hires still
-        // fetches 2 words, never 1 -- the lores constant must not leak in.
+        // fetches 2 words, never 1 -- the lores width must not leak in.
         state.ddfstrt = 0x0038;
         state.ddfstop = 0x0038;
-        assert_eq!(Geometry::decode(&state).ddf_words, 2, "(0)/4 + 2");
+        assert_eq!(Geometry::decode(&state).ddf_words, 2, "one unit, hires");
     }
 
     /// The same degenerate window in lores must use lores' own `+1`, not

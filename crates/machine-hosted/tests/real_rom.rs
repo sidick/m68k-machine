@@ -229,15 +229,24 @@ fn kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger() {
 /// RAM, matching real sprite-DMA fetch semantics) and pinned by
 /// `render.rs`'s own
 /// `sprite_height_comes_from_the_real_header_in_ram_not_the_stale_ctl_register`
-/// unit test. With that fixed, this ROM's captured frame is a uniform
-/// fill -- genuinely nothing on screen, the same conclusion the AROS test
-/// below reaches for the same underlying reason (no boot device).
+/// unit test.
+///
+/// **Corrected finding.** This test previously asserted a uniform fill,
+/// which was true only because the machine could not yet get this far.
+/// Once CIA one-shot timers started on the timer-high write, strap woke
+/// and built the real no-boot-media screen, and the renderer learned to
+/// follow COPJMP2 into the second copper list where that screen lives.
+/// Kickstart now draws its boot picture with no boot device at all: the
+/// checkered ball, the Hyperion banner and the floppy graphic, on a
+/// 4-plane hires screen. So this asserts drawn content rather than a
+/// specific picture -- pixel-exact matching would break on any legitimate
+/// palette or layout change.
 /// `--screenshot-frame 200` is comfortably clear of `--max-frames 250`'s
 /// boundary (see the AROS test for why that matters: a capture taken
 /// right at the run's own final frame can observe a register mid-write).
 #[test]
 #[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
-fn kickstart_3_2_2_a1200_screenshot_is_a_flat_fill_pending_mirage_storage() {
+fn kickstart_3_2_2_a1200_screenshot_shows_the_boot_screen() {
     if !Path::new(KICKSTART_A1200).exists() {
         eprintln!("SKIP: {KICKSTART_A1200} not present");
         return;
@@ -275,30 +284,51 @@ fn kickstart_3_2_2_a1200_screenshot_is_a_flat_fill_pending_mirage_storage() {
 
     let background = dominant_pixel(&rgba);
     let non_background = rgba.chunks(4).filter(|px| *px != background).count();
-    assert_eq!(
-        non_background, 0,
-        "expected a uniform fill: Kickstart has no bitplanes enabled and \
-         (after the sprite-height fix) no visible sprite 0 either at \
-         frame 200 -- see this test's doc comment"
+    assert!(
+        non_background > 2000,
+        "expected Kickstart's boot picture to be drawn, got {non_background} \
+         non-background pixels -- see this test's doc comment"
+    );
+
+    let mut colours: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    for px in rgba.chunks(4) {
+        colours.insert(px);
+    }
+    assert!(
+        colours.len() >= 4,
+        "expected a multi-colour picture from a 4-plane screen, got {} distinct colours",
+        colours.len()
     );
 }
 
-/// The AROS counterpart of the Kickstart test above, and the inverse
-/// finding: manual investigation (`--inspect`'s `display state` line)
-/// shows AROS reaches `workbench.task`/`workbook.resource` in its
-/// resident-module list but leaves `COP1LC`, `BPLCON0`'s plane field and
-/// `BPL1PT` all at zero through frame 3000+ -- it is blocked (`TaskWait`
-/// shows `trackdisk.device` and the bootstrap task themselves parked) on
-/// having no boot device to load Workbench data from (roadmap Phase 3's
-/// MIRAGE storage gap), so it never reaches the code path that actually
-/// programs a display. This asserts that honestly: a real capture, at a
-/// frame safely clear of `--max-frames`'s own boundary (a register can be
-/// caught mid-update in the single frame right at that edge -- observed
-/// directly while preparing this test), renders as one flat, unbroken
-/// fill colour -- not asserting a specific colour, since `COLOR00` alone
-/// still drifts a little during AROS's otherwise-idle housekeeping.
+/// The AROS counterpart of the Kickstart test above -- and a **corrected
+/// finding** (this test originally asserted a flat fill; see the git
+/// history). AROS does reach a real display with no boot device at all:
+/// by frame ~400 its `dosboot.resource` has put up the "Waiting for
+/// bootable media" screen -- the cat-eyes boot logo on a 4-plane hires
+/// interlaced screen programmed through a copper list (`COP2LC` sets the
+/// full 16-colour palette, `BPLCON0 = $C204`, `DDFSTRT/STOP = $3C/$D0`,
+/// `BPL1MOD/BPL2MOD = $50`, and four bitplane pointers), then parks the
+/// whole system in `Wait` -- the same idle state the Copperline oracle
+/// shows at its logo (both CPUs stopped at the identical exec idle PC,
+/// `$00FE8B88`). The earlier flat-fill reading came from inspecting only
+/// the raw `BPLCON0`/`BPL1PT` registers, which the *copper list* (not the
+/// CPU) programs each frame.
+///
+/// So this asserts drawn content, not a specific picture: a healthy
+/// capture has the logo palette's many distinct colours and thousands of
+/// non-background pixels. Chip-RAM comparison against the Copperline
+/// oracle (byte-identical bitplanes up to boot-animation timing) shows
+/// the guest populates the frame correctly; the capture's exact pixels
+/// additionally depend on the stop-gap renderer's DDF model, so the
+/// thresholds here are deliberately loose enough to hold both before and
+/// after renderer-side DDF fixes, while still failing hard on the old
+/// "nothing drawn at all" reading. `--screenshot-frame 400` stays safely
+/// clear of `--max-frames 500`'s boundary (a register can be caught
+/// mid-update in the single frame right at that edge -- observed directly
+/// while preparing the original test).
 #[test]
-fn aros_68k_screenshot_is_a_flat_fill_pending_mirage_storage() {
+fn aros_68k_screenshot_shows_boot_screen_content_without_boot_media() {
     assert!(
         Path::new(AROS_MAIN).exists() && Path::new(AROS_EXT).exists(),
         "AROS ROM pair is vendored in-repo (assets/aros/) and must be present"
@@ -336,11 +366,21 @@ fn aros_68k_screenshot_is_a_flat_fill_pending_mirage_storage() {
     );
     let background = dominant_pixel(&rgba);
     let distinct_from_background = rgba.chunks(4).filter(|px| *px != background).count();
-    assert_eq!(
-        distinct_from_background, 0,
-        "expected a uniform fill: AROS has not programmed any bitplane \
-         DMA by frame 400 (no boot device to reach a real screen -- see \
-         this test's doc comment)"
+    assert!(
+        distinct_from_background > 2_000,
+        "expected the AROS boot-logo screen to draw real content \
+         (got {distinct_from_background} non-background pixels) -- see \
+         this test's doc comment"
+    );
+    let distinct_colours = rgba
+        .chunks(4)
+        .map(|px| <[u8; 4]>::try_from(px).unwrap())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert!(
+        distinct_colours >= 8,
+        "expected the boot logo's 16-colour palette to show up as many \
+         distinct colours (got {distinct_colours})"
     );
 }
 
