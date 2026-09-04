@@ -44,6 +44,7 @@ pub mod blitter;
 pub mod chipset;
 pub mod cia;
 pub mod display;
+pub mod render;
 pub mod rom;
 
 use blitter::Blitter;
