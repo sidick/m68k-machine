@@ -44,12 +44,14 @@ pub mod blitter;
 pub mod chipset;
 pub mod cia;
 pub mod display;
+pub mod gayle;
 pub mod render;
 pub mod rom;
 
 use blitter::Blitter;
 use chipset::Chipset;
 use cia::{Cia, CiaId, FloppyDrive, FloppyPresence};
+use gayle::{BlockDevice, Gayle};
 
 /// Size in bytes of the chip RAM region, `$000000`-`$1FFFFF` (2 MB).
 ///
@@ -105,6 +107,12 @@ pub struct MachineBus<'a> {
     /// on the bus, not on either `Cia`, because it is wired between the
     /// two chips (CIA-B drives it, CIA-A reads it back).
     pub floppy: FloppyDrive,
+    /// Gayle and its IDE interface — the bring-up storage device (see
+    /// [`gayle`]). Absent unless a board layer attaches one.
+    pub gayle: Gayle,
+    /// The disk behind Gayle's IDE port, supplied by the board layer
+    /// since this crate has no file I/O of its own.
+    hd: Option<&'a mut dyn BlockDevice>,
 
     /// While set, the ROM is mirrored over the bottom of the address
     /// space so the CPU's reset vector fetch from `$000000`/`$000004`
@@ -172,8 +180,16 @@ impl<'a> MachineBus<'a> {
             // under both 1.3 and 3.2.3. `with_floppy` overrides this for
             // the `--floppy empty` diagnostic mode.
             floppy: FloppyDrive::new(FloppyPresence::None),
+            gayle: Gayle::new(),
+            hd: None,
             overlay: true,
         }
+    }
+
+    /// Attach a disk to Gayle's IDE port.
+    pub fn with_hd(mut self, hd: &'a mut dyn BlockDevice) -> Self {
+        self.hd = Some(hd);
+        self
     }
 
     /// Attach an AROS extended ROM at `$E00000`.
@@ -266,6 +282,14 @@ impl<'a> MachineBus<'a> {
 
         if (CHIP_RAM_BASE..CHIP_RAM_END).contains(&address) {
             self.chip_ram[(address - CHIP_RAM_BASE) as usize]
+        } else if Gayle::responds_to(address) {
+            // Reborrow the device rather than moving it out: Gayle
+            // needs it only for the duration of this access.
+            let device: Option<&mut dyn BlockDevice> = match &mut self.hd {
+                Some(d) => Some(&mut **d),
+                None => None,
+            };
+            self.gayle.read(address, device)
         } else if (CIA_BASE..CIA_END).contains(&address) {
             self.read_cia(address)
         } else if (CUSTOM_BASE..CUSTOM_END).contains(&address) {
@@ -399,6 +423,16 @@ impl<'a> MachineBus<'a> {
         // table at $000000 before clearing OVL.
         if (CHIP_RAM_BASE..CHIP_RAM_END).contains(&address) {
             self.chip_ram[(address - CHIP_RAM_BASE) as usize] = value;
+        } else if Gayle::responds_to(address) {
+            let device: Option<&mut dyn BlockDevice> = match &mut self.hd {
+                Some(d) => Some(&mut **d),
+                None => None,
+            };
+            self.gayle.write(address, value, device);
+            // The A1200 wires Gayle's interrupt to INT2 alongside CIA-A.
+            if self.gayle.irq_pending() {
+                self.chipset.raise_int(chipset::intbit::PORTS);
+            }
         } else if (CIA_BASE..CIA_END).contains(&address) {
             self.write_cia(address, value);
         } else if (CUSTOM_BASE..CUSTOM_END).contains(&address) {
