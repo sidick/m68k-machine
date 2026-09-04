@@ -3,8 +3,10 @@
 //! For visibility before P96 is installed — early startup menu, boot,
 //! Gurus, Screenmode prefs — and as the permanent Guru/early-boot display.
 //! Deliberately dumb: once per frame it walks the copper list linearly
-//! (`MOVE`s honoured, `WAIT`s skipped), then renders once from the latched
-//! `BPL`/`DIW`/`DDF`/`COLOR` state that walk produced. Lores/hires, 1-5
+//! (`MOVE`s honoured, `WAIT`s skipped, a `COPJMP1`/`COPJMP2` strobe
+//! followed as the jump it is — see [`run_copper`]'s doc comment), then
+//! renders once from the latched `BPL`/`DIW`/`DDF`/`COLOR` state that walk
+//! produced. Lores/hires, 1-5
 //! bitplanes, interlace, and a software mouse pointer from sprite 0 are in
 //! scope. Per-line palettes, HAM, EHB and dual playfield are explicitly
 //! **not** — see [`Geometry::decode`]'s doc comment for how out-of-scope
@@ -108,7 +110,17 @@ struct CopperState {
     ddfstrt: u16,
     ddfstop: u16,
     color: [u16; 32],
-    /// Only the pointer is shadowed here, deliberately — see
+    /// Shadow of `COP1LC`/`COP2LC`, seeded from the real [`Chipset`] and
+    /// updated by in-list `MOVE`s to `COP1LCH/L`/`COP2LCH/L` exactly like
+    /// every other pointer field here. [`run_copper`] reads these — not
+    /// `chipset.cop1lc`/`cop2lc` directly — when it follows a `COPJMP1`/
+    /// `COPJMP2` strobe, because real hardware jumps to whatever COP*LC
+    /// currently latches, including a value a list set for itself
+    /// mid-walk (a stub commonly does exactly this: load COP2LC, then
+    /// strobe COPJMP2).
+    cop1lc: u32,
+    cop2lc: u32,
+    /// Only the sprite pointer is shadowed here, deliberately — see
     /// [`draw_sprite0`]'s doc comment for why `SPR0POS`/`SPR0CTL` are
     /// *not* latched into this state the way every other display
     /// register is: this machine has no sprite DMA engine, so those two
@@ -137,16 +149,21 @@ impl CopperState {
             ddfstrt: chipset.ddfstrt,
             ddfstop: chipset.ddfstop,
             color: chipset.color,
+            cop1lc: chipset.cop1lc,
+            cop2lc: chipset.cop2lc,
             spr0pt: chipset.spr0pt,
         }
     }
 
     /// Apply one copper `MOVE`'s effect: write `value` into whichever of
     /// the display-relevant shadow registers `offset` names. Registers
-    /// this renderer has no use for (audio, disk, `COP2LC`, `COPJMP*`,
-    /// anything not read by [`Geometry::decode`] or the paint pass) are
-    /// silently ignored, matching how a real `MOVE` to a register nobody
-    /// is watching still "happens" but has no visible effect here.
+    /// this renderer has no use for (audio, disk, anything not read by
+    /// [`Geometry::decode`] or the paint pass) are silently ignored,
+    /// matching how a real `MOVE` to a register nobody is watching still
+    /// "happens" but has no visible effect here. `COPJMP1`/`COPJMP2`
+    /// themselves are handled by [`run_copper`], not here — a strobe
+    /// changes control flow (which `apply_move` has no access to), it
+    /// doesn't latch a value.
     fn apply_move(&mut self, offset: u16, value: u16) {
         match offset {
             reg::BPL1PTH => set_ptr_hi(&mut self.bplpt[0], value),
@@ -161,6 +178,11 @@ impl CopperState {
             reg::BPL5PTL => set_ptr_lo(&mut self.bplpt[4], value),
             reg::BPL6PTH => set_ptr_hi(&mut self.bplpt[5], value),
             reg::BPL6PTL => set_ptr_lo(&mut self.bplpt[5], value),
+
+            reg::COP1LCH => set_ptr_hi(&mut self.cop1lc, value),
+            reg::COP1LCL => set_ptr_lo(&mut self.cop1lc, value),
+            reg::COP2LCH => set_ptr_hi(&mut self.cop2lc, value),
+            reg::COP2LCL => set_ptr_lo(&mut self.cop2lc, value),
 
             reg::BPLCON0 => self.bplcon0 = value,
             reg::BPLCON1 => self.bplcon1 = value,
@@ -208,6 +230,31 @@ impl CopperState {
 /// until the next frame); without it we'd just keep reading zeroed/stale
 /// memory past the list until the budget ran out, which is harmless but
 /// pointless.
+///
+/// **Following `COPJMP1`/`COPJMP2`**: on real hardware, a `MOVE` to either
+/// strobe address (any value — the write itself is the trigger) makes the
+/// copper's program counter jump to `COP1LC`/`COP2LC` immediately, same as
+/// any other jump. Kickstart 3.2.2's boot screen relies on exactly this:
+/// `COP1LC` permanently points at a small stub whose only job is to
+/// strobe `COPJMP2`, handing control to the real screen list at `COP2LC`.
+/// A walk that stopped at the stub (as an earlier version of this
+/// function did) would never see that list at all. This is a genuine
+/// control-flow jump, not a data-latching `MOVE`, so it is handled here
+/// rather than in [`CopperState::apply_move`], which has no `pc` to
+/// redirect.
+///
+/// A jump consumes exactly one instruction's worth of budget like any
+/// other instruction (the `executed += 1` above already counts it before
+/// this check runs) — a stub that jumps to a list that jumps back is a
+/// natural, not even malicious, shape (this Kickstart's own stub is one
+/// jump away from being exactly that if list 2 ever strobed `COPJMP1`
+/// back), so the walk must still terminate in bounded time rather than
+/// hang. `pc` is simply set from the shadow `cop1lc`/`cop2lc`, whatever
+/// they currently hold (possibly nonsense a hostile or malformed list
+/// wrote); every subsequent read through it goes through
+/// [`read_word`]/[`read_byte`], which never panic on an out-of-range
+/// address, so an off-the-rails `COP2LC` degrades to reading zeros rather
+/// than crashing.
 fn run_copper(start: u32, ram: &[u8], state: &mut CopperState) -> u32 {
     let mut pc = start;
     let mut executed = 0;
@@ -218,7 +265,13 @@ fn run_copper(start: u32, ram: &[u8], state: &mut CopperState) -> u32 {
         executed += 1;
 
         if w1 & 1 == 0 {
-            state.apply_move(w1 & 0x1FE, w2);
+            let offset = w1 & 0x1FE;
+            state.apply_move(offset, w2);
+            match offset {
+                reg::COPJMP1 => pc = state.cop1lc,
+                reg::COPJMP2 => pc = state.cop2lc,
+                _ => {}
+            }
         } else if w1 == 0xFFFF && (w2 & 0xFFFE) == 0xFFFE {
             break;
         }
@@ -549,10 +602,13 @@ impl Renderer {
     ///
     /// Order of operations: walk the copper list at `chipset.cop1lc` into
     /// a local shadow of the display registers (never mutating `chipset`
-    /// itself); fill `fb` with the resulting background colour
-    /// (`COLOR00`); decode geometry; paint bitplanes; composite sprite 0.
-    /// `chip_ram` is an arbitrary borrowed slice, not necessarily the
-    /// bus's full 2 MB chip RAM array — every read into it is bounds-safe
+    /// itself), following any `COPJMP1`/`COPJMP2` strobe the list itself
+    /// executes (see [`run_copper`]'s doc comment — Kickstart 3.2.2's real
+    /// boot screen lives entirely behind one such jump); fill `fb` with
+    /// the resulting background colour (`COLOR00`); decode geometry; paint
+    /// bitplanes; composite sprite 0. `chip_ram` is an arbitrary borrowed
+    /// slice, not necessarily the bus's full 2 MB chip RAM array — every
+    /// read into it is bounds-safe
     /// (see [`read_byte`]), so a shorter slice (as the unit tests below
     /// use) is exactly as safe as the real thing, just more likely to
     /// show a wild-pointer's garbage.
@@ -661,6 +717,115 @@ mod tests {
         let executed = run_copper(0, &ram, &mut state);
 
         assert_eq!(executed, 2, "MOVE then the end-of-list sentinel");
+    }
+
+    /// The shape this whole feature exists for: Kickstart 3.2.2's real
+    /// `COP1LC` is a stub whose only job is to strobe `COPJMP2` and hand
+    /// control to the real screen list at `COP2LC` (see this module's doc
+    /// comment on [`run_copper`]). `COP2LC` here mimics the CPU having
+    /// already latched it via `COP2LCH`/`COP2LCL` writes, which is how
+    /// Kickstart actually programs it — the stub list itself contains no
+    /// `MOVE` to `COP2LC*`, only the strobe.
+    #[test]
+    fn copjmp2_follows_to_cop2lc_and_its_moves_take_effect() {
+        let mut ram = ram_with(256);
+        // Stub list at address 0: strobe COPJMP2 and nothing else.
+        write_instrs(&mut ram, 0, &[move_instr(reg::COPJMP2, 0x0000)]);
+        // List 2 at 0x40: an ordinary MOVE, then the end-of-list sentinel.
+        write_instrs(
+            &mut ram,
+            0x40,
+            &[move_instr(reg::COLOR00, 0x0ABC), end_instr()],
+        );
+
+        let mut chipset = Chipset::new();
+        chipset.cop2lc = 0x40;
+        let mut state = CopperState::from_chipset(&chipset);
+        let executed = run_copper(0, &ram, &mut state);
+
+        assert_eq!(state.color[0], 0x0ABC, "list 2's MOVE must take effect");
+        assert_eq!(executed, 3, "strobe, list 2's MOVE, list 2's end sentinel");
+    }
+
+    /// A stub that jumps to a list that jumps back is a natural shape, not
+    /// even a hostile one (this Kickstart's own stub is one stray
+    /// `COPJMP1` away from being exactly this) — the budget, not list
+    /// content, must be what stops it.
+    #[test]
+    fn copjmp_induced_cycle_terminates_on_budget_not_hang() {
+        let mut ram = ram_with(256);
+        // List 1 at 0: strobe COPJMP2.
+        write_instrs(&mut ram, 0, &[move_instr(reg::COPJMP2, 0x0000)]);
+        // List 2 at 0x40: strobe COPJMP1, bouncing back to list 1 forever.
+        write_instrs(&mut ram, 0x40, &[move_instr(reg::COPJMP1, 0x0000)]);
+
+        let mut chipset = Chipset::new();
+        chipset.cop1lc = 0x0;
+        chipset.cop2lc = 0x40;
+        let mut state = CopperState::from_chipset(&chipset);
+        let executed = run_copper(0, &ram, &mut state);
+
+        assert_eq!(
+            executed, COPPER_INSTR_BUDGET,
+            "budget, not the cycle, stops the walk"
+        );
+    }
+
+    /// A `COP2LC` pointing at nonsense (never programmed, or corrupted)
+    /// must degrade to reading zeros through the existing
+    /// [`read_word`]/[`read_byte`] bounds check, exactly like a wild
+    /// `COP1LC`/`BPLPT` already does — never panic.
+    #[test]
+    fn cop2lc_outside_chip_ram_degrades_safely_without_panic() {
+        let mut ram = ram_with(16);
+        write_instrs(&mut ram, 0, &[move_instr(reg::COPJMP2, 0x0000)]);
+
+        let mut chipset = Chipset::new();
+        chipset.cop2lc = 0xFFFF_0000; // wildly out of range
+        let mut state = CopperState::from_chipset(&chipset);
+        let executed = run_copper(0, &ram, &mut state); // must not panic
+
+        assert_eq!(
+            executed, COPPER_INSTR_BUDGET,
+            "reads-as-zero past the jump never hits the end sentinel, so \
+             the budget is what stops it"
+        );
+    }
+
+    /// Regression test for the wider render path: a stub-then-jump list
+    /// end to end through [`Renderer::render`], matching the shape of the
+    /// real Kickstart 3.2.2 A1200 no-boot-media screen (COP1LC's stub
+    /// strobes COPJMP2; the real BPLCON0/geometry lives behind it) — must
+    /// not panic and must reflect list 2's state, not the stub's.
+    #[test]
+    fn render_follows_copjmp2_to_the_real_screen_list() {
+        let mut ram = ram_with(4096);
+        write_instrs(&mut ram, 0, &[move_instr(reg::COPJMP2, 0x0000)]);
+        write_instrs(
+            &mut ram,
+            0x40,
+            &[
+                move_instr(reg::BPLCON0, 0x1000), // 1 plane, lores
+                move_instr(reg::COLOR00, 0x0123),
+                end_instr(),
+            ],
+        );
+
+        let mut chipset = Chipset::new();
+        chipset.cop1lc = 0x0;
+        chipset.cop2lc = 0x40;
+        // Stub's own BPLCON0 stays zero-planes; only list 2 sets it.
+        assert_eq!(chipset.bplcon0, 0);
+
+        let mut pixels = [0u32; 16 * 16];
+        let mut fb = Framebuffer::new(&mut pixels, 16, 16).unwrap();
+        Renderer::new().render(&chipset, &ram, &mut fb); // must not panic
+
+        assert_eq!(
+            fb.pixels[0],
+            argb_from_amiga(0x0123),
+            "background colour must come from list 2, behind the jump"
+        );
     }
 
     /// Real-world standard PAL low-res 320-pixel-wide, 256-line display
