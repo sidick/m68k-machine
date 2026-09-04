@@ -8,6 +8,7 @@
 mod bus;
 mod cli;
 mod console;
+mod hd_image;
 mod introspect;
 mod rom_image;
 mod run;

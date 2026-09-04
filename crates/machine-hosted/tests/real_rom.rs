@@ -16,6 +16,14 @@ use std::process::Command;
 
 const KICKSTART_A1200: &str = "/Users/simond/src/amirfb/nondistribution/roms/A1200.47.115.rom";
 
+/// A bootable AmigaOS 3.2.2 HDF (RDB, one `DH0` FFS partition), built by
+/// `tools/amibake` from licensed media -- see `docs/storage.md` for how it
+/// was built and why, like the Kickstart ROM above, it cannot live in this
+/// repo. User-supplied and machine-local, so (like every other real-ROM
+/// test in this file) the test using it skips cleanly when it is absent.
+const HD_IMAGE: &str = "/private/tmp/claude-501/-Users-simond-src-m68k-machine/\
+f2deab3e-9bac-4e93-ba8a-ac7f5bdec300/scratchpad/hdf2/m68k-machine.hdf";
+
 // Vendored in-repo (assets/aros/PROVENANCE.md) -- freely redistributable,
 // so unlike the Kickstart tests below, the AROS tests in this file run
 // unconditionally rather than skip-when-absent.
@@ -389,6 +397,108 @@ fn aros_68k_screenshot_shows_boot_screen_content_without_boot_media() {
         distinct_colours >= 8,
         "expected the boot logo's 16-colour palette to show up as many \
          distinct colours (got {distinct_colours})"
+    );
+}
+
+/// Phase 3 regression test (this task's brief, `docs/storage.md`): attach
+/// the file-backed `BlockDevice` (`crate::hd_image::FileBlockDevice`,
+/// wired via `--hd`) to Gayle's IDE port and drive a real Kickstart all
+/// the way through disk boot.
+///
+/// **What actually happens, confirmed by inspecting the captured PNG
+/// (not just pixel-difference counts):** the RDB is read, `DH0:` mounts,
+/// FFS loads it, `Startup-Sequence` runs, and Intuition opens a real
+/// Workbench screen. `S/Startup-Sequence` line 17 in this image is
+/// `AddBuffers >NIL: DF0: 15` -- an ordinary line that references `DF0:`,
+/// which this machine (like a real A1200 with no floppy drive, and
+/// matching `--floppy none`'s default) does not have. DOS itself, not the
+/// command, raises Intuition's "Please insert volume DF0: in any drive"
+/// System Request over the Workbench screen as a result. That is a
+/// correct outcome for this exact image/configuration, not a stall: by
+/// the time it appears, the entire storage path -- ID gate, RDB,
+/// partition, filesystem, DOS, Workbench -- has already worked.
+///
+/// Frame timing: unlike the no-disk boot-screen test above (stable by
+/// frame 2500), a real disk boot keeps Kickstart busy well past the IDE
+/// probe window into actual filesystem and Workbench work. Sweeping
+/// `--screenshot-every` while preparing this test found the requester
+/// screen already fully drawn and pixel-stable from frame 4000 onward (no
+/// change at all through 5500); frame 4000 is used here with `--max-frames
+/// 4500` for margin clear of the capture boundary (same reasoning as the
+/// AROS test's frame-400-of-500 margin).
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_boots_from_hd_to_the_insert_df0_requester() {
+    if !Path::new(KICKSTART_A1200).exists() {
+        eprintln!("SKIP: {KICKSTART_A1200} not present");
+        return;
+    }
+    if !Path::new(HD_IMAGE).exists() {
+        eprintln!("SKIP: {HD_IMAGE} not present");
+        return;
+    }
+    let path = screenshot_path("kickstart-hd");
+    let (status, stdout) = run(&[
+        "--rom",
+        KICKSTART_A1200,
+        "--hd",
+        HD_IMAGE,
+        "--max-frames",
+        "4500",
+        "--max-instructions",
+        "300000000",
+        "--screenshot",
+        path.to_str().unwrap(),
+        "--screenshot-frame",
+        "4000",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    assert!(
+        stdout.contains("hd:") && stdout.contains("read-only"),
+        "expected the runner to report attaching the image read-only by default"
+    );
+    assert!(
+        stdout.contains("screenshot: frame 4000"),
+        "expected the capture to actually fire by frame 4000"
+    );
+
+    let (width, height, rgba) = decode_png(&path);
+    assert_eq!(
+        (width, height),
+        (
+            machine_core::display::MAX_WIDTH as u32,
+            machine_core::display::MAX_HEIGHT as u32
+        ),
+        "screenshots are always the renderer's full worst-case canvas"
+    );
+
+    let background = dominant_pixel(&rgba);
+    let non_background = rgba.chunks(4).filter(|px| *px != background).count();
+    // A specific, meaningful floor rather than "some pixels changed": the
+    // requester's window border, title bar, gadgets and two lines of text
+    // account for a stable ~5,400 non-background pixels on this exact
+    // image (see this test's doc comment) -- comfortably below that would
+    // mean something much smaller than a whole requester drew.
+    assert!(
+        non_background > 3_000,
+        "expected the 'insert volume DF0' requester drawn over the \
+         Workbench screen, got {non_background} non-background pixels -- \
+         see this test's doc comment"
+    );
+
+    let mut colours: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    for px in rgba.chunks(4) {
+        colours.insert(px);
+    }
+    assert!(
+        colours.len() >= 4,
+        "expected the requester's title bar, borders, gadgets and text to \
+         show up as several distinct colours over the Workbench grey, got \
+         {} distinct colours",
+        colours.len()
     );
 }
 

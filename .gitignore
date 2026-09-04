@@ -2,3 +2,10 @@
 **/target/
 *.swp
 .DS_Store
+
+# amibake build outputs, if ever built inside the tree. They contain
+# licensed AmigaOS media and must never be committed — see
+# tools/amibake/m68k-machine.toml and docs/storage.md.
+*.hdf
+*.hdz
+/tools/amibake/out/

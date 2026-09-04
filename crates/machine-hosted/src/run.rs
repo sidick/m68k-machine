@@ -47,11 +47,13 @@ use std::path::Path;
 
 use m68k::{CpuCore, CycleBatchControl, CycleBatchExit};
 
+use machine_core::gayle::BlockDevice;
 use machine_core::{MachineBus, CHIP_RAM_SIZE};
 
 use crate::bus::Bus;
 use crate::cli::Args;
 use crate::console::Console;
+use crate::hd_image::FileBlockDevice;
 use crate::rom_image;
 use crate::serial_script::SerialScript;
 
@@ -193,6 +195,29 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
             Err(_) => unreachable!("boxed_slice has exactly CHIP_RAM_SIZE elements"),
         };
 
+    // Opened before `machine_bus` (which borrows it, `with_hd`'s `&'a mut`)
+    // and outside the `Option` match below so the file, once opened, lives
+    // long enough regardless of which branch runs.
+    let mut hd_device = match &args.hd {
+        Some(path) => match FileBlockDevice::open(path, args.hd_writable) {
+            Ok(dev) => {
+                console.diag(&format!(
+                    "hd: {} ({} sectors, {})",
+                    path.display(),
+                    dev.sector_count(),
+                    if dev.writable() {
+                        "read-write"
+                    } else {
+                        "read-only"
+                    }
+                ));
+                Some(dev)
+            }
+            Err(e) => return setup_error(console, format!("opening --hd {}: {e}", path.display())),
+        },
+        None => None,
+    };
+
     let machine_bus = MachineBus::new(&mut chip_ram, &rom_bytes);
     let machine_bus = match &ext_rom_bytes {
         Some(ext) => machine_bus.with_ext_rom(ext),
@@ -200,6 +225,10 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     };
     let machine_bus = machine_bus.with_floppy(args.floppy.into());
     console.diag(&format!("floppy: {:?}", args.floppy));
+    let machine_bus = match &mut hd_device {
+        Some(dev) => machine_bus.with_hd(dev),
+        None => machine_bus,
+    };
     let mut bus = Bus(machine_bus);
 
     let mut serial_script = match &args.serial_script {

@@ -107,6 +107,27 @@ pub struct Args {
     #[arg(long)]
     pub screenshot_every: Option<u64>,
 
+    /// Path to a disk image to attach to Gayle's IDE port (proposal §11.1,
+    /// `machine_core::gayle`). Raw sequential sectors -- an `.hdf` file (a
+    /// bare RDB-partitioned image with no ADF/DMS-style wrapper) is
+    /// exactly this shape. Omit for no drive at all, this machine's
+    /// previous behaviour and still the honest story for the eventual
+    /// MIRAGE storage path (proposal §10.3) -- Gayle IDE is bring-up only
+    /// (`gayle.rs`'s module doc comment).
+    #[arg(long)]
+    pub hd: Option<PathBuf>,
+
+    /// Open `--hd` for writing rather than the default read-only. Off by
+    /// default on purpose: this is a brand new, so-far-unproven IDE
+    /// implementation, and a disk image worth attaching is typically a
+    /// licensed-media conversion (`docs/storage.md`) that took real effort
+    /// to build and cannot simply be re-downloaded if a bug corrupts it. A
+    /// full boot to Workbench never needs to write a sector; pass this
+    /// flag once write access is actually wanted (e.g. testing Kickstart's
+    /// write path, or letting Workbench persist state back to the image).
+    #[arg(long, default_value_t = false)]
+    pub hd_writable: bool,
+
     /// Floppy drive configuration this machine presents on CIA-A PRA /
     /// CIA-B PRB (proposal §7.2; see `machine_core::cia::FloppyDrive`).
     /// `none` (the default) is this machine's honest hardware story --
