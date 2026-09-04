@@ -60,6 +60,27 @@ pub struct Args {
     /// (see `crates/machine-hosted/src/introspect.rs`).
     #[arg(long, default_value_t = false)]
     pub inspect: bool,
+
+    /// Path to a `serial_script`-language file of host→guest serial
+    /// input to drive during the run (`SEND`/`WAIT`/`SLEEP`
+    /// directives -- see `crate::serial_script`'s doc comment). This is
+    /// the machine's only way to hand the guest received bytes at all;
+    /// see `Chipset::push_serial_in_byte`.
+    #[arg(long)]
+    pub serial_script: Option<PathBuf>,
+
+    /// Force a genuine 68k illegal-instruction exception into the guest
+    /// this many chipset frames after the ROM overlay first clears
+    /// (`MachineBus::overlay`), by calling `CpuCore::take_illegal_exception`
+    /// directly from the host rather than waiting for the guest to fetch
+    /// a real illegal opcode. This is a deliberate host-driven crash
+    /// trigger, not a fault injection bug: it exists to reach Kickstart's
+    /// alert/LED-blink loop (and, from there, attempt the documented
+    /// serial break-in into ROMWack -- AHRM alert chapter) at a point
+    /// where the ROM would otherwise stay healthy and idle. Omit for a
+    /// normal boot run.
+    #[arg(long)]
+    pub trigger_illegal_after_frames: Option<u64>,
 }
 
 /// The CPU models this runner knows how to select. A thin wrapper around

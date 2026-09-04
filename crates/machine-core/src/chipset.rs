@@ -143,6 +143,20 @@ pub const VPOSR_AGNUS_ID: u16 = 0x2000;
 /// guest (there is no flow control to give serial.device to make it wait).
 const SERIAL_BUF_CAP: usize = 32;
 
+/// Capacity of the `SERDATR` host→guest receive ring buffer.
+///
+/// Real Paula hardware holds exactly one received word until the guest
+/// (or an interrupt handler) drains it via `SERDATR`; overrun is a
+/// single-byte-behind condition. This machine has no wire timing at all
+/// -- a host might hand over a whole ROMWack command line's worth of
+/// bytes in one call (`Chipset::push_serial_in_byte`) before the guest
+/// gets a chance to read any of them -- so a small queue rather than a
+/// one-byte latch avoids losing input to that timing gap without
+/// pretending to model real baud-rate pacing. Same size as
+/// [`SERIAL_BUF_CAP`] for the same reason: generous for line-based debug
+/// traffic, not sized for bulk transfer.
+const SERIAL_IN_BUF_CAP: usize = 32;
+
 /// How far the beam moved during one [`Chipset::tick`].
 ///
 /// Both figures drive the CIAs' TOD counters, which the OS uses as its
@@ -255,12 +269,33 @@ pub struct Chipset {
     /// Serial sink (§7.1): latched but never transmitted on real hardware
     /// terms. `serdat` holds the last word written for inspection.
     pub serdat: u16,
+    /// `SERPER` write latch. There is no baud-rate/bit-timing model in
+    /// this machine at all -- `SERDAT`/`SERDATR` transfers complete the
+    /// instant they're written/read (see `write`'s `SERDAT` arm and
+    /// [`Chipset::read_serdatr`]), so there is no shift clock for this
+    /// value to actually drive. It is kept purely so a guest that reads
+    /// it back (or a future cycle-accurate mode) sees what it wrote; the
+    /// documented 9600-baud `SERPER` value (372, `AHRM`) that a ROMWack
+    /// host-side client computes never appears anywhere else in this
+    /// file, which is why this comment exists.
     pub serper: u16,
     /// Host debug-channel ring buffer fed by `SERDAT` writes, drained by
     /// [`Chipset::take_serial_byte`]. See [`SERIAL_BUF_CAP`].
     serial_buf: [u8; SERIAL_BUF_CAP],
     serial_head: usize,
     serial_len: usize,
+
+    /// Host→guest receive ring buffer for `SERDATR`, fed by
+    /// [`Chipset::push_serial_in_byte`] and drained one byte per read by
+    /// [`Chipset::read_serdatr`]. See [`SERIAL_IN_BUF_CAP`].
+    serial_in_buf: [u8; SERIAL_IN_BUF_CAP],
+    serial_in_head: usize,
+    serial_in_len: usize,
+    /// `SERDATR` bit 15 (OVRUN) latch: set when a host byte arrives while
+    /// the receive queue is already full and has to be dropped. Cleared
+    /// the next time the guest reads a byte via `SERDATR` -- see
+    /// [`Chipset::read_serdatr`].
+    serial_in_overrun: bool,
 }
 
 impl Chipset {
@@ -343,6 +378,62 @@ impl Chipset {
         // real, unconnected serial port would simply lose data too.
     }
 
+    /// Hand one byte from the host to the guest's serial receiver.
+    ///
+    /// This is the receive counterpart of [`Chipset::take_serial_byte`]:
+    /// the host (`machine-hosted`'s `--serial-in`, or an injected DEL for
+    /// the ROMWack break-in) calls this, and the byte becomes visible to
+    /// the guest through `SERDATR` (see [`Chipset::read_serdatr`]).
+    ///
+    /// Raises the `RBF` interrupt (`intbit::RBF`, 68k level 5, AHRM's
+    /// `INTENA`/`INTREQ` chapter) on every accepted byte, not just when
+    /// the queue was empty -- real Paula raises RBF once per received
+    /// word, and a host that hands over several bytes in one call (e.g.
+    /// a whole command line) must not collapse that into a single
+    /// interrupt or an interrupt-driven `serial.device` would stop
+    /// after the first byte. This is also why the source polling
+    /// `SERDATR` directly (Kickstart's crash-loop DEL check, AHRM) and
+    /// an interrupt-driven reader both work off the same queue: the
+    /// interrupt is a convenience for the latter, not the only path in.
+    ///
+    /// A full queue sets `OVRUN` and drops the byte -- there is no flow
+    /// control to push back on the host with, exactly like
+    /// [`Chipset::push_serial_byte`]'s transmit-side sibling.
+    pub fn push_serial_in_byte(&mut self, byte: u8) {
+        if self.serial_in_len < SERIAL_IN_BUF_CAP {
+            let idx = (self.serial_in_head + self.serial_in_len) % SERIAL_IN_BUF_CAP;
+            self.serial_in_buf[idx] = byte;
+            self.serial_in_len += 1;
+            self.raise_int(intbit::RBF);
+        } else {
+            self.serial_in_overrun = true;
+        }
+    }
+
+    /// Whether [`Chipset::push_serial_in_byte`] currently has room without
+    /// dropping a byte and latching `OVRUN`. A host-side pacer that wants
+    /// to hand over more bytes than the queue holds at once (e.g.
+    /// `machine-hosted`'s scripted serial input, one command line at a
+    /// time) can poll this to throttle itself, rather than leaning on the
+    /// drop-and-flag overrun path meant for a genuine host/guest speed
+    /// mismatch.
+    pub fn serial_in_has_room(&self) -> bool {
+        self.serial_in_len < SERIAL_IN_BUF_CAP
+    }
+
+    /// Take the oldest queued receive byte, if any. Private: the only
+    /// caller is [`Chipset::read_serdatr`], which is where consuming a
+    /// byte and presenting `RBF` have to happen atomically together.
+    fn pop_serial_in_byte(&mut self) -> Option<u8> {
+        if self.serial_in_len == 0 {
+            return None;
+        }
+        let byte = self.serial_in_buf[self.serial_in_head];
+        self.serial_in_head = (self.serial_in_head + 1) % SERIAL_IN_BUF_CAP;
+        self.serial_in_len -= 1;
+        Some(byte)
+    }
+
     /// Read a register. `offset` is the offset within `$DFF000`, already
     /// masked to the register window by the caller.
     ///
@@ -361,13 +452,9 @@ impl Chipset {
             reg::JOY0DAT => self.joy0dat,
             reg::JOY1DAT => self.joy1dat,
             reg::POTGOR => self.potgor,
-            // No disk and no serial hardware: report "idle, nothing to do"
-            // so trackdisk.device and serial.device settle instead of
-            // spinning. SERDATR bit 13 is TBE (transmit buffer empty);
-            // it is always set here since a SERDAT write "completes"
-            // immediately (see `write`), so serial.device never sees a
-            // busy transmitter to wait out.
-            reg::SERDATR => 0x2000,
+            // No disk hardware: report "idle, nothing to do" so
+            // trackdisk.device settles instead of spinning.
+            reg::SERDATR => self.read_serdatr(),
             reg::DSKBYTR => 0x0000,
             _ => 0xFFFF,
         }
@@ -459,6 +546,53 @@ impl Chipset {
     /// `VHPOSR`: vertical position low byte, horizontal position low byte.
     fn vhposr(&self) -> u16 {
         (((self.vpos & 0xFF) << 8) | (self.hpos & 0xFF)) as u16
+    }
+
+    /// `SERDATR`: `OVRUN` (bit 15), `RBF` (bit 14), `TBE` (bit 13), `TSRE`
+    /// (bit 12), `RXD` (bit 11), received data in bits 8-0 (the AHRM's
+    /// `SERDATR` chapter; layout cross-checked against Copperline's
+    /// `chipset/paula.rs::read_serdatr`, the project's chipset oracle,
+    /// which implements the identical bit-for-bit meaning).
+    ///
+    /// `TBE`/`TSRE` are unconditionally set: a `SERDAT` write "completes"
+    /// the instant it lands (see `write`'s `SERDAT` arm) since there is
+    /// no shift-register timing model here at all, so neither transmit
+    /// stage is ever busy from the guest's point of view. `RXD` is the
+    /// raw, two-stage-synchronised input pin, which real hardware can
+    /// read as low mid-byte independently of `RBF`; with no bit timing to
+    /// derive that from, it is reported high (idle mark state, RS-232's
+    /// resting level) rather than fabricate a framing signal that
+    /// doesn't exist here -- the same "don't pretend to a fidelity this
+    /// machine doesn't model" call this file already makes for `SERPER`.
+    ///
+    /// Reading this register consumes the oldest queued receive byte
+    /// (if any) and reports `RBF` only for that read. Real hardware
+    /// instead clears `RBF`/`OVRUN` on the matching `INTREQ` write and
+    /// leaves `SERDATR`'s data latched until the next word overwrites it
+    /// (Copperline models that precisely because AROS's level-5
+    /// dispatcher acks `INTREQ` *before* reading `SERDATR`). This
+    /// machine has no interrupt-ack-vs-register-read distinction to
+    /// reproduce that against -- `write`'s `INTREQ` arm just clears the
+    /// bit, it doesn't know it's "the RBF ack" specifically -- so
+    /// read-consumes is the simpler contract that still gives both a
+    /// polling reader (Kickstart's crash-loop DEL check) and an
+    /// interrupt-driven `serial.device` a genuine byte per read.
+    fn read_serdatr(&mut self) -> u16 {
+        // TBE, TSRE, RXD: always idle/high, per this method's doc comment.
+        let mut v: u16 = (1 << 13) | (1 << 12) | (1 << 11);
+        if let Some(byte) = self.pop_serial_in_byte() {
+            v |= 1 << 14; // RBF
+            v |= byte as u16;
+            if self.serial_in_overrun {
+                v |= 1 << 15; // OVRUN
+            }
+        }
+        // OVRUN is reported at most once: it acknowledges itself the
+        // same read that hands back a byte, matching "the guest caught
+        // up with the receiver" rather than requiring a second,
+        // separate acknowledgement this model has no register for.
+        self.serial_in_overrun = false;
+        v
     }
 
     /// Raise an interrupt source (used by the CIAs and, later, by cards).
@@ -796,6 +930,114 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, SERIAL_BUF_CAP, "buffer caps rather than growing");
+    }
+
+    #[test]
+    fn serdatr_idle_with_no_input_matches_pre_receive_behaviour() {
+        // Pins the exact "no regression" value: TBE/TSRE/RXD idle-high,
+        // nothing else set, same as the pre-receive-path `0x2000` (masked)
+        // this replaced -- serial.device's transmit-side idle check must
+        // not start seeing anything new.
+        let mut c = Chipset::new();
+        assert_eq!(c.read(reg::SERDATR), (1 << 13) | (1 << 12) | (1 << 11));
+        assert_eq!(c.read(reg::SERDATR) & 0x2000, 0x2000, "TBE still set");
+    }
+
+    #[test]
+    fn serdatr_delivers_a_queued_host_byte_and_clears_rbf_after() {
+        let mut c = Chipset::new();
+        c.push_serial_in_byte(0x7F); // DEL -- the ROMWack break-in byte
+        let v = c.read(reg::SERDATR);
+        assert_eq!(v & (1 << 14), 1 << 14, "RBF set with a byte queued");
+        assert_eq!(v & 0x01FF, 0x7F, "data in the low 9 bits");
+        // Consumed: the next read finds the queue empty and RBF clear.
+        let v = c.read(reg::SERDATR);
+        assert_eq!(v & (1 << 14), 0, "RBF clears once the byte is read");
+    }
+
+    #[test]
+    fn serdatr_delivers_multiple_queued_bytes_oldest_first() {
+        let mut c = Chipset::new();
+        c.push_serial_in_byte(b'a');
+        c.push_serial_in_byte(b'b');
+        assert_eq!(c.read(reg::SERDATR) & 0xFF, b'a' as u16);
+        assert_eq!(c.read(reg::SERDATR) & 0xFF, b'b' as u16);
+        assert_eq!(c.read(reg::SERDATR) & (1 << 14), 0, "queue now empty");
+    }
+
+    #[test]
+    fn serdatr_reports_overrun_once_when_the_receive_queue_is_full() {
+        let mut c = Chipset::new();
+        for i in 0..SERIAL_IN_BUF_CAP + 5 {
+            c.push_serial_in_byte(i as u8);
+        }
+        // Every queued byte reads back; the last 5 pushes were dropped and
+        // set OVRUN, which shows up on the very next read...
+        let mut overrun_seen = false;
+        let mut count = 0;
+        loop {
+            let v = c.read(reg::SERDATR);
+            if v & (1 << 14) == 0 {
+                break;
+            }
+            if v & (1 << 15) != 0 {
+                overrun_seen = true;
+            }
+            count += 1;
+        }
+        assert_eq!(count, SERIAL_IN_BUF_CAP, "queue caps rather than growing");
+        assert!(overrun_seen, "a dropped byte must set OVRUN");
+        // ...and OVRUN does not linger once acknowledged.
+        assert_eq!(
+            c.read(reg::SERDATR) & (1 << 15),
+            0,
+            "OVRUN clears once reported"
+        );
+    }
+
+    #[test]
+    fn push_serial_in_byte_raises_rbf_interrupt() {
+        let mut c = Chipset::new();
+        c.write(
+            reg::INTENA,
+            0x8000 | (1 << intbit::INTEN) | (1 << intbit::RBF),
+        );
+        assert_eq!(c.pending_level(), 0, "nothing received yet");
+        c.push_serial_in_byte(b'_'); // ROMWack's handshake prompt byte
+        assert_eq!(c.pending_level(), 5, "RBF is level 5");
+        assert_eq!(c.read(reg::INTREQR) & (1 << intbit::RBF), 1 << intbit::RBF);
+    }
+
+    #[test]
+    fn serial_in_has_room_reflects_queue_occupancy() {
+        let mut c = Chipset::new();
+        assert!(c.serial_in_has_room());
+        for i in 0..SERIAL_IN_BUF_CAP {
+            assert!(c.serial_in_has_room(), "room before byte {i}");
+            c.push_serial_in_byte(i as u8);
+        }
+        assert!(!c.serial_in_has_room(), "queue is now full");
+        c.read(reg::SERDATR); // drain one byte
+        assert!(c.serial_in_has_room());
+    }
+
+    #[test]
+    fn push_serial_in_byte_raises_rbf_once_per_byte_not_once_per_batch() {
+        // An interrupt-driven serial.device must see one RBF-serviceable
+        // event per received byte, not a single edge for a whole burst --
+        // otherwise a host handing over several bytes at once (a whole
+        // ROMWack command line) would only ever wake the driver for the
+        // first one.
+        let mut c = Chipset::new();
+        c.write(
+            reg::INTENA,
+            0x8000 | (1 << intbit::INTEN) | (1 << intbit::RBF),
+        );
+        c.push_serial_in_byte(b'a');
+        c.write(reg::INTREQ, 1 << intbit::RBF); // ack, as a real handler would
+        assert_eq!(c.pending_level(), 0);
+        c.push_serial_in_byte(b'b');
+        assert_eq!(c.pending_level(), 5, "second byte re-asserts RBF");
     }
 
     #[test]

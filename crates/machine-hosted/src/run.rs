@@ -53,6 +53,7 @@ use crate::bus::Bus;
 use crate::cli::Args;
 use crate::console::Console;
 use crate::rom_image;
+use crate::serial_script::SerialScript;
 
 /// CPU cycles requested per `run_for_cycles_with_hook` call. Chosen well
 /// under `i32::MAX` (so a long-running batch can never overflow the
@@ -199,6 +200,19 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     };
     let mut bus = Bus(machine_bus);
 
+    let mut serial_script = match &args.serial_script {
+        Some(path) => match SerialScript::load(path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                return setup_error(
+                    console,
+                    format!("reading --serial-script {}: {e}", path.display()),
+                )
+            }
+        },
+        None => None,
+    };
+
     let mut cpu = CpuCore::new();
     cpu.set_cpu_type(args.cpu.into());
     cpu.reset(&mut bus);
@@ -210,7 +224,18 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         if bus.0.overlay() { "mapped" } else { "clear" }
     ));
 
-    let report = run_guest(args, console, &mut cpu, &mut bus);
+    let report = run_guest(args, console, &mut cpu, &mut bus, serial_script.as_mut());
+
+    if let Some(script) = &serial_script {
+        console.diag(&format!(
+            "serial-script: {}",
+            if script.is_done() {
+                "completed"
+            } else {
+                "did not finish (run ended first -- see --max-frames/--max-instructions)"
+            }
+        ));
+    }
 
     // Introspection runs after the guest has stopped moving (whatever the
     // reason), reading whatever state it left behind -- see
@@ -226,10 +251,23 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     report
 }
 
-fn run_guest(args: &Args, console: &mut Console, cpu: &mut CpuCore, bus: &mut Bus) -> Report {
+fn run_guest(
+    args: &Args,
+    console: &mut Console,
+    cpu: &mut CpuCore,
+    bus: &mut Bus,
+    mut serial_script: Option<&mut SerialScript>,
+) -> Report {
     let mut total_instructions: u64 = 0;
     let mut last_progress_frame: u64 = 0;
     let mut overlay_was_cleared = false;
+    // Frame the overlay first cleared, and the last frame the serial
+    // script/illegal-instruction trigger were serviced at -- both are
+    // `None` until the guest gets that far, matching `overlay_was_cleared`
+    // above.
+    let mut overlay_cleared_frame: Option<u64> = None;
+    let mut last_serviced_frame: Option<u64> = None;
+    let mut illegal_triggered = false;
 
     // Tight-loop detector state, shared across hook invocations within one
     // outer-loop batch (recreated each batch since a fresh closure borrows
@@ -251,6 +289,28 @@ fn run_guest(args: &Args, console: &mut Console, cpu: &mut CpuCore, bus: &mut Bu
             bus.0.tick(cycles.max(0) as u32);
             cpu.set_irq(bus.0.pending_irq_level());
             drain_serial(bus, console);
+            // Only serviced from here, not from the `Stopped` branch's own
+            // catch-up tick below: this hook is guaranteed to run with the
+            // CPU actively executing (never `stopped`), which is required
+            // for `cpu.take_illegal_exception` below to leave the guest in
+            // a coherent post-exception state rather than vectoring a
+            // still-`stopped` core (`m68k-rs`'s `take_exception` does not
+            // itself clear the stop condition). Kickstart's idle `STOP`
+            // uses SR mask 0, so VERTB (level 3, every frame) always wakes
+            // it and runs this hook at least once per frame -- the same
+            // property `docs/phase0-findings.md`'s `STOP` section
+            // documents -- so frame-granularity servicing here does not
+            // miss frames even though it never runs while stopped.
+            service_host_serial(
+                args,
+                cpu,
+                bus,
+                console,
+                serial_script.as_deref_mut(),
+                &mut overlay_cleared_frame,
+                &mut last_serviced_frame,
+                &mut illegal_triggered,
+            );
 
             total_instructions += 1;
             let pc = cpu.ppc;
@@ -474,6 +534,52 @@ fn run_guest(args: &Args, console: &mut Console, cpu: &mut CpuCore, bus: &mut Bu
 fn drain_serial(bus: &mut Bus, console: &mut Console) {
     while let Some(byte) = bus.0.chipset.take_serial_byte() {
         console.guest_byte(byte);
+    }
+}
+
+/// Drive the optional `--serial-script` and `--trigger-illegal-after-frames`
+/// once per changed chipset frame. Only called from the per-instruction
+/// hook -- see that call site's comment for why the CPU is guaranteed to
+/// be actively executing (not `stopped`) there, which
+/// `cpu.take_illegal_exception` needs.
+#[allow(clippy::too_many_arguments)]
+fn service_host_serial(
+    args: &Args,
+    cpu: &mut CpuCore,
+    bus: &mut Bus,
+    console: &mut Console,
+    script: Option<&mut SerialScript>,
+    overlay_cleared_frame: &mut Option<u64>,
+    last_serviced_frame: &mut Option<u64>,
+    illegal_triggered: &mut bool,
+) {
+    let frame = bus.0.chipset.frames;
+    if !bus.0.overlay() && overlay_cleared_frame.is_none() {
+        *overlay_cleared_frame = Some(frame);
+    }
+
+    if let Some(target) = args.trigger_illegal_after_frames {
+        if !*illegal_triggered {
+            if let Some(cleared) = *overlay_cleared_frame {
+                if frame >= cleared.saturating_add(target) {
+                    console.diag(&format!(
+                        "PHASE1 HOSTED: forcing illegal-instruction exception at frame \
+                         {frame} (--trigger-illegal-after-frames {target}) to reach the \
+                         alert/LED-blink loop"
+                    ));
+                    cpu.take_illegal_exception(bus);
+                    *illegal_triggered = true;
+                }
+            }
+        }
+    }
+
+    if *last_serviced_frame == Some(frame) {
+        return; // already serviced this frame
+    }
+    *last_serviced_frame = Some(frame);
+    if let Some(script) = script {
+        script.tick(frame, &mut bus.0.chipset, console);
     }
 }
 
