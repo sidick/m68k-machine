@@ -1,0 +1,29 @@
+# ROMWack break-in: flood DEL (0x7F) across the ROM's break-in poll.
+#
+# Kickstart 47.115's alert/LED-blink loop (`docs/serial-debugging.md`
+# has the full disassembly, at $F83F9C-$F83FD8) polls SERDATR for a DEL
+# byte, but only six times (D1 is loaded with 5 and the loop is DBEQ) --
+# roughly one poll per LED blink half-cycle -- before it gives up and
+# falls through to the normal alert display. A single, precisely-timed
+# DEL can hit that window, but this crate has no way to line a `SEND` up
+# with the guest's blink-loop timing in advance, so instead this floods
+# DEL for the REPEAT count below: cheap (the chipset only accepts one
+# byte per frame when the receive queue has room, so 400 sends still
+# costs at most 400 frames -- about 2s of real wall-clock time at this
+# ROM's normal decode speed) and it reliably lands at least one DEL
+# inside every six-poll window from wherever the flood starts.
+#
+# Usage (see `docs/serial-debugging.md` for the full writeup):
+#
+#   cargo build -p machine-hosted --release
+#   ./target/release/machine-hosted \
+#     --rom <path to a Kickstart 3.2.x ROM> \
+#     --trigger-illegal-after-frames 20 \
+#     --serial-script examples/serial-scripts/romwack-break-in.txt \
+#     --max-frames 400
+#
+# `--trigger-illegal-after-frames` is required: retail Kickstart only
+# reaches this poll loop by way of a genuine alert, and there is no
+# other route into it. Without a forced fault, this ROM stays healthy
+# and never touches SERDAT at all (see the doc's Phase 1 gate section).
+REPEAT 400 SEND \x7f

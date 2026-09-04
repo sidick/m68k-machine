@@ -1,0 +1,42 @@
+# ROMWack break-in followed by a short interactive session, demonstrating
+# that the guest's own debugger -- not just this crate's `--inspect` --
+# can be driven end to end over the emulated serial line.
+#
+# Usage (see `docs/serial-debugging.md` for the full command-by-command
+# transcript this was verified against):
+#
+#   cargo build -p machine-hosted --release
+#   ./target/release/machine-hosted \
+#     --rom <path to a Kickstart 3.2.x ROM> \
+#     --trigger-illegal-after-frames 20 \
+#     --serial-script examples/serial-scripts/romwack-interactive-session.txt \
+#     --max-frames 600 --inspect
+#
+# Flood DEL across the break-in poll (see romwack-break-in.txt for why
+# this is a flood and not one precisely-timed SEND), then wait for the
+# `rom-wack` banner before typing anything -- ROMWack's line editor has
+# no notion of a receive buffer to hold input typed before it's ready,
+# so a SEND that races the banner would just be lost.
+REPEAT 400 SEND \x7f
+WAIT rom-wack 120
+
+# `regs` re-prints the same PC/SR/USP/SSP/XCPT/TASK/DR/AR/SF block the
+# banner opened with -- ROMWack's line editor echoes each typed line
+# back before acting on it, so the echoed "regs" and the dump both
+# appear in the transcript.
+SLEEP 5
+SEND regs\r
+
+# `resume` (equivalently `go` with no argument, verified separately)
+# continues guest execution from the faulted PC instead of staying
+# parked in ROMWack. This is the one command in this script that
+# actually changes what the guest does next, rather than just
+# inspecting it -- everything after this point is Kickstart running
+# again, not ROMWack. Pair this run with `--inspect`: the guest
+# reconverges on the same idle boot-menu state (well-formed ExecBase,
+# 45 resident modules, every task in TaskWait, none in TaskReady) an
+# undisturbed boot reaches on its own, which is the evidence cited in
+# docs/serial-debugging.md's Phase 1 gate discussion.
+SLEEP 5
+SEND resume\r
+SLEEP 60

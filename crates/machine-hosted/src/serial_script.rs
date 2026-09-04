@@ -37,6 +37,18 @@
 //! - `SLEEP <frames>` -- wait `<frames>` chipset frames unconditionally,
 //!   with no output condition -- for pacing between sends when there is
 //!   nothing distinctive to `WAIT` for yet.
+//! - `REPEAT <n> <directive>` -- expand to `<n>` copies of the (single,
+//!   non-`REPEAT`) directive that follows on the same line. Exists for
+//!   the ROMWack break-in script: the 47.115 ROM's break-in poll
+//!   (`docs/serial-debugging.md`) only samples `SERDATR` six times before
+//!   giving up, so a reliable break-in floods DEL across that window
+//!   rather than timing one send -- `REPEAT 400 SEND \x7f` says that
+//!   without 400 near-duplicate lines in the committed script (a real
+//!   maintenance hazard: a stray edit to one of 400 identical lines would
+//!   be invisible in review). Nesting is rejected rather than silently
+//!   flattened -- `REPEAT` inside `REPEAT` has no use this crate needs
+//!   yet, so it's simpler to reject it now than to define its semantics
+//!   speculatively.
 //!
 //! `SEND` paces itself at one byte per frame boundary and only when
 //! [`Chipset::serial_in_has_room`] says the receive queue isn't full, so
@@ -111,8 +123,8 @@ impl SerialScript {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let directive = parse_line(line).map_err(|e| format!("line {}: {e}", lineno + 1))?;
-            remaining.push_back(directive);
+            let directives = parse_line(line).map_err(|e| format!("line {}: {e}", lineno + 1))?;
+            remaining.extend(directives);
         }
         Ok(Self {
             remaining,
@@ -222,11 +234,16 @@ impl SerialScript {
     }
 }
 
-fn parse_line(line: &str) -> Result<Directive, String> {
+/// Parse one script line into the directive(s) it expands to -- more than
+/// one only for `REPEAT`, which duplicates its inner directive `n` times
+/// rather than the parser inventing a runtime-repeat directive variant
+/// (`tick` in [`SerialScript::tick`] would gain a whole extra state just
+/// to re-derive what expansion already gives it for free).
+fn parse_line(line: &str) -> Result<Vec<Directive>, String> {
     let (cmd, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
     let rest = rest.trim_start();
     match cmd {
-        "SEND" => Ok(Directive::Send(unescape(rest)?)),
+        "SEND" => Ok(vec![Directive::Send(unescape(rest)?)]),
         "WAIT" => {
             // The text may itself contain spaces once unescaped, but the
             // optional trailing max_frames is a bare integer with no
@@ -234,22 +251,40 @@ fn parse_line(line: &str) -> Result<Directive, String> {
             // only when it parses as one.
             if let Some((text, count)) = rest.rsplit_once(char::is_whitespace) {
                 if let Ok(max_frames) = count.trim().parse::<u64>() {
-                    return Ok(Directive::Wait {
+                    return Ok(vec![Directive::Wait {
                         needle: unescape(text.trim_end())?,
                         max_frames,
-                    });
+                    }]);
                 }
             }
-            Ok(Directive::Wait {
+            Ok(vec![Directive::Wait {
                 needle: unescape(rest)?,
                 max_frames: DEFAULT_WAIT_FRAMES,
-            })
+            }])
         }
         "SLEEP" => rest
             .trim()
             .parse::<u64>()
-            .map(Directive::Sleep)
+            .map(|frames| vec![Directive::Sleep(frames)])
             .map_err(|e| format!("SLEEP: {e}")),
+        "REPEAT" => {
+            let (count, inner) = rest
+                .split_once(char::is_whitespace)
+                .ok_or("REPEAT: expected <n> <directive>")?;
+            let count: usize = count.trim().parse().map_err(|e| format!("REPEAT: {e}"))?;
+            let inner = inner.trim_start();
+            if inner.split_once(char::is_whitespace).map(|(c, _)| c) == Some("REPEAT")
+                || inner == "REPEAT"
+            {
+                return Err("REPEAT: nesting REPEAT is not supported".to_string());
+            }
+            let expanded = parse_line(inner)?;
+            let mut out = Vec::with_capacity(expanded.len() * count);
+            for _ in 0..count {
+                out.extend(expanded.iter().cloned());
+            }
+            Ok(out)
+        }
         other => Err(format!("unknown directive {other:?}")),
     }
 }
@@ -368,5 +403,32 @@ mod tests {
     #[test]
     fn unknown_directive_is_a_parse_error() {
         assert!(SerialScript::parse("FROB x").is_err());
+    }
+
+    #[test]
+    fn repeat_expands_to_n_copies_of_the_inner_directive() {
+        let mut script = SerialScript::parse("REPEAT 3 SEND \\x7f").unwrap();
+        assert_eq!(script.remaining.len(), 3);
+        let mut chipset = Chipset::new();
+        let mut console = Console::new(None).unwrap();
+        for frame in 0..3 {
+            script.tick(frame, &mut chipset, &mut console);
+            assert_eq!(
+                chipset.read(machine_core::chipset::reg::SERDATR) & 0xFF,
+                0x7f
+            );
+        }
+        assert!(script.is_done());
+    }
+
+    #[test]
+    fn repeat_rejects_nesting() {
+        assert!(SerialScript::parse("REPEAT 2 REPEAT 2 SEND x").is_err());
+    }
+
+    #[test]
+    fn repeat_rejects_garbage_count() {
+        assert!(SerialScript::parse("REPEAT nope SEND x").is_err());
+        assert!(SerialScript::parse("REPEAT 2").is_err());
     }
 }
