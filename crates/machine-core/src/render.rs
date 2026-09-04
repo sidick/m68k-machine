@@ -335,6 +335,7 @@ impl CopperState {
 #[derive(Clone)]
 struct BandState {
     bplcon0: u16,
+    bplcon1: u16,
     bpl1mod: u16,
     bpl2mod: u16,
     diwstrt: u16,
@@ -355,6 +356,7 @@ impl BandState {
     fn from_state(state: &CopperState) -> Self {
         Self {
             bplcon0: state.bplcon0,
+            bplcon1: state.bplcon1,
             bpl1mod: state.bpl1mod,
             bpl2mod: state.bpl2mod,
             diwstrt: state.diwstrt,
@@ -374,6 +376,7 @@ impl BandState {
     fn zeroed() -> Self {
         Self {
             bplcon0: 0,
+            bplcon1: 0,
             bpl1mod: 0,
             bpl2mod: 0,
             diwstrt: 0,
@@ -630,6 +633,17 @@ struct Geometry {
     /// multiplies an output-relative pixel index by this to find which
     /// fetched bit to read.
     bits_per_output_px: u32,
+    /// Which *fetched* bit the display window's leftmost pixel reads —
+    /// the fetch-to-display alignment. `0` for the standard register
+    /// relationships (`DDFSTRT = $38`/`$3C` with `DIWSTRT` h `$81`,
+    /// no scroll), where the first fetched bit is exactly the first
+    /// displayed one; positive when the guest fetches earlier than the
+    /// window opens (the early words are fetched but never shown);
+    /// negative when the window opens before any fetched data exists
+    /// (extreme overscan — those pixels show background). See
+    /// [`Geometry::decode_band`]'s doc comment for the derivation and
+    /// the real-ROM capture that required it.
+    fetch_bit_shift: i32,
 }
 
 impl Geometry {
@@ -698,13 +712,37 @@ impl Geometry {
     /// by row instead of being a one-off error. Clamped to
     /// [`MAX_DDF_WORDS`] against a hostile or malformed `DDFSTOP`.
     ///
-    /// **Not implemented**: `BPLCON1`'s fine horizontal scroll (`PF1H`).
-    /// Getting it exactly right needs sub-word bit shifting across the
-    /// fetched data, not just an x-offset (its unit is finer than a whole
-    /// output pixel in some modes); that is meaningfully more machinery
-    /// for a feature that exists for smooth-scrolling demos, not the boot
-    /// menu/Guru/Screenmode-prefs audience this renderer serves, so it is
-    /// read into [`CopperState`] but not applied.
+    /// **Fetch-to-display alignment** (`fetch_bit_shift`): the first
+    /// *displayed* bit is not always the first *fetched* bit. Denise
+    /// starts showing bitplane data when the beam reaches `DIWSTRT`'s
+    /// horizontal position; Agnus starts fetching at `DDFSTRT`. With the
+    /// standard relationship (`DDFSTRT = $3C` hires / `$38` lores against
+    /// `DIWSTRT` h `$81`, `BPLCON1 = 0`) the pipeline delivers fetched
+    /// bit 0 exactly as the window opens, and the picture's placement
+    /// moves *linearly* from there: one colour clock of earlier `DDFSTRT`
+    /// shows 2 more lores (4 more hires) bits of pre-window data, one
+    /// `DIWSTRT` h unit of later window start skips one lores (two hires)
+    /// fetched bits, and each `BPLCON1` `PF1H` scroll step delays the
+    /// data by one lores pixel, i.e.
+    /// `shift = (hstart - $81 - 2*(ddfstrt - std_ddf) - pf1h) * bits_per_output_px`
+    /// fetched bits (Copperline's `fetch_origin_native_shift`, read for
+    /// understanding, implements exactly this linear model relative to
+    /// the same calibrated standard case). Kickstart 47's boot screen is
+    /// the real capture that required it: `DIWSTRT h=$95, DDFSTRT=$40,
+    /// BPLCON1=$44` gives `shift = (20 - 8 - 4) * 2 = 16` — the first
+    /// fetched word (which, with its `BPL1MOD = -6` and 38-word fetch
+    /// over 70-byte rows, holds the *previous* row's rightmost floppy-
+    /// graphic bytes) is fetched but never displayed. Painting it, as
+    /// this function did before the shift existed, put a tan sliver of
+    /// the floppy's right edge at the window's left edge, one row down.
+    ///
+    /// **Partially implemented**: `BPLCON1` enters only through this
+    /// whole-output-pixel shift, applied from `PF1H` to *all* planes.
+    /// Per-playfield split scroll (`PF2H` differing from `PF1H`) and
+    /// sub-output-pixel positioning are not modelled — smooth-scroll
+    /// machinery this renderer's boot-screen audience never exercises
+    /// (real system screens program both nibbles equal, as Kickstart's
+    /// `$44` does).
     fn decode_band(b: &BandState) -> Self {
         let hires = b.bplcon0 & 0x8000 != 0;
         let raw_planes = ((b.bplcon0 >> 12) & 0x7) as u8;
@@ -753,6 +791,16 @@ impl Geometry {
             0
         };
 
+        // Fetch-to-display alignment, linear relative to the calibrated
+        // standard register relationship -- see this fn's doc comment.
+        // All three terms are in lores-pixel units (one DIWSTRT h unit)
+        // before scaling to fetched bits: DDFSTRT counts whole colour
+        // clocks, hence its factor of 2.
+        let std_ddf: i32 = if hires { 0x3C } else { 0x38 };
+        let pf1h = (b.bplcon1 & 0xF) as i32;
+        let fetch_bit_shift = (hstart_raw as i32 - 0x81 - 2 * (b.ddfstrt as i32 - std_ddf) - pf1h)
+            * bits_per_output_px as i32;
+
         Self {
             planes,
             lace,
@@ -763,6 +811,7 @@ impl Geometry {
             diw_y1: vstop.max(vstart),
             ddf_words,
             bits_per_output_px,
+            fetch_bit_shift,
         }
     }
 }
@@ -874,13 +923,17 @@ fn advance_plane_ptr(ptr: u32, words: u32, modulo: i16) -> u32 {
 /// emulator, not whatever uninitialised chip RAM those unused pointers
 /// happen to address.
 ///
-/// The fetched data is painted starting at `diw_x0`, using words in the
-/// order they were fetched (word 0 is the first displayed pixel group) --
-/// not offset by `DDFSTRT`'s own colour-clock position. Real hardware
-/// always programs `DDFSTRT` one fetch unit ahead of `DIWSTRT` precisely
-/// so the first fetched word is ready in time to be the first *displayed*
-/// word; `DDFSTRT`'s value only controls fetch timing, never a
-/// screen-space offset of its own.
+/// The fetched data is painted starting at `diw_x0`, with the window's
+/// leftmost pixel reading fetched bit [`Geometry::fetch_bit_shift`] — 0
+/// under the standard `DDFSTRT`/`DIWSTRT` relationship, where the first
+/// fetched word arrives exactly as the window opens, but *not* in
+/// general: a guest that fetches earlier than the window opens (as
+/// Kickstart 47's boot screen does, `DDFSTRT=$40` with `DIWSTRT h=$95`
+/// and scroll `$44`) has its leading fetched word(s) discarded by the
+/// window comparator on real hardware, never shown. See
+/// [`Geometry::decode_band`]'s doc comment for the model and the
+/// left-edge artefact that assuming "fetched bit 0 is displayed bit 0"
+/// produced.
 fn draw_bitplanes(state: &CopperState, ram: &[u8], bands: &Bands, fb: &mut Framebuffer) {
     let mut y0 = u32::MAX;
     let mut y1 = 0u32;
@@ -967,24 +1020,26 @@ fn draw_bitplanes(state: &CopperState, ram: &[u8], bands: &Bands, fb: &mut Frame
             bplpt[field][p] = advance_plane_ptr(bplpt[field][p], geom.ddf_words, modulo);
         }
 
-        let total_px = geom.ddf_words * 16;
+        let total_px = geom.ddf_words as i64 * 16;
         for x in geom.diw_x0..geom.diw_x1 {
-            // Fetched data is indexed from `diw_x0`, not from `DDFSTRT`'s
-            // own colour-clock position -- see this fn's doc comment.
-            // `src_px` (not `rel_px` directly) is the bit to actually
-            // read: in hires, `bits_per_output_px` is 2, so every other
-            // fetched bit is skipped (nearest-neighbour decimation) to
-            // fit hires' denser data into the canvas's fixed
-            // OUTPUT_PX_PER_CCK scale -- see Geometry::decode_band's doc
-            // comment on why the canvas doesn't instead widen to match.
+            // `src_px` is the fetched bit this output pixel reads: the
+            // window-relative position scaled by `bits_per_output_px`
+            // (2 in hires -- nearest-neighbour decimation to fit hires'
+            // denser data into the canvas's fixed OUTPUT_PX_PER_CCK
+            // scale, see Geometry::decode_band's doc comment), plus the
+            // fetch-to-display alignment `fetch_bit_shift` (see this
+            // fn's and Geometry::decode_band's doc comments).
             let rel_px = x - geom.diw_x0;
-            let src_px = rel_px * geom.bits_per_output_px;
-            let color_index = if src_px < total_px {
-                pixel_color_index(&words, geom.planes, src_px)
+            let src_px =
+                rel_px as i64 * geom.bits_per_output_px as i64 + geom.fetch_bit_shift as i64;
+            let color_index = if (0..total_px).contains(&src_px) {
+                pixel_color_index(&words, geom.planes, src_px as u32)
             } else {
-                // DIW wider than the fetched data (or a pathological DDF):
-                // show the background colour rather than fabricating
-                // plane data past what was actually fetched.
+                // Window pixels with no fetched data behind them: before
+                // the first fetched bit (window opens ahead of the data,
+                // negative src_px) or past the last (DIW wider than the
+                // fetch, or a pathological DDF). Show the background
+                // colour rather than fabricating plane data.
                 0
             };
             let argb = argb_from_amiga(bstate.color[color_index & 0x1F]);
@@ -1708,7 +1763,9 @@ mod tests {
     /// hardware formula.
     ///
     /// `BPLCON0 = $C000` (hires, 4 planes) with `DDFSTRT == DDFSTOP =
-    /// $38` gives `ddf_words = (0)/4 + 2 = 2` words = 4 bytes/row/plane
+    /// $3C` (the standard hires start, so the fetch-to-display shift is
+    /// zero and stride stays the only thing under test) gives
+    /// `ddf_words = (0)/4 + 2 = 2` words = 4 bytes/row/plane
     /// (see [`Geometry::decode_band`]'s doc comment) -- so plane 0's row 1
     /// must be fetched from `BPL1PT + 4`, not `+2` (the old, wrong
     /// lores-shaped formula's answer). Only plane 0 carries real data;
@@ -1749,8 +1806,8 @@ mod tests {
                 move_instr(reg::BPLCON0, 0xC000), // hires, 4 planes
                 move_instr(reg::DIWSTRT, 0x0081), // vstart 0, hstart 0x81
                 move_instr(reg::DIWSTOP, 0x8AC1), // vstop 138 (byte >= 0x80)
-                move_instr(reg::DDFSTRT, 0x0038),
-                move_instr(reg::DDFSTOP, 0x0038),
+                move_instr(reg::DDFSTRT, 0x003C),
+                move_instr(reg::DDFSTOP, 0x003C),
                 move_instr(reg::COLOR00, 0x0000),
                 move_instr(reg::COLOR00 + 2, 0x0FFF), // COLOR01: lit
                 end_instr(),
@@ -1933,6 +1990,106 @@ mod tests {
         state.ddfstrt = 0x0038;
         state.ddfstop = 0x0038;
         assert_eq!(Geometry::decode(&state).ddf_words, 1, "(0)/8 + 1");
+    }
+
+    /// The standard register relationships map fetched bit 0 to the
+    /// window's leftmost pixel (`fetch_bit_shift == 0`) in both
+    /// resolutions -- the alignment every pre-existing test and screen
+    /// implicitly assumed, now pinned explicitly.
+    #[test]
+    fn geometry_standard_ddf_diw_pairs_have_zero_fetch_shift() {
+        let mut lores = base_state();
+        lores.diwstrt = 0x2C81;
+        lores.diwstop = 0x2CC1;
+        lores.ddfstrt = 0x0038;
+        lores.ddfstop = 0x00D0;
+        lores.bplcon0 = 0x1000;
+        assert_eq!(Geometry::decode(&lores).fetch_bit_shift, 0, "lores");
+
+        let mut hires = lores.clone();
+        hires.ddfstrt = 0x003C;
+        hires.ddfstop = 0x00D4;
+        hires.bplcon0 = 0x9000;
+        assert_eq!(Geometry::decode(&hires).fetch_bit_shift, 0, "hires");
+    }
+
+    /// Kickstart 47's real boot-screen registers (captured from the ROM's
+    /// own copper list: `DIWSTRT=$1D95, DIWSTOP=$38AD, DDFSTRT=$40,
+    /// DDFSTOP=$D0, BPLCON1=$44`, hires): the fetch starts one unit
+    /// earlier than the window needs and scroll delays it further, so the
+    /// window's leftmost pixel must read fetched bit 16 -- word 0 is
+    /// fetched but never displayed. With its 38-word fetch over 70-byte
+    /// rows (`BPL1MOD=-6`), word 0 holds the *previous* row's rightmost
+    /// bytes; displaying it painted a sliver of the floppy graphic's
+    /// right edge at the window's left edge (see
+    /// [`Geometry::decode_band`]'s doc comment).
+    #[test]
+    fn geometry_kickstart47_boot_screen_skips_the_first_fetched_word() {
+        let mut state = base_state();
+        state.diwstrt = 0x1D95;
+        state.diwstop = 0x38AD;
+        state.ddfstrt = 0x0040;
+        state.ddfstop = 0x00D0;
+        state.bplcon1 = 0x0044;
+        state.bplcon0 = 0xC302; // hires, 4 planes
+
+        let geom = Geometry::decode(&state);
+        assert_eq!(
+            geom.fetch_bit_shift, 16,
+            "(0x95 - 0x81 - 2*(0x40 - 0x3C) - 4) * 2 fetched bits"
+        );
+        assert_eq!(
+            geom.ddf_words, 38,
+            "ceil((0xD0-0x40)/8)+1 units, 2 words each"
+        );
+        assert_eq!(
+            geom.diw_x1 - geom.diw_x0,
+            280,
+            "560 hires px window, decimated 2:1"
+        );
+    }
+
+    /// End-to-end pin of the fetch-to-display mapping through a full
+    /// render with Kickstart 47's register relationship: the first
+    /// *displayed* pixel must come from fetched bit 16 (word 1's MSB),
+    /// and word 0's content must never reach the screen.
+    #[test]
+    fn first_displayed_pixel_comes_from_bit_16_for_kickstart47s_registers() {
+        let mut ram = ram_with(4096);
+        // Word 0: all-ones -- would paint COLOR01 at the window's left
+        // edge if the renderer showed it. Word 1: MSB only.
+        write_word(&mut ram, 0x0100, 0xFFFF);
+        write_word(&mut ram, 0x0102, 0x8000);
+
+        let mut chipset = Chipset::new();
+        chipset.bplpt[0] = 0x0100;
+        chipset.bplcon0 = 0x9000; // hires, 1 plane
+        chipset.bplcon1 = 0x0044;
+        chipset.dmacon = 0x8300; // SETCLR | DMAEN | BPLEN
+        chipset.diwstrt = 0x0095; // vstart 0, hstart $95
+        chipset.diwstop = 0x01AD; // vstop line 1, hstop $AD
+        chipset.ddfstrt = 0x0040;
+        chipset.ddfstop = 0x00D0;
+        chipset.color[0] = 0x0000;
+        chipset.color[1] = 0x0FFF;
+
+        let geom_x0 = ((chipset.diwstrt & 0xFF) as usize / 2) * 2;
+        let width = geom_x0 + 8;
+        let mut pixels = std::vec![0u32; width];
+        let mut fb = Framebuffer::new(&mut pixels, width, 1).unwrap();
+
+        Renderer::new().render(&chipset, &ram, &mut fb);
+
+        assert_eq!(
+            fb.pixels[geom_x0],
+            argb_from_amiga(0x0FFF),
+            "leftmost window pixel reads fetched bit 16 (word 1's MSB), lit"
+        );
+        assert_eq!(
+            fb.pixels[geom_x0 + 1],
+            argb_from_amiga(0x0000),
+            "next pixel reads bit 18, clear -- word 0's all-ones must not leak in"
+        );
     }
 
     #[test]
