@@ -549,10 +549,17 @@ pub fn format_report(report: &Report) -> String {
 /// mis-diagnosis that investigation started from.
 pub fn format_display_state(chipset: &Chipset) -> String {
     format!(
-        "display state: COP1LC {:#010x}  BPLCON0 {:#06x}  BPLCON1 {:#06x}  \
+        "display state: COP1LC {:#010x}  COP2LC {:#010x}  BPLCON0 {:#06x}  BPLCON1 {:#06x}  \
          BPL1PT {:#010x}  DIWSTRT/STOP {:#06x}/{:#06x}  DDFSTRT/STOP {:#06x}/{:#06x}  \
          COLOR00 {:#06x}  SPR0PT {:#010x}",
         chipset.cop1lc,
+        // COP2LC matters as much as COP1LC for diagnosing a blank
+        // screen: Kickstart's boot view keeps COP1LC pointing at a
+        // stub list that strobes COPJMP2, and installs the real
+        // (bitplane-enabling) list through COP2LC from the VBlank
+        // server every frame -- so a machine that "looks blank" on
+        // COP1LC alone may in fact have a fully-built screen here.
+        chipset.cop2lc,
         chipset.bplcon0,
         chipset.bplcon1,
         chipset.bplpt[0],

@@ -278,15 +278,31 @@ impl Cia {
                 // Real 8520 behaviour software depends on: writing the
                 // high byte while the timer is stopped reloads the
                 // counter from the latch immediately, rather than
-                // waiting for a START.
-                if self.cra & CRA_START == 0 {
+                // waiting for a START -- and in one-shot mode it also
+                // sets START itself (MOS 8520 datasheet: "In one-shot
+                // mode, a write to timer-high will transfer the timer
+                // latch to the counter and initiate counting").
+                // Kickstart's timer.device relies on the one-shot
+                // auto-start for every MICROHZ interval: it programs
+                // CRA to one-shot, then writes TALO/TAHI and never
+                // touches START -- without this, no timer.device delay
+                // ever fires and boot parks before the insert-disk
+                // screen.
+                if self.cra & CRA_RUNMODE != 0 {
+                    self.timer_a = self.latch_a;
+                    self.cra |= CRA_START;
+                } else if self.cra & CRA_START == 0 {
                     self.timer_a = self.latch_a;
                 }
             }
             reg::TBLO => self.latch_b = (self.latch_b & 0xFF00) | value as u16,
             reg::TBHI => {
                 self.latch_b = (self.latch_b & 0x00FF) | ((value as u16) << 8);
-                if self.crb & CRB_START == 0 {
+                // Same one-shot auto-start rule as TAHI.
+                if self.crb & CRB_RUNMODE != 0 {
+                    self.timer_b = self.latch_b;
+                    self.crb |= CRB_START;
+                } else if self.crb & CRB_START == 0 {
                     self.timer_b = self.latch_b;
                 }
             }
@@ -829,6 +845,69 @@ mod tests {
         }
         assert!(advance(&mut cia, 1), "underflow on the 4th tick");
         assert_eq!(cia.timer_a, 3, "reloaded from the latch");
+    }
+
+    /// The 8520 auto-start Kickstart's timer.device depends on: with
+    /// RUNMODE (one-shot) already set, writing the timer's high byte
+    /// loads the counter from the latch *and* sets START itself (MOS
+    /// 8520 datasheet: "In one-shot mode, a write to timer-high will
+    /// transfer the timer latch to the counter and initiate counting").
+    /// The OS programs every MICROHZ interval as "CRA <- one-shot,
+    /// TALO, TAHI" and never touches START -- without the auto-start no
+    /// timer.device delay ever fires, and Kickstart 3.2 parks before it
+    /// ever puts up the insert-disk screen.
+    #[test]
+    fn tahi_write_in_one_shot_mode_starts_timer_a() {
+        let mut cia = Cia::new(CiaId::A);
+        cia.icr_mask = 1 << icr::TA;
+        cia.write(reg::CRA, CRA_RUNMODE);
+        cia.write(reg::TALO, 3);
+        assert_eq!(cia.cra & CRA_START, 0, "TALO alone must not start it");
+        cia.write(reg::TAHI, 0);
+        assert_ne!(
+            cia.cra & CRA_START,
+            0,
+            "TAHI write auto-starts a one-shot timer"
+        );
+        for i in 0..3 {
+            assert!(!advance(&mut cia, 1), "no underflow yet at tick {i}");
+        }
+        assert!(advance(&mut cia, 1), "one-shot fires after latch+1 ticks");
+        assert_eq!(cia.cra & CRA_START, 0, "and stops itself again");
+    }
+
+    /// The auto-start is a one-shot-mode behaviour only: in continuous
+    /// mode a TAHI write just latches (and reloads a stopped counter),
+    /// leaving START to the guest.
+    #[test]
+    fn tahi_write_in_continuous_mode_does_not_start_timer_a() {
+        let mut cia = Cia::new(CiaId::A);
+        cia.icr_mask = 1 << icr::TA;
+        cia.write(reg::TALO, 3);
+        cia.write(reg::TAHI, 0);
+        assert_eq!(cia.cra & CRA_START, 0, "continuous mode never auto-starts");
+        assert!(!advance(&mut cia, 8), "and the timer is not counting");
+    }
+
+    /// Timer B follows the same one-shot auto-start rule as timer A.
+    #[test]
+    fn tbhi_write_in_one_shot_mode_starts_timer_b() {
+        let mut cia = Cia::new(CiaId::B);
+        cia.icr_mask = 1 << icr::TB;
+        cia.write(reg::CRB, CRB_RUNMODE);
+        cia.write(reg::TBLO, 3);
+        assert_eq!(cia.crb & CRB_START, 0, "TBLO alone must not start it");
+        cia.write(reg::TBHI, 0);
+        assert_ne!(
+            cia.crb & CRB_START,
+            0,
+            "TBHI write auto-starts a one-shot timer"
+        );
+        for i in 0..3 {
+            assert!(!advance(&mut cia, 1), "no underflow yet at tick {i}");
+        }
+        assert!(advance(&mut cia, 1), "one-shot fires after latch+1 ticks");
+        assert_eq!(cia.crb & CRB_START, 0, "and stops itself again");
     }
 
     #[test]

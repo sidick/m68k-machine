@@ -137,8 +137,17 @@ pub const CIA_A_PRA_FIR0: u8 = 1 << 6;
 /// from the frame clock rather than a cycle-accurate model, so these are
 /// ratios chosen to make the guest's notion of time correct, not a
 /// claim about real 68040 bus timing.
+///
+/// The two must stay consistent with each other: the PAL E-clock is the
+/// colour clock divided by 5 (3.546895 MHz / 5 = 709.379 kHz, Amiga
+/// Hardware Reference Manual), so with 4 CPU clocks per colour clock one
+/// E-clock tick is 4 x 5 = 20 CPU clocks. Getting this wrong scales
+/// every CIA timer interval -- timer.device calibrates the VBlank rate
+/// against the E-clock at boot and derives all of its delays from it, so
+/// a doubled divider here made the guest's whole sense of time run half
+/// speed.
 pub const CPU_CLOCKS_PER_COLOUR_CLOCK: u32 = 4;
-pub const CPU_CLOCKS_PER_ECLOCK: u32 = 40;
+pub const CPU_CLOCKS_PER_ECLOCK: u32 = CPU_CLOCKS_PER_COLOUR_CLOCK * 5;
 
 impl<'a> MachineBus<'a> {
     /// Build a bus over caller-owned chip RAM and ROM storage.
@@ -197,7 +206,11 @@ impl<'a> MachineBus<'a> {
         // hardware: CIA-A counts vertical blanks, CIA-B counts raster
         // lines. Driving both from the beam keeps guest time coherent
         // with VERTB rather than drifting against it.
-        if beam.frame_wrapped {
+        // One TOD tick per frame *crossed*, not per call: a host resyncing
+        // a STOPped CPU ticks in coarse multi-frame batches, and dropping
+        // the extra wraps would run the OS wall clock (and every
+        // timer.device delay measured against it) slow.
+        for _ in 0..beam.frames_wrapped {
             self.cia_a.tod_tick();
         }
         for _ in 0..beam.lines_started {
@@ -447,6 +460,41 @@ mod tests {
         boxed_slice
             .try_into()
             .unwrap_or_else(|_| unreachable!("boxed_slice has exactly CHIP_RAM_SIZE elements"))
+    }
+
+    /// One giant `tick` spanning several frames (how the hosted runner
+    /// advances a STOPped CPU, only in smaller slices) must give CIA-A's
+    /// TOD one tick per frame *crossed*, not one per call: CIA-A TOD
+    /// counts vertical blanks and is the OS wall clock, so dropping
+    /// wraps runs every timer.device delay measured against it slow.
+    #[test]
+    fn cia_a_tod_ticks_once_per_frame_even_in_one_giant_tick() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom);
+        let frame_clocks = chipset::PAL_LINES_PER_FRAME
+            * chipset::PAL_COLOUR_CLOCKS_PER_LINE
+            * CPU_CLOCKS_PER_COLOUR_CLOCK;
+        bus.tick(frame_clocks * 5 + 10);
+        assert_eq!(bus.cia_a.tod, 5, "one TOD tick per wrapped frame");
+    }
+
+    /// Pin the clock-ratio relationship: the PAL E-clock is the colour
+    /// clock divided by 5 (AHRM), so the two `CPU_CLOCKS_PER_*`
+    /// constants must always satisfy `eclock = colour_clock * 5` -- one
+    /// PAL frame is then exactly `312 * 227 / 5` E-clock ticks. A
+    /// doubled E-clock divider once made every CIA timer (and so all of
+    /// timer.device's idea of time) run at half speed.
+    #[test]
+    fn eclock_ratio_is_five_colour_clocks() {
+        assert_eq!(CPU_CLOCKS_PER_ECLOCK, CPU_CLOCKS_PER_COLOUR_CLOCK * 5);
+        let frame_clocks = chipset::PAL_LINES_PER_FRAME
+            * chipset::PAL_COLOUR_CLOCKS_PER_LINE
+            * CPU_CLOCKS_PER_COLOUR_CLOCK;
+        assert_eq!(
+            frame_clocks / CPU_CLOCKS_PER_ECLOCK,
+            chipset::PAL_LINES_PER_FRAME * chipset::PAL_COLOUR_CLOCKS_PER_LINE / 5,
+        );
     }
 
     #[test]

@@ -450,7 +450,28 @@ fn run_guest(
                 // `run_for_cycles_inner` services a newly serviceable
                 // interrupt (including waking a stopped core) before its
                 // first fetch on every call.
-                bus.0.tick(RUN_BATCH_CYCLES as u32);
+                //
+                // Tick in raster-line slices and stop at the first slice
+                // that leaves an interrupt pending, never in one
+                // `RUN_BATCH_CYCLES` gulp. A gulp that size spans ~7 PAL
+                // frames, and a real 68k in STOP wakes the moment IPL
+                // rises -- gulping instead delivered one VERTB per gulp
+                // (every VBlank-counted OS timeout ran ~7x slow, so
+                // Kickstart's insert-disk screen never came up inside any
+                // sane frame budget), collapsed distinct CIA timer
+                // underflows into one ICR event, and let a freshly raised
+                // VERTB shadow a lower-level CIA interrupt at every
+                // resync point.
+                const STOP_TICK_SLICE: u32 = machine_core::chipset::PAL_COLOUR_CLOCKS_PER_LINE
+                    * machine_core::CPU_CLOCKS_PER_COLOUR_CLOCK;
+                let mut budget = RUN_BATCH_CYCLES as u32;
+                while budget > 0 {
+                    bus.0.tick(STOP_TICK_SLICE.min(budget));
+                    budget = budget.saturating_sub(STOP_TICK_SLICE);
+                    if bus.0.pending_irq_level() != 0 {
+                        break;
+                    }
+                }
                 cpu.set_irq(bus.0.pending_irq_level());
                 drain_serial(bus, console);
 

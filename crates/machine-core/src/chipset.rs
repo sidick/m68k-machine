@@ -167,8 +167,12 @@ const SERIAL_IN_BUF_CAP: usize = 32;
 pub struct BeamAdvance {
     /// Raster lines started during this tick.
     pub lines_started: u32,
-    /// Whether a frame boundary was crossed (VERTB was raised).
-    pub frame_wrapped: bool,
+    /// Frame boundaries crossed during this tick (VERTB raised at each).
+    /// A count, not a flag: a caller ticking in coarse batches can cross
+    /// several boundaries at once, and per-frame clocks hung off this
+    /// (CIA-A's TOD counts vertical blanks) must not lose ticks when it
+    /// does.
+    pub frames_wrapped: u32,
 }
 
 /// Which mouse button a host input event refers to.
@@ -652,7 +656,7 @@ impl Chipset {
                 self.vpos = 0;
                 self.frames += 1;
                 self.lof = !self.lof;
-                advance.frame_wrapped = true;
+                advance.frames_wrapped += 1;
                 self.raise_int(intbit::VERTB);
             }
         }
@@ -1094,8 +1098,8 @@ mod tests {
     fn beam_advances_across_a_line() {
         let mut c = Chipset::new();
         // One colour clock's worth of CPU cycles.
-        let wrapped = c.tick(4, 4).frame_wrapped;
-        assert!(!wrapped);
+        let wrapped = c.tick(4, 4).frames_wrapped;
+        assert_eq!(wrapped, 0);
         assert_eq!(c.hpos, 1);
         assert_eq!(c.vpos, 0);
     }
@@ -1104,8 +1108,8 @@ mod tests {
     fn beam_wraps_hpos_into_vpos_at_line_end() {
         let mut c = Chipset::new();
         let clocks = PAL_COLOUR_CLOCKS_PER_LINE * 4; // one full line
-        let wrapped = c.tick(clocks, 4).frame_wrapped;
-        assert!(!wrapped, "one line is not a full frame");
+        let wrapped = c.tick(clocks, 4).frames_wrapped;
+        assert_eq!(wrapped, 0, "one line is not a full frame");
         assert_eq!(c.hpos, 0);
         assert_eq!(c.vpos, 1);
     }
@@ -1119,15 +1123,15 @@ mod tests {
         );
         let frame_clocks = PAL_LINES_PER_FRAME * PAL_COLOUR_CLOCKS_PER_LINE * 4;
 
-        let wrapped = c.tick(frame_clocks, 4).frame_wrapped;
-        assert!(wrapped);
+        let wrapped = c.tick(frame_clocks, 4).frames_wrapped;
+        assert_eq!(wrapped, 1);
         assert_eq!(c.frames, 1);
         assert_eq!(c.pending_level(), 3);
 
         // Clear INTREQ; a second identical tick must raise it again, once.
         c.write(reg::INTREQ, 1 << intbit::VERTB);
-        let wrapped = c.tick(frame_clocks, 4).frame_wrapped;
-        assert!(wrapped);
+        let wrapped = c.tick(frame_clocks, 4).frames_wrapped;
+        assert_eq!(wrapped, 1);
         assert_eq!(c.frames, 2);
         assert_eq!(c.pending_level(), 3);
     }
@@ -1177,7 +1181,10 @@ mod tests {
         // instruction-hook call per frame.
         let advance = c.tick(frame_clocks * 5 + 10, 4);
         assert_eq!(c.frames, 5, "all five frame boundaries counted");
-        assert!(advance.frame_wrapped);
+        assert_eq!(
+            advance.frames_wrapped, 5,
+            "every wrapped frame is reported, so per-frame clocks (CIA-A TOD) lose none"
+        );
         assert_eq!(
             c.pending_level(),
             3,
