@@ -241,9 +241,17 @@ fn kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger() {
 /// 4-plane hires screen. So this asserts drawn content rather than a
 /// specific picture -- pixel-exact matching would break on any legitimate
 /// palette or layout change.
-/// `--screenshot-frame 200` is comfortably clear of `--max-frames 250`'s
-/// boundary (see the AROS test for why that matters: a capture taken
-/// right at the run's own final frame can observe a register mid-write).
+/// **The capture has to be late.** Since the machine gained a Gayle IDE
+/// interface, Kickstart finds an IDE port, probes it, and waits out the
+/// standard timeout before concluding there is no drive — around 30
+/// seconds, or ~1500 frames at 50 Hz, exactly as a real A1200 with no
+/// disk attached does. Before Gayle the ID register read as open bus,
+/// Kickstart concluded there was no interface at all, and the screen
+/// appeared immediately; capturing at frame 200 was fine then and is far
+/// too early now. Frame 2500 is comfortably past the timeout and clear
+/// of `--max-frames`'s own boundary (see the AROS test for why that
+/// matters: a capture taken at the run's final frame can observe a
+/// register mid-write).
 #[test]
 #[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
 fn kickstart_3_2_2_a1200_screenshot_shows_the_boot_screen() {
@@ -256,20 +264,20 @@ fn kickstart_3_2_2_a1200_screenshot_shows_the_boot_screen() {
         "--rom",
         KICKSTART_A1200,
         "--max-frames",
-        "250",
+        "2600",
         "--max-instructions",
-        "80000000",
+        "200000000",
         "--screenshot",
         path.to_str().unwrap(),
         "--screenshot-frame",
-        "200",
+        "2500",
     ])
     .unwrap();
     eprintln!("exit: {status:?}");
     eprintln!("{stdout}");
     assert!(
-        stdout.contains("screenshot: frame 200"),
-        "expected the capture to actually fire by frame 200"
+        stdout.contains("screenshot: frame 2500"),
+        "expected the capture to actually fire by frame 2500"
     );
 
     let (width, height, rgba) = decode_png(&path);

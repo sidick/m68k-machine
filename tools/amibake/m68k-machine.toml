@@ -1,0 +1,31 @@
+# Boot HDF for the m68k Machine's Gayle IDE bring-up device.
+#
+# Machine block mirrors what this machine actually presents to the guest:
+# a 68040 with FPU (proposal §6.2, and what Exec reports as AttnFlags
+# $804F), 2 MB of chip RAM (§6.1) and no fast RAM yet. No RTG: P96 is
+# Phase 3, and until then the stop-gap planar renderer (§8.1) is the
+# display.
+#
+# mmulibs supplies 68040.library. Without it the base's own
+# Startup-Sequence nags every boot for a missing CPU support library,
+# which on a machine presenting a 68040 is exactly the gap §6.2 warns
+# about.
+#
+# Both outputs are wanted. The `hdf` is what this machine's Gayle IDE
+# port serves — and Copperline models the same built-in Gayle IDE
+# (`attach = "ide-master"`, documented as "Built-in Gayle / A4000 IDE
+# Master"), so the identical image boots on both and the oracle can be
+# used against our IDE implementation rather than only our chipset.
+# The `dir` output is what amibake's copperline emitter currently
+# requires; Copperline supports host directories too, so it is a second
+# way to boot the same tree.
+#
+# The built outputs contain licensed AmigaOS 3.2.2 and must never be
+# committed — see .gitignore. Build them locally with:
+#
+#   ~/src/amibake/.venv/bin/amibake build tools/amibake/m68k-machine.toml
+base     = "os3.2.2"
+machine  = { cpu = "68040", fpu = true, ram = "chip:2M" }
+packages = ["mmulibs"]
+output   = ["hdf", "dir"]
+emit     = ["copperline"]

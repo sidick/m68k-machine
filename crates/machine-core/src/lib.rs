@@ -540,7 +540,12 @@ mod tests {
         // A representative sample of proposal §6.1's open-bus ranges:
         // slow RAM/unused, RTC, Gary/Ramsey, and the Gayle ID register the
         // A1200 3.2 ROM specifically probes.
-        for &addr in &[0x00C0_0000u32, 0x00D8_0000, 0x00DE_0000, 0x00DE_1000] {
+        // $DE1000 is deliberately absent: that is the Gayle ID
+        // register, which now genuinely answers there (see `gayle`).
+        // §11.1 expected it to read as absent under the open-bus rule
+        // and allowed for a stub if it did not; this is that stub grown
+        // into a real interface.
+        for &addr in &[0x00C0_0000u32, 0x00D8_0000, 0x00DE_0000, 0x00DD_0000] {
             assert_eq!(bus.read_byte(addr), 0xFF, "byte at {addr:#x}");
             assert_eq!(bus.read_word(addr), 0xFFFF, "word at {addr:#x}");
             assert_eq!(bus.read_long(addr), 0xFFFF_FFFF, "long at {addr:#x}");
@@ -553,8 +558,8 @@ mod tests {
         let rom = [0u8; ROM_WINDOW_SIZE];
         let mut bus = new_bus(&mut ram, &rom);
 
-        bus.write_long(0x00DE_1000, 0x1234_5678);
-        assert_eq!(bus.read_long(0x00DE_1000), 0xFFFF_FFFF);
+        bus.write_long(0x00DD_0000, 0x1234_5678);
+        assert_eq!(bus.read_long(0x00DD_0000), 0xFFFF_FFFF);
     }
 
     #[test]
