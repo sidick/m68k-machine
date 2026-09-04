@@ -283,10 +283,15 @@ impl Blitter {
                 m as i32
             }
         };
-        let amod = signed_step(self.modulo[CHAN_A]);
-        let bmod = signed_step(self.modulo[CHAN_B]);
-        let cmod = signed_step(self.modulo[CHAN_C]);
-        let dmod = signed_step(self.modulo[CHAN_D]);
+        // Modulos are added to word-aligned pointers, so the hardware
+        // ignores bit 0 of the programmed value. Adding it raw put the
+        // pointer one byte further out than Copperline's for every odd
+        // modulo — 10 divergences, invisible to a test suite that
+        // applied the same arithmetic it was checking.
+        let amod = signed_step(even(self.modulo[CHAN_A]));
+        let bmod = signed_step(even(self.modulo[CHAN_B]));
+        let cmod = signed_step(even(self.modulo[CHAN_C]));
+        let dmod = signed_step(even(self.modulo[CHAN_D]));
 
         let mut apt = self.pt[CHAN_A];
         let mut bpt = self.pt[CHAN_B];
@@ -294,14 +299,19 @@ impl Blitter {
         let mut dpt = self.pt[CHAN_D];
 
         // The barrel shifter carries the previously-processed word of
-        // each channel into the next word's shift, so a shifted blit
-        // reads correctly across word boundaries within a row. Reset at
-        // the top of each row: nothing carries in from the previous row.
+        // each channel into the next word's shift. It is a shift
+        // register, not per-row state: the hardware never clears it
+        // between rows, so the first word of every row after the first
+        // shifts in bits from the last word of the row before. Declaring
+        // these inside the row loop instead cost 21 divergences against
+        // Copperline — every shifted case with more than one row — while
+        // every unit test passed, since those checked the implementation
+        // against the same assumption it was built on.
+        let mut a_prev: u16 = 0;
+        let mut b_prev: u16 = 0;
         let mut last_d: u16 = 0;
 
         for _row in 0..self.height_rows {
-            let mut a_prev: u16 = 0;
-            let mut b_prev: u16 = 0;
             let mut fill_state: u16 = fci;
 
             for word_idx in 0..self.width_words {
@@ -670,6 +680,12 @@ fn line_step_y(dy: i32, bplmod: i32, cpt: &mut u32, one_dot: &mut bool) {
     let delta = if dy > 0 { bplmod } else { -bplmod };
     *cpt = cpt.wrapping_add(delta as u32);
     *one_dot = false;
+}
+
+/// Clear bit 0 of a modulo: pointers are word-aligned and the hardware
+/// never applies the odd byte.
+fn even(modulo: i16) -> i16 {
+    modulo & !1
 }
 
 fn set_ptr_hi(ptr: &mut u32, value: u16) {
