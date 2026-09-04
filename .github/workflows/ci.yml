@@ -56,7 +56,8 @@ jobs:
         run: cargo test -p machine-hosted
 
   # aarch64 harness: build board-qemu-virt, boot it under QEMU's `virt`
-  # machine, and grep its serial output for the Phase 0 marker line.
+  # machine, and assert it runs its bus/CPU checks and then boots the
+  # embedded AROS ROM pair on bare metal, narrating over the PL011 UART.
   qemu-virt:
     name: qemu-virt (aarch64)
     runs-on: ubuntu-latest
@@ -76,15 +77,36 @@ jobs:
       - name: Build board-qemu-virt
         run: cargo build -p board-qemu-virt --target aarch64-unknown-none
 
-      - name: Run under QEMU and check for Phase 0 marker
+      # Poll for AROS's own boot narration rather than the payload's
+      # Phase 0 marker: the guest booting is the later and stronger
+      # signal, and waiting for it means the completed log can then be
+      # asserted for everything at once. The payload parks after its
+      # bounded run, so the poll is what ends QEMU.
+      #
+      # Poll for the LAST line we intend to assert. The poll kills QEMU
+      # the moment it matches, so waiting on an earlier line races the
+      # rest of the output -- polling `callroms done` and then asserting
+      # the chip-memory list passed on virt and failed on q35 for exactly
+      # that reason.
+      - name: Run under QEMU and wait for the AROS boot
         run: |
           ./scripts/run-qemu-virt.sh > virt-serial.log 2>&1 &
           qemu_pid=$!
           ./scripts/ci-grep-serial.sh \
-            "PHASE0 BOARD-QEMU-VIRT: ALL CHECKS PASSED" \
+            "'chip memory'" \
             virt-serial.log \
-            60 \
+            180 \
             "$qemu_pid"
+
+      # Assert the whole chain on the finished log, so a regression in
+      # the Phase 0 bus/CPU checks cannot hide behind a successful boot.
+      - name: Check the bare-metal boot markers
+        run: |
+          ./scripts/check-serial-markers.sh virt-serial.log \
+            "PHASE0 BOARD-QEMU-VIRT: ALL CHECKS PASSED" \
+            "PHASE1 BOARD-QEMU-VIRT: overlay cleared" \
+            "GUEST | callroms done" \
+            "'chip memory'"
 
       - name: Upload serial log
         if: always()
@@ -95,8 +117,8 @@ jobs:
           if-no-files-found: ignore
 
   # x86-64 harness: build board-qemu-q35 (UEFI), boot it under QEMU's
-  # `q35` machine with OVMF firmware, and grep its serial output for the
-  # Phase 0 marker line. run-qemu-q35.sh does the cargo build itself (it
+  # `q35` machine with OVMF firmware, and assert the same bus/CPU checks
+  # and bare-metal AROS boot as the aarch64 harness above. run-qemu-q35.sh does the cargo build itself (it
   # needs to assemble an ESP directory from the built .efi), so this job
   # does not build it separately first.
   qemu-q35:
@@ -121,15 +143,25 @@ jobs:
       - name: Build board-qemu-q35
         run: cargo build -p board-qemu-q35 --target x86_64-unknown-uefi
 
-      - name: Run under QEMU and check for Phase 0 marker
+      # As for qemu-virt above, but with a longer budget: OVMF's own
+      # firmware boot runs before the payload starts at all.
+      - name: Run under QEMU and wait for the AROS boot
         run: |
           ./scripts/run-qemu-q35.sh > q35-serial.log 2>&1 &
           qemu_pid=$!
           ./scripts/ci-grep-serial.sh \
-            "PHASE0 BOARD-QEMU-Q35: ALL CHECKS PASSED" \
+            "'chip memory'" \
             q35-serial.log \
-            120 \
+            240 \
             "$qemu_pid"
+
+      - name: Check the bare-metal boot markers
+        run: |
+          ./scripts/check-serial-markers.sh q35-serial.log \
+            "PHASE0 BOARD-QEMU-Q35: ALL CHECKS PASSED" \
+            "PHASE1 BOARD-QEMU-Q35: overlay cleared" \
+            "GUEST | callroms done" \
+            "'chip memory'"
 
       - name: Upload serial log
         if: always()

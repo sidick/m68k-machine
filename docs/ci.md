@@ -30,13 +30,33 @@ well under a minute.
 ## `qemu-virt` and `qemu-q35`
 
 Build the aarch64 (`aarch64-unknown-none`) and x86-64 UEFI
-(`x86_64-unknown-uefi`) board layers, boot each under its QEMU harness
-(`scripts/run-qemu-virt.sh`, `scripts/run-qemu-q35.sh`), and grep the
-guest's serial output for a fixed marker line
-(`PHASE0 BOARD-QEMU-VIRT: ALL CHECKS PASSED` /
-`PHASE0 BOARD-QEMU-Q35: ALL CHECKS PASSED`) written after the payload's
-`MachineBus` self-checks (open bus, chip RAM roundtrip, ROM read +
-mirroring) all pass. Neither harness script exits QEMU on its own — the
+(`x86_64-unknown-uefi`) board layers and boot each under its QEMU
+harness (`scripts/run-qemu-virt.sh`, `scripts/run-qemu-q35.sh`).
+
+Each payload does two things. First the `MachineBus` self-checks (open
+bus, chip RAM roundtrip, ROM read and mirroring) plus a real
+`m68k::CpuCore` stepping guest instructions, ending in
+`PHASE0 BOARD-QEMU-VIRT: ALL CHECKS PASSED` / `...-Q35: ...`. Then it
+boots the **embedded AROS 68k ROM pair on bare metal** — no host OS
+under it — and narrates the guest's own output over the board's serial
+port, which is the roadmap's Phase 1 exit ("a ROM boots on both
+harnesses, observed via serial").
+
+The jobs assert the whole chain on the finished log with
+`scripts/check-serial-markers.sh`: the Phase 0 marker, the
+`PHASE1 ... overlay cleared` line, and AROS's own `callroms done` and
+chip-memory list. Asserting all four rather than just the last means a
+regression in the bus or CPU checks cannot hide behind a successful
+boot.
+
+**Poll for the last line you intend to assert.**
+`scripts/ci-grep-serial.sh` kills QEMU the moment its marker matches, so
+waiting on an earlier line races the rest of the output. Polling
+`callroms done` and then asserting the chip-memory list that follows it
+passed on virt and failed on q35 for exactly that reason; both now poll
+on the chip-memory line itself.
+
+Neither harness script exits QEMU on its own — the
 payload parks forever once done — so both jobs run the script in the
 background, redirect its output to a log file, and poll that file for the
 marker with `scripts/ci-grep-serial.sh <marker> <logfile> <timeout-secs>
@@ -48,9 +68,11 @@ unconditionally (`if: always()`), so a failure's output is inspectable
 without reproducing it locally.
 
 `qemu-virt` installs `qemu-system-arm` (the Ubuntu package providing
-`qemu-system-aarch64`) and gives the marker poll 60s. `qemu-q35` installs
-`qemu-system-x86` and `ovmf`, and gives the marker poll 120s (OVMF/UEFI
-boot is slower than the aarch64 `virt` machine's bare `-kernel` boot).
+`qemu-system-aarch64`) and gives the poll 180s. `qemu-q35` installs
+`qemu-system-x86` and `ovmf`, and gives it 240s — OVMF's own firmware
+boot runs before the payload starts at all. Both are generous against
+local runs of well under a minute, since a whole guest OS boot now sits
+inside that budget.
 `scripts/run-qemu-q35.sh` probes a short list of known OVMF code-pflash
 paths, including Ubuntu 24.04's `/usr/share/OVMF/OVMF_CODE_4M.fd` (the
 package renamed `OVMF_CODE.fd` there); override with the `OVMF_CODE` env
