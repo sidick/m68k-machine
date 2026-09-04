@@ -29,11 +29,16 @@ mkdir -p "$esp_dir/efi/boot"
 cp "$efi_bin" "$esp_dir/efi/boot/bootx64.efi"
 
 # Locate OVMF/edk2 code-only (read-only) firmware. Known paths, in order:
-# Homebrew macOS (qemu package), then common Linux distro locations.
+# Homebrew macOS (qemu package), then common Linux distro locations. Ubuntu
+# 24.04's `ovmf` package renamed the file to OVMF_CODE_4M.fd (4 MB image,
+# still at the same /usr/share/OVMF/ directory) -- probed after the older
+# OVMF_CODE.fd name so a system with both prefers the one this script has
+# used historically.
 known_ovmf_paths=(
     "/opt/homebrew/share/qemu/edk2-x86_64-code.fd"
     "/usr/share/qemu/edk2-x86_64-code.fd"
     "/usr/share/OVMF/OVMF_CODE.fd"
+    "/usr/share/OVMF/OVMF_CODE_4M.fd"
     "/usr/share/edk2/ovmf/OVMF_CODE.fd"
     "/usr/share/ovmf/OVMF.fd"
     "/usr/share/qemu/OVMF.fd"
