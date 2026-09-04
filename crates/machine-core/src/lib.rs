@@ -1,23 +1,26 @@
 //! Machine core: the guest-visible address space of the m68k Machine.
 //!
 //! This crate is `#![no_std]` and has no runtime dependencies. It owns the
-//! memory map (proposal `docs/m68k-machine-proposal.md` §6.1) and nothing
-//! else yet: no chipset registers, no CIAs, no CPU. Those land in later
-//! phases; Phase 0's job is a bus that a CPU core can read a reset vector
-//! and a handful of instructions from.
+//! memory map (proposal `docs/m68k-machine-proposal.md` §6.1) and the
+//! devices the OS spins on, but never the CPU: the m68k core is a
+//! consumer of this bus, not part of it.
 //!
-//! # Memory map (Phase 0 skeleton)
+//! # Memory map
 //!
 //! | Range | Contents |
 //! |---|---|
+//! | `$000000`-`$07FFFF` | ROM overlay while OVL is asserted (reads only) |
 //! | `$000000`-`$1FFFFF` | 2 MB chip RAM, borrowed from the board layer |
-//! | `$F80000`-`$FFFFFF` | 512 KB Kickstart ROM window, borrowed, read-only |
+//! | `$A00000`-`$BFFFFF` | CIA-A (odd bytes) and CIA-B (even bytes) |
+//! | `$DFF000`-`$DFFFFF` | Custom chip registers, [`chipset`] |
+//! | `$E00000`-`$E7FFFF` | AROS extended ROM, when a pair is loaded |
+//! | `$F80000`-`$FFFFFF` | 512 KB Kickstart ROM window, read-only |
 //! | everything else | open bus |
 //!
-//! The rest of proposal §6.1 (CIA space, custom chip registers, Zorro III,
-//! fast RAM) is not implemented here; those addresses currently fall
+//! Still absent, by phase: the software blitter and renderer (Phase 2),
+//! Zorro III board space and fast RAM (Phase 3). Those addresses fall
 //! through to the open-bus rule below, which is exactly what an
-//! unpopulated real machine would do at those addresses today.
+//! unpopulated real machine would do at them today.
 //!
 //! # Open-bus rule
 //!
@@ -110,6 +113,11 @@ pub const CIA_END: u32 = 0x00C0_0000;
 pub const CUSTOM_BASE: u32 = 0x00DF_F000;
 pub const CUSTOM_END: u32 = 0x00E0_0000;
 
+/// CIA-A PRA bit 6: joystick/mouse port 0 fire button (pin 6, FIR0),
+/// which is where the left mouse button actually lands — not the
+/// chipset's `POTGOR`, which carries only the right and middle buttons.
+pub const CIA_A_PRA_FIR0: u8 = 1 << 6;
+
 /// CPU clocks per colour clock and per E-clock tick.
 ///
 /// The machine presents a 68040 (proposal §6.2) but drives its timers
@@ -152,13 +160,49 @@ impl<'a> MachineBus<'a> {
     /// CIAs. Call this from the CPU's `sync` hook so device time and
     /// guest time stay in step.
     pub fn tick(&mut self, cpu_clocks: u32) {
-        self.chipset.tick(cpu_clocks, CPU_CLOCKS_PER_COLOUR_CLOCK);
+        let beam = self.chipset.tick(cpu_clocks, CPU_CLOCKS_PER_COLOUR_CLOCK);
+
+        // The CIAs' TOD counters are the OS's wall clock, and each is
+        // wired to a different edge of the same frame clock on real
+        // hardware: CIA-A counts vertical blanks, CIA-B counts raster
+        // lines. Driving both from the beam keeps guest time coherent
+        // with VERTB rather than drifting against it.
+        if beam.frame_wrapped {
+            self.cia_a.tod_tick();
+        }
+        for _ in 0..beam.lines_started {
+            self.cia_b.tod_tick();
+        }
 
         if self.cia_a.tick(cpu_clocks, CPU_CLOCKS_PER_ECLOCK) {
             self.chipset.raise_int(chipset::intbit::PORTS);
         }
         if self.cia_b.tick(cpu_clocks, CPU_CLOCKS_PER_ECLOCK) {
             self.chipset.raise_int(chipset::intbit::EXTER);
+        }
+    }
+
+    /// Report a mouse movement to the guest.
+    pub fn mouse_delta(&mut self, dx: i8, dy: i8) {
+        self.chipset.mouse_delta(dx, dy);
+    }
+
+    /// Report a mouse button change to the guest.
+    ///
+    /// The buttons are split across two chips on real hardware and so
+    /// they are here: the left button is CIA-A PRA bit 6 (pin 6, FIR0),
+    /// while right and middle are `POTGOR` bits. Routing both through
+    /// one call keeps that split out of the host's input code.
+    pub fn mouse_button(&mut self, button: chipset::MouseButton, pressed: bool) {
+        if button == chipset::MouseButton::Left {
+            // Active low: the pin is pulled to ground while pressed.
+            if pressed {
+                self.cia_a.pra &= !CIA_A_PRA_FIR0;
+            } else {
+                self.cia_a.pra |= CIA_A_PRA_FIR0;
+            }
+        } else {
+            self.chipset.mouse_button(button, pressed);
         }
     }
 
