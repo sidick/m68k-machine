@@ -49,7 +49,7 @@ Written once, byte-identical on both platforms:
 
 ## Phase 5 — Standalone machine (large)
 
-**Fork in the road, decided at entry — see `adr-0001-bare-metal-vs-linux-host.md`.** This phase was originally specified as bare metal on the assumption that the CPU core would build `no_std`. Phase 0 found it does not today, and also found the gap to be roughly a day or two of mechanical work rather than a wall. So the phase opens with a choice between owning the board's drivers (bare metal, below) and borrowing them (a minimal Linux as the hardware layer, the Amithlon model, which deletes most of this phase and collapses Phase 4's KVM stage). The Phase 4 measurements decide it, alongside the Emu68-variant question. Everything in Phases 0–4 is identical either way.
+**Fork in the road, decided at entry — see `adr-0001-bare-metal-vs-linux-host.md`.** This phase was originally specified as bare metal on the assumption that the CPU core would build `no_std`. Phase 0 found the published crate does not, and sized the gap at roughly a day or two of mechanical work rather than a wall. **That work has since been done** — the project now uses a `no_std` fork and has run a guest instruction on bare metal — so the CPU-core blocker is gone and what remains of the bare-metal option is the per-board driver work. So the phase opens with a choice between owning the board's drivers (bare metal, below) and borrowing them (a minimal Linux as the hardware layer, the Amithlon model, which deletes most of this phase and collapses Phase 4's KVM stage). The Phase 4 measurements decide it, alongside the Emu68-variant question. Everything in Phases 0–4 is identical either way.
 
 If bare metal, in order of effort and reuse:
 

@@ -14,36 +14,44 @@ See `docs/m68k-machine-proposal.md` for the full design rationale and
 
 ## Status
 
-**Phase 0 — Foundations.** Repo and licensing set up; the `m68k` crate's
-`no_std` support verified (currently absent — see
-`docs/phase0-findings.md`); a skeleton `no_std` address bus
-(`crates/machine-core`) implements the Phase 0 slice of the memory map
-(chip RAM, ROM window, open bus) with a hosted test that runs a real guest
-instruction through `m68k-rs`. Rock 5B hardware pre-checks are tracked in
-`docs/rock5b-week-one.md`.
+**Phase 2 — substantively complete.** Both target OSes boot and render
+their real boot screens with no boot device attached: Kickstart 3.2.2's
+checkered ball, Hyperion banner and floppy graphic; AROS 68k's cat-eyes
+logo, wordmark, "Waiting for bootable media" and device icons. See
+`docs/screenshots.md` for the evidence and the diagnostic traps found
+along the way, and proposal §8.1 for what the stop-gap renderer behind
+this does and does not cover.
 
-Nothing here boots a real ROM yet. That starts at Phase 1.
+The CPU now also runs on bare metal: the project adopted a `no_std` fork
+of the `m68k` crate (Phase 0's load-bearing finding — see
+`docs/phase0-findings.md`), and `board-qemu-virt` steps a real guest
+instruction under QEMU on `aarch64-unknown-none`, no host OS involved.
+The fork is pinned by `rev` and is not upstreamed, which is a real
+maintenance consideration recorded in that document.
 
 One open architectural question came out of Phase 0 and is recorded in
 `docs/adr-0001-bare-metal-vs-linux-host.md`: whether the Phase 5 endgame
 is bare metal (owning each board's drivers) or a minimal Linux as the
-hardware layer (borrowing them, the Amithlon model). Phases 0–4 are
-identical either way, so the decision waits for the Phase 4 measurements.
+hardware layer (borrowing them, the Amithlon model). The `no_std`
+conversion that ADR was waiting on has landed, which strengthens the
+bare-metal option, but the decision itself stays deferred to the Phase 4
+measurements as planned. Rock 5B hardware pre-checks are tracked in
+`docs/rock5b-week-one.md`.
 
 ## Workspace layout
 
 | Path | What |
 |---|---|
-| `crates/machine-core` | `#![no_std]`, dependency-free library: the guest-visible address bus (`MachineBus`) and memory map. No CPU, no chipset registers yet — those land in later phases. |
-| `crates/board-qemu-virt` *(planned)* | aarch64 board layer targeting QEMU's `virt` machine. |
-| `crates/board-qemu-q35` *(planned)* | x86-64 board layer targeting QEMU's `q35` machine. |
+| `crates/machine-core` | `#![no_std]` library: the guest-visible address bus (`MachineBus`), chipset registers, CIAs, software blitter, and the stop-gap planar renderer (§8.1). |
+| `crates/machine-hosted` | Hosted `std` runner: boots a real ROM, drives the guest under `m68k-rs`, and supports `--screenshot`/`--inspect` for diagnostics (`docs/screenshots.md`). |
+| `crates/board-qemu-virt` | aarch64 bare-metal board layer targeting QEMU's `virt` machine (`aarch64-unknown-none`); runs a real `CpuCore` and steps guest instructions with no host OS. |
+| `crates/board-qemu-q35` | x86-64 board layer targeting QEMU's `q35` machine. |
 | `docs/` | Design and process documents (proposal, roadmap, findings, hardware checklists). |
 
-The board crates are not yet added by this pass of work; they will build
-for bare-metal targets (`aarch64-unknown-none`, `x86_64-unknown-uefi`)
-distinct from `machine-core`'s own hosted test build, so the workspace
-`Cargo.toml` carries a comment on how per-crate targets are expected to
-be built once those crates land.
+Bare-metal board crates build for their own targets
+(`aarch64-unknown-none`, `x86_64-unknown-uefi`) distinct from
+`machine-core`'s and `machine-hosted`'s hosted builds; the workspace
+`Cargo.toml` carries a comment on how per-crate targets are built.
 
 ## Licence
 

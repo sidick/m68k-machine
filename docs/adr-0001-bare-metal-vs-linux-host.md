@@ -1,7 +1,11 @@
 # ADR 0001 — What the machine runs on at Phase 5
 
 **Status:** open — deliberately deferred to Phase 4/5. Recorded now
-because Phase 0 turned up evidence that changes the option set.
+because Phase 0 turned up evidence that changes the option set, and
+updated now that the option A conversion this ADR weighs has actually
+been done (see "Update: the conversion has landed" below). The decision
+itself has **not** been made — that stays deferred, deliberately, to the
+Phase 4 measurements.
 
 **Context:** proposal §5, §13, §15; roadmap Phase 5.
 
@@ -49,13 +53,39 @@ blocked by a wall; it is blocked by a chore. The choice below is
 therefore about **which set of drivers this project wants to own**, not
 about whether the CPU core can be made to link.
 
+## Update: the conversion has landed
+
+The chore sized above is done. The project owner wrote a `no_std` fork
+of `m68k`, pinned by `rev` in `[workspace.dependencies]` (not
+upstreamed — see `phase0-findings.md`'s "Resolution" section for that as
+a maintenance consideration in its own right), and `board-qemu-virt` now
+instantiates a real `CpuCore` and steps a guest instruction
+(`MOVEQ #42,D0` plus two `NOP`s) on bare metal under QEMU on
+`aarch64-unknown-none` — the first guest instruction this project has
+run outside a hosted process.
+
+This does not decide the ADR; it changes what "Option A" now costs.
+Before this, option A's cost was "the conversion chore, plus every
+driver in Phase 5." The conversion chore is now paid, a guest
+instruction has executed, and what remains for option A is **only** the
+per-board driver work (§13's UART, MMC/NVMe, GIC, PCIe root complex,
+xHCI for USB HID, and a display path per board) — there is no longer a
+CPU-core blocker sitting in front of it. That strengthens option A
+relative to option B without settling the choice: the Phase 4
+measurements this ADR is deferred to are about interpreter throughput
+and driver-ownership cost, neither of which this change speaks to.
+
 ## Options
 
 ### A. Convert `m68k` to `no_std`, keep the bare-metal plan
 
-The proposal as written. Cost: the conversion chore above, plus every
-driver in Phase 5 — UART, MMC/NVMe, GIC, PCIe root complex, xHCI for USB
-HID, and a display path per board.
+The proposal as written. **The conversion chore is done** (see "Update"
+above) — a fork exists, is pinned, and has run a guest instruction on
+bare metal. What remains of this option's cost is every driver in Phase
+5 — UART, MMC/NVMe, GIC, PCIe root complex, xHCI for USB HID, and a
+display path per board — plus the standing cost of depending on an
+unupstreamed personal fork (manual porting of any future upstream fix,
+single point of maintenance).
 
 Keeps: instant boot, no host OS, a single self-contained artifact, and
 the Emu68-variant door (§5.3) fully open.
@@ -111,12 +141,18 @@ outcome.
 
 ## Recommendation
 
-**Option B if the bare-metal identity is negotiable; option A if it is
-not.** Option B buys roughly a phase of driver work and a much shorter
-path to a machine that is genuinely usable on the Rock 5B, at the cost of
-a project claim that is partly marketing. Option A is the honest choice
-if "no host OS" is the point of the exercise rather than a nice property
-of it — and it is now known to be cheaper than Phase 0 first suggested.
+**Still open — deliberately not decided here.** Option B buys roughly a
+phase of driver work and a much shorter path to a machine that is
+genuinely usable on the Rock 5B, at the cost of a project claim that is
+partly marketing. Option A is the honest choice if "no host OS" is the
+point of the exercise rather than a nice property of it — and its
+conversion chore, which Phase 0 first sized as the deciding cost, is no
+longer a cost at all: it is done, and a guest instruction has run on
+bare metal because of it (see "Update" above). What option A now costs
+is per-board driver work and standing fork maintenance, not a CPU-core
+blocker — which makes it more attractive than it was when this ADR was
+first written, without being a reason to skip the Phase 4 measurements
+this decision is deferred to.
 
 The two are not mutually exclusive over time: B ships, A follows for the
 targets that justify it, and the m68k side cannot tell the difference.
@@ -138,7 +174,10 @@ platform question.
 ## Decision triggers
 
 - Phase 4 exit: interpreter throughput on RK3588 under the chosen host.
-- Whether `no_std` support lands upstream in `m68k` (either by this
-  project contributing it, per the sizing above, or independently).
+- Whether `no_std` support lands upstream in `m68k` — **not yet
+  resolved**: the project carries its own fork (rev-pinned, not
+  upstreamed) rather than waiting on this, so option A no longer needs
+  this trigger to fire, but an upstream merge would still retire the
+  fork-maintenance cost this ADR now records against option A.
 - Whether USB HID and NVMe on ARM bare metal look like work this project
   wants to own, once Phase 4 has shown what the rest of the stack costs.

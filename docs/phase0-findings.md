@@ -1,5 +1,13 @@
 # Phase 0 findings
 
+## m68k-rs `no_std` support — RESOLVED (see "Resolution" below)
+
+The finding immediately below is kept as it was recorded: it is the
+reason the architecture looks the way it does (§5.1's interpreter-first
+stance, ADR-0001's Phase 5 fork), and the "how big is the gap, actually?"
+sizing at the end of this section is what made the resolution cheap. It
+no longer describes the project's present state — see "Resolution".
+
 ## m68k-rs `no_std` support: verified FALSE (0.12.1, checked 2026-09-04)
 
 Proposal §15 and roadmap Phase 0 both flag the `m68k` crate's `no_std`
@@ -148,6 +156,54 @@ Delivered as `crates/machine-core`:
 - `cargo build -p machine-core --target aarch64-unknown-none` succeeds:
   `machine-core` itself is dependency-free `no_std` and compiles for the
   bare-metal target, independent of the `m68k` no_std question above.
+
+## Resolution: the project now carries a `no_std` fork of `m68k`
+
+The chore this document sized above ("bare metal is gated by a chore,
+not a wall") is done. The project owner wrote a fork of `m68k` with
+`no_std` support and it is adopted: declared once in
+`[workspace.dependencies]`, **pinned by `rev`, not by branch** — a branch
+moves underneath you, and this project already pins the published crate
+exactly for the same reason (a CPU-semantics change should be a
+deliberate, reviewed step, not something that arrives silently under the
+test suite). No guest-visible behaviour differs from the published
+crate: identical pass counts across `machine-core` and `machine-hosted`.
+
+**The fork is not being upstreamed for now.** Say this plainly rather
+than let it sit implicit: the project depends on a personal fork of a
+single-author crate, on top of already being that crate's only known
+bus-accurate `no_std` consumer. That is a real maintenance liability —
+it means CPU-core fixes and upstream `m68k` improvements have to be
+manually ported into the fork, and the fork itself has exactly one
+maintainer. It is recorded here rather than glossed over because the
+original finding's "single-author crate — pin versions, upstream fixes"
+risk (proposal §15) has, if anything, gotten sharper, not gone away.
+
+`board-qemu-virt` now instantiates a real `CpuCore` over the same ROM
+overlay the hosted test uses, resets it, and steps `MOVEQ #42,D0` plus
+two `NOP`s under QEMU on `aarch64-unknown-none` — the first guest
+instruction this project has executed outside a hosted process.
+
+**Two gotchas found doing the conversion, both general to every future
+bare-metal board layer, not specific to this one:**
+
+- **`no_std` + `alloc` still needs a registered `#[global_allocator]`.**
+  `step`/`reset` never allocate at runtime, but the crate's decode tables
+  reference `Vec`/`Box`, so linking it at all pulls in `alloc` and a
+  bare-metal consumer must supply an allocator even though the hot path
+  never touches it. A trivial bump allocator suffices.
+- **`CpuCore::new()`'s large struct literal gets lowered to SIMD
+  instructions despite involving no floating point.** The ~1.5 KB literal
+  is large enough that LLVM emits NEON load/stores to initialise it. FP/
+  SIMD traps by default at EL1 and EL2 on aarch64, and with no exception
+  vector table installed the trap has nowhere to go: the payload stalls
+  **silently**, indistinguishable from a hang, at a point that moves
+  between debug and release builds (different codegen, different trap
+  site). `_start` must enable `CPACR_EL1.FPEN` (and `CPTR_EL2.TFP` when
+  started at EL2 — check `CurrentEL` rather than assume) before any code
+  path can construct a `CpuCore`. x86 has an analogous requirement
+  (`CR0.EM`/`CR0.MP`/`CR4.OSFXSR`) that `board-qemu-q35` will need when it
+  reaches the same point.
 
 **Reset-vector detail worth flagging for later phases:** m68k-rs's
 `CpuCore::reset` reads the initial SSP/PC from absolute addresses

@@ -106,11 +106,17 @@ observably: locally, Kickstart reaches Exec's idle loop, but Phase 1's
 chipset/serial-console work up to now has been driven and verified
 against the AROS ROM, and Kickstart's boot narrates nothing over the
 serial port at the point it currently reaches — so even a from-scratch
-Kickstart CI job would have nothing on serial to assert against yet. That
-observability gap closes once Phase 2's display lands (Kickstart's boot
-menu is drawn, not printed); until then, AROS is not just the
-redistributable ROM, it is also the only ROM whose Phase 1 progress is
-observable at all without a screen.
+Kickstart CI job would have nothing on serial to assert against yet.
+
+**Update: that observability gap has closed.** Phase 2's renderer landed,
+and Kickstart's boot screen is drawn rather than printed, so its progress
+is now checkable by capturing a frame — see `screenshots.md` and the
+`kickstart_3_2_2_a1200_screenshot_shows_the_boot_screen` test. Kickstart
+is also reachable over serial through its own ROMWack debugger
+(`serial-debugging.md`), though that observes a deliberately faulted
+machine rather than a healthy one. AROS remains the public gate for the
+reason that has not changed — it is the redistributable ROM — rather than
+because it is the only observable one.
 
 ### Sourcing the ROM pair: vendored in-repo, not fetched
 

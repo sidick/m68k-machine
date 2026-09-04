@@ -139,16 +139,18 @@ Only registers the OS spins on or reads for identification are implemented; ever
 | `BLT*` | Software blitter (§7.3) | Planar rendering |
 | `COP1LC`/`COP2LC`, `COPJMP1` | Latched; consumed by renderer | Display (§8) |
 | `BPL*`, `DIW*`, `DDF*`, `COLOR00–31`, `SPR*` | Latched; consumed by renderer | Display |
-| `DSKBYTR`/`DSKLEN`/`DSKPT` | No disk; sink | trackdisk idles |
+| `DSKBYTR`/`DSKLEN`/`DSKPT` | Sink | see below — disk presence is not sensed here |
 | `SERDATR`/`SERDAT`/`SERPER` | Sink; TBE set | serial.device idles |
 | `POTGOR`/`POTGO`, `JOY0DAT`/`JOY1DAT` | Mouse deltas from host input | gameport.device unmodified |
 | `AUD*` | Sink | audio.device opens; AHI is the real path |
 
 **VERTB**: level-3 `INTF_VERTB` at 50 Hz (60 selectable) from the platform timer, shared with the beam counter and renderer so `WaitTOF`, VBlank servers and copper positions agree. One frame clock, designed in from day one.
 
+**Correction to the `DSKBYTR`/`DSKLEN`/`DSKPT` row (originally "no disk; sink | trackdisk idles").** That assumption was wrong: disk presence is not sensed through those registers at all. Real hardware senses a drive through the CIA-B PRB → CIA-A PRA wiring (`SELECT`, motor relay, `DSKTRACK0`, `DSKCHNG`, `DSKPROT`, and a 32-bit drive-ID shift register clocked out through `DSKRDY`), which this machine did not model. With those pins unmodelled, `trackdisk.device` **hung** rather than idling — sinking the data registers alone left the "is a drive there at all" question unanswered on the wires the OS actually reads it from. §7.2 now models the CIA side of that (`FloppyDrive`, per §10.3's storage plan not this section's registers), and the machine defaults to **no drive attached** — this machine has no floppy connector (it takes after the DraCo, §3, with storage over MIRAGE/Zorro III, §10.3), so advertising a phantom drive would only cost motor spin-ups and retries for hardware that doesn't exist. Confirmed on real hardware and in Amiberry, under both Kickstart 1.3 and 3.2.3, that zero drives still reaches the boot screen.
+
 ### 7.2 CIAs
 
-Two 8520s, register-level (not cycle-level) faithful: timers A/B (E-clock 709,379 Hz mapped to the platform timer), TOD + alarm, ICR with INT2/INT6 raising, **CIA-A SP/SDR keyboard handshake** (host HID → Amiga raw keycodes clocked in as hardware does — keyboard.device unmodified, the Amithlon trick), CIA-A PA / CIA-B PB per hardware.
+Two 8520s, register-level (not cycle-level) faithful: timers A/B (E-clock 709,379 Hz mapped to the platform timer), TOD + alarm, ICR with INT2/INT6 raising, **CIA-A SP/SDR keyboard handshake** (host HID → Amiga raw keycodes clocked in as hardware does — keyboard.device unmodified, the Amithlon trick), CIA-A PA / CIA-B PB per hardware, including the floppy status lines PRA/PRB carry per the correction above (`PRA`/`PRB` reads now compute `(latch & ddr) | (pins & !ddr)` so input pins report real levels instead of the output latch, which is also where the mouse fire button belongs and now lives).
 
 ### 7.3 Software blitter
 
@@ -158,7 +160,15 @@ graphics.library uses the blitter for *any* planar bitmap (Text(), offscreen Blt
 
 ### 8.1 Stop-gap planar renderer
 
-For visibility before P96 is installed (early startup menu, boot, gurus, Screenmode prefs) and as the permanent Guru/early-boot display. Deliberately dumb: once per frame walk the copper list linearly (MOVEs honoured, WAITs skipped), render from latched BPL/DIW/DDF/COLOR state — lores/hires, 1–5 planes, interlace, software pointer from sprite 0. No dragging, per-line palettes, HAM, EHB, dual playfield. ~500 lines on a spare core; output to the board layer's display surface. Not extended, ever.
+For visibility before P96 is installed (early startup menu, boot, gurus, Screenmode prefs) and as the permanent Guru/early-boot display.
+
+**Scope principle:** everything needed to render an ordinary screen correctly is in scope; effect-only extras stay out. The original spec ("walk the copper list linearly, MOVEs honoured, WAITs skipped") could not render any real Amiga screen: a real copper list turns bitplane DMA and the display on for a vertical band and off outside it, purely via vertical `WAIT`s, so skipping them left the renderer landing on the list's trailing planes-off state and produced a blank picture against a real Kickstart boot list. That is what the principle above replaced it with, and it is deliberately narrower than a full copper simulation — see the exclusions below.
+
+**Implemented**, once per frame: `MOVE`s honoured; `COPJMP1`/`COPJMP2` followed as the jump they are between copper lists (a stub list that strobes into a second list, as Kickstart's does, is followed); `WAIT`'s *vertical* position (mask and target line) honoured, so register state — including `DMACON`, `BPLCON0` and the palette — applies from the scanline it names onward, each output row rendered from whichever state was actually in force at that row; the `DMACON` `DMAEN`+`BPLEN` bitplane-DMA gate (no plane data is drawn unless both are set, matching real hardware); `BPLCON1`'s `PF1H` scroll, applied as a whole-output-pixel fetch-to-display shift (per-playfield split scroll and sub-pixel positioning are not modelled — see `render.rs`'s `fetch_bit_shift` doc comment); correct hires geometry (`DIWSTRT`/`DIWSTOP` scaled by a fixed output-pixel density, not by fetch density) and fetch-unit arithmetic (words-per-line computed in 8-colour-clock fetch units, with hires' one-word-deeper pipeline honoured); interlace rendered as two interleaved fields, each with its own advancing bitplane pointer; a software mouse pointer for sprite 0, its position/height read from the real sprite list header in chip RAM (`SPR0PT`/`SPR0PT+2`) rather than from the CPU-written `SPR0POS`/`SPR0CTL` registers, which real sprite DMA — absent here — is what would normally keep in sync. Lores/hires, 1–5 bitplanes.
+
+**Excluded, permanently:** HAM, EHB, dual playfield (`BPLCON2` blend/priority), sprite dragging, per-pixel copper effects, `WAIT`'s horizontal position and `SKIP`'s conditional behaviour (both no-ops), and mid-frame `BPLxPT` reprogramming (bitplane pointers are latched once per band, not walked forward row by row within a band the way real DMA would). None of this is scope creep waiting to happen — see `render.rs`'s module doc comment for the same line drawn in code.
+
+Grown well past the original ~500-line estimate (over 1,200 non-test lines as of this writing) as vertical-WAIT handling, fetch-unit arithmetic and interlace were added; runs on a spare core, output to the board layer's display surface. See `docs/screenshots.md` for what this renderer actually produces against both project ROMs.
 
 ### 8.2 P96 on a virtual framebuffer card (production path)
 
