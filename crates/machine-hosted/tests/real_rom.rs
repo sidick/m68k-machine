@@ -11,8 +11,11 @@
 //! -- --ignored --nocapture` and see how far things get without writing a
 //! one-off command line by hand every time.
 
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// Resolve a fixture this repo may not carry: an environment variable if
 /// the caller sets one, otherwise `nondistribution/` at the repo root.
@@ -247,6 +250,135 @@ fn kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger() {
     // rather than pass on banner text alone.
     assert!(
         stdout.contains("XCPT: 8000002F"),
+        "expected a register dump for the forced illegal-instruction exception"
+    );
+}
+
+/// The same ROMWack break-in as
+/// `kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger` above,
+/// but driven over `--serial-tcp` from a real client socket rather than
+/// from `--serial-script` -- the sharpest available proof that
+/// host->guest bytes genuinely cross the wire this task's brief added,
+/// not just that `SerialTcpBridge`'s own unit tests (`crate::serial_tcp`)
+/// can talk to themselves over loopback.
+///
+/// The break-in poll (`docs/serial-debugging.md`) only samples `SERDATR`
+/// six times, so hitting it needs a DEL already queued when the guest
+/// polls, not sent afterward. Unlike `--serial-script`'s `SEND` (which is
+/// paced deliberately, one byte per frame, entirely inside the emulator's
+/// own frame-by-frame clock), a byte sent from this test's separate
+/// process has to cross real wall-clock time to arrive -- so instead of
+/// one precisely-timed send this test does the same thing the script
+/// does for the same reason (`romwack-break-in.txt`'s own doc comment):
+/// flood DEL continuously from the moment the socket connects, so the
+/// guest's 32-byte receive queue is already sitting full of DEL well
+/// before frame ~29 (where the break-in poll actually runs -- see the
+/// other test's doc comment) regardless of exactly when that lands in
+/// real time. This works because this crate has no wall-clock pacing at
+/// all: `cargo test`'s debug build reaches frame 29 roughly 1.4s into the
+/// run (measured from the sibling test's own "~20s for 400 frames" note),
+/// which is ample time for a same-host TCP connection and a flooding
+/// thread to be running well ahead of it.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger_over_tcp() {
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
+        return;
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_machine-hosted"))
+        .args([
+            "--rom",
+            &rom,
+            "--trigger-illegal-after-frames",
+            "20",
+            "--serial-tcp",
+            "127.0.0.1:0",
+            "--max-frames",
+            "500",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn machine-hosted");
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+
+    // `run.rs`'s own diag line for a bound `--serial-tcp` listener:
+    // "host  | serial-tcp: listening on 127.0.0.1:<port> -- ...". Read
+    // lines until it shows up rather than guessing a port ourselves --
+    // `:0` above means the OS chose it.
+    let mut addr = None;
+    let mut lines = Vec::new();
+    for _ in 0..200 {
+        let mut line = String::new();
+        let n = stdout.read_line(&mut line).expect("read child stdout");
+        assert!(
+            n > 0,
+            "child exited before printing its --serial-tcp address"
+        );
+        let line = line.trim_end().to_string();
+        if let Some(rest) = line.strip_prefix("host  | serial-tcp: listening on ") {
+            let addr_str = rest.split(" --").next().unwrap_or(rest).trim();
+            addr = Some(addr_str.to_string());
+            lines.push(line);
+            break;
+        }
+        lines.push(line);
+    }
+    let addr = addr.expect("never saw the --serial-tcp listening address in stdout");
+    eprintln!("connecting to {addr}");
+
+    let client = TcpStream::connect(&addr).expect("connect to --serial-tcp bridge");
+    client
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+
+    // Flood DEL from a dedicated thread for the same reason
+    // `romwack-break-in.txt` floods it across 400 scripted frames -- see
+    // this test's own doc comment. Stops itself once the main thread
+    // below has seen the debugger banner, or after a generous ceiling so
+    // a failed break-in doesn't leave a thread spinning forever.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flood_stop = std::sync::Arc::clone(&stop);
+    let flooder = std::thread::spawn(move || {
+        let mut flood_client = client;
+        for _ in 0..20_000 {
+            if flood_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            if flood_client.write_all(&[0x7f]).is_err() {
+                return; // guest side closed -- run ended
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    // Read the rest of the child's output until it exits (bounded by
+    // `--max-frames 500` above regardless of whether the break-in
+    // lands), collecting every line for the same assertions the
+    // `--serial-script` sibling test makes.
+    loop {
+        let mut line = String::new();
+        match stdout.read_line(&mut line) {
+            Ok(0) => break, // EOF: child closed stdout (exiting)
+            Ok(_) => lines.push(line.trim_end().to_string()),
+            Err(_) => break,
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = flooder.join();
+    let status = child.wait().expect("wait for machine-hosted");
+
+    let stdout_text = lines.join("\n");
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout_text}");
+    assert!(
+        stdout_text.contains("GUEST | rom-wack"),
+        "expected the ROM's own rom-wack debugger banner, reached over --serial-tcp"
+    );
+    assert!(
+        stdout_text.contains("XCPT: 8000002F"),
         "expected a register dump for the forced illegal-instruction exception"
     );
 }

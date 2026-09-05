@@ -57,6 +57,7 @@ use crate::hd_image::FileBlockDevice;
 use crate::input_script::InputScript;
 use crate::rom_image;
 use crate::serial_script::SerialScript;
+use crate::serial_tcp::SerialTcpBridge;
 
 /// CPU cycles requested per `run_for_cycles_with_hook` call. Chosen well
 /// under `i32::MAX` (so a long-running batch can never overflow the
@@ -329,6 +330,19 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     };
     let mut bus = Bus(machine_bus, blitter_trace);
 
+    // Refused rather than silently prioritised: see `--serial-tcp`'s doc
+    // comment on `Args` for why picking a winner between "a live client"
+    // and "a fixed scripted sequence" would be a worse answer than making
+    // the caller choose one host->guest input source.
+    if args.serial_tcp.is_some() && args.serial_script.is_some() {
+        return setup_error(
+            console,
+            "--serial-tcp and --serial-script cannot both be given -- both drive host->guest \
+             serial input and only one can be the source of it"
+                .to_string(),
+        );
+    }
+
     let mut serial_script = match &args.serial_script {
         Some(path) => match SerialScript::load(path) {
             Ok(s) => Some(s),
@@ -338,6 +352,26 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
                     format!("reading --serial-script {}: {e}", path.display()),
                 )
             }
+        },
+        None => None,
+    };
+
+    // Bound *outside* the `Option` match, same lifetime reason as
+    // `hostblk_device`/`graphics_vram` above -- `SerialTcpBridge::start`
+    // spawns its background thread immediately, so the bridge exists
+    // (and its thread is polling) for the rest of this function's scope
+    // regardless of which branch below runs.
+    let serial_tcp = match &args.serial_tcp {
+        Some(addr) => match SerialTcpBridge::start(addr) {
+            Ok(bridge) => {
+                console.diag(&format!(
+                    "serial-tcp: listening on {} -- bidirectional bridge to the guest's \
+                     serial port (crate::serial_tcp)",
+                    bridge.local_addr()
+                ));
+                Some(bridge)
+            }
+            Err(e) => return setup_error(console, format!("binding --serial-tcp {addr}: {e}")),
         },
         None => None,
     };
@@ -373,6 +407,7 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         &mut bus,
         serial_script.as_mut(),
         input_script.as_mut(),
+        serial_tcp.as_ref(),
     );
 
     if let Some(script) = &serial_script {
@@ -435,6 +470,7 @@ fn run_guest(
     bus: &mut Bus,
     mut serial_script: Option<&mut SerialScript>,
     mut input_script: Option<&mut InputScript>,
+    serial_tcp: Option<&SerialTcpBridge>,
 ) -> Report {
     let mut total_instructions: u64 = 0;
     let mut last_progress_frame: u64 = 0;
@@ -476,7 +512,7 @@ fn run_guest(
         let result = cpu.run_for_cycles_with_hook(bus, RUN_BATCH_CYCLES, |cpu, bus, cycles| {
             bus.0.tick(cycles.max(0) as u32);
             cpu.set_irq(bus.0.pending_irq_level());
-            drain_serial(bus, console);
+            drain_serial(bus, console, serial_tcp);
             // Only serviced from here, not from the `Stopped` branch's own
             // catch-up tick below: this hook is guaranteed to run with the
             // CPU actively executing (never `stopped`), which is required
@@ -496,6 +532,7 @@ fn run_guest(
                 console,
                 serial_script.as_deref_mut(),
                 input_script.as_deref_mut(),
+                serial_tcp,
                 &mut overlay_cleared_frame,
                 &mut last_serviced_frame,
                 &mut illegal_triggered,
@@ -556,11 +593,11 @@ fn run_guest(
                 job.maybe_capture(frames, args.max_frames, &mut bus.0, console);
             }
 
-            if total_instructions >= args.max_instructions {
+            if args.max_instructions != 0 && total_instructions >= args.max_instructions {
                 hook_limit = Some("max-instructions");
                 return CycleBatchControl::Return;
             }
-            if frames >= args.max_frames {
+            if args.max_frames != 0 && frames >= args.max_frames {
                 hook_limit = Some("max-frames");
                 return CycleBatchControl::Return;
             }
@@ -627,7 +664,7 @@ fn run_guest(
                 // reached with the CPU still stopped, the bound has
                 // caught up.
                 let frames = bus.0.chipset.frames;
-                if frames >= args.max_frames {
+                if args.max_frames != 0 && frames >= args.max_frames {
                     break 'outer Outcome::LimitReached("max-frames");
                 }
 
@@ -665,7 +702,7 @@ fn run_guest(
                     }
                 }
                 cpu.set_irq(bus.0.pending_irq_level());
-                drain_serial(bus, console);
+                drain_serial(bus, console, serial_tcp);
 
                 let frames = bus.0.chipset.frames;
                 if let Some(job) = screenshot_job.as_mut() {
@@ -765,9 +802,15 @@ fn run_guest(
 /// `take_serial_byte`), but nothing drained that buffer before this --
 /// `Console::guest_byte` existed and was already wired for exactly this,
 /// just never called.
-fn drain_serial(bus: &mut Bus, console: &mut Console) {
+fn drain_serial(bus: &mut Bus, console: &mut Console, serial_tcp: Option<&SerialTcpBridge>) {
     while let Some(byte) = bus.0.chipset.take_serial_byte() {
         console.guest_byte(byte);
+        // Composes with the console tee unconditionally: a connected
+        // `--serial-tcp` client sees exactly the same guest bytes stdout/
+        // `--serial-log` do, never a filtered or delayed subset.
+        if let Some(bridge) = serial_tcp {
+            bridge.push_guest_byte(byte);
+        }
     }
 }
 
@@ -784,6 +827,7 @@ fn service_host_serial(
     console: &mut Console,
     script: Option<&mut SerialScript>,
     input_script: Option<&mut InputScript>,
+    serial_tcp: Option<&SerialTcpBridge>,
     overlay_cleared_frame: &mut Option<u64>,
     last_serviced_frame: &mut Option<u64>,
     illegal_triggered: &mut bool,
@@ -822,6 +866,29 @@ fn service_host_serial(
     // real card, never a dangling one against no card at all.
     if let (Some(script), Some(dev)) = (input_script, bus.0.input_mut()) {
         script.tick(frame, dev);
+    }
+    // One byte per frame, exactly `SerialScript`'s own `SEND` pace, and
+    // for the same underlying reason even though the two callers arrived
+    // at it differently: `SerialScript` throttles itself against
+    // `serial_in_has_room` to avoid tripping the chipset's overrun path;
+    // this throttles even though room is available, because
+    // `push_serial_in_byte` raises the RBF interrupt (68k level 5) once
+    // per accepted byte (its own doc comment is explicit this is
+    // deliberate, so an interrupt-driven reader doesn't stop after the
+    // first byte of several). Draining the whole 32-byte queue in one
+    // service call -- which a fast client left unthrottled easily fills,
+    // unlike a human typing or `SerialScript`'s own one-directive-at-a-
+    // time pace -- fires that many RBF interrupts back-to-back. Confirmed
+    // empirically, not theoretically: an unthrottled drain here reliably
+    // wedged the real Kickstart 3.2.2 ROMWack break-in test into an
+    // exception storm instead of ever reaching the debugger, while this
+    // one-byte throttle reaches it the same as the scripted version does.
+    if let Some(bridge) = serial_tcp {
+        if bus.0.chipset.serial_in_has_room() {
+            if let Some(byte) = bridge.try_recv_host_byte() {
+                bus.0.chipset.push_serial_in_byte(byte);
+            }
+        }
     }
 }
 

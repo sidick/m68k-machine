@@ -16,6 +16,7 @@ mod rom_image;
 mod run;
 mod screenshot;
 mod serial_script;
+mod serial_tcp;
 
 use std::process::ExitCode;
 

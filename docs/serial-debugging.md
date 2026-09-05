@@ -251,3 +251,54 @@ observing on Kickstart (guest memory state, not guest narration) while
 crediting ROMWack for what it actually demonstrated: that this
 project's `--inspect` picture of "healthy and idle" and the ROM's own
 internal debugger's picture of the same moment agree.
+
+## Live sessions: `--serial-tcp`
+
+Everything above drives the guest's serial port from a fixed,
+pre-written `--serial-script`. `--serial-tcp <addr>` (e.g.
+`127.0.0.1:1234`) is the live counterpart: it binds `addr` and bridges
+it bidirectionally onto the same `SERDAT`/`SERDATR` wire -- a connected
+TCP client sees guest output as it happens and can type input back,
+including driving the ROMWack break-in above interactively rather than
+from a script. See `crates/machine-hosted/src/serial_tcp.rs`'s module
+doc comment for the full threading and client-lifecycle design; the
+short version:
+
+- It is a plain byte stream with no framing of its own -- exactly what
+  `SERDAT`/`SERDATR` already carry. TCP was chosen for our own reasons
+  (nothing beyond `std`; matches the shape Copperline, this project's
+  oracle, already exposes its own guest serial as, so the same
+  host-side tooling can point at either machine by address alone; no
+  optional serial-library dependency), not because any one client
+  needs TCP specifically -- AmiPilot's own `WireClient` is equally at
+  home over TCP or a real/virtual serial port (`connect`/
+  `connect_serial`), and a plain `nc`, a terminal, or a future debugger
+  work here identically.
+- Refused together with `--serial-script` (both would compete to
+  supply host->guest bytes); composes fine with `--serial-log`, and
+  guest output still reaches stdout as always.
+- No client yet: guest output buffers (bounded, drop-oldest) rather
+  than blocking or vanishing. Client connects mid-run: picked up on the
+  bridge thread's next poll, no handshake needed. Disconnects: the
+  bridge goes back to accepting: a client can reconnect and pick up
+  where output buffering left off.
+- Host->guest bytes are handed to the guest one per serviced frame,
+  the same pace `SerialScript`'s `SEND` uses -- not because of any
+  baud model (there isn't one), but because `push_serial_in_byte`
+  raises the RBF interrupt once per accepted byte; draining a fast
+  client's whole backlog into the guest's 32-byte queue in one gulp
+  fires that many interrupts back to back and was confirmed, not just
+  suspected, to wedge the ROMWack break-in below into an exception
+  storm instead of ever reaching the debugger.
+- An interactive session has no natural frame/instruction count to end
+  it at: pass `--max-frames 0 --max-instructions 0` (both flags treat
+  `0` as unlimited) and end the run from outside (Ctrl-C) instead.
+
+`crates/machine-hosted/tests/real_rom.rs`'s
+`kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger_over_tcp`
+reproduces the break-in above end to end over a real socket (a test
+client connects, floods DEL, and watches for the `rom-wack` banner in
+the child process's own stdout) -- the sharpest available proof that
+this bridge's host->guest direction genuinely crosses a real socket
+rather than only its own loopback unit tests
+(`crates/machine-hosted/src/serial_tcp.rs`) talking to themselves.

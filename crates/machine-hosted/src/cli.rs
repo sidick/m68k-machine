@@ -32,12 +32,24 @@ pub struct Args {
 
     /// Stop after this many chipset frames (VERTB boundaries) even if
     /// nothing else ended the run. Guarantees termination for CI.
+    ///
+    /// `0` means unlimited: the frame count is never checked, and the run
+    /// continues until some other outcome (clean halt, wedge, or
+    /// `--max-instructions`) ends it. This exists for `--serial-tcp`
+    /// interactive sessions, which have no natural frame count to bound
+    /// them by; every other caller (CI included) keeps getting a genuine
+    /// bound because `0` is never the default.
     #[arg(long, default_value_t = 6_000)]
     pub max_frames: u64,
 
     /// Stop after this many retired instructions even if nothing else
     /// ended the run. Guarantees termination for CI independent of
     /// whether the guest ever reaches a frame boundary.
+    ///
+    /// `0` means unlimited, for the same reason and the same
+    /// `--serial-tcp` use case as `--max-frames`'s `0`. Pass both as `0`
+    /// for a genuinely unbounded interactive session -- terminate it from
+    /// the outside (Ctrl-C, killing the process) instead.
     #[arg(long, default_value_t = 200_000_000)]
     pub max_instructions: u64,
 
@@ -83,6 +95,40 @@ pub struct Args {
     /// appearing in a screenshot. See `docs/input-protocol.md`.
     #[arg(long)]
     pub input_script: Option<PathBuf>,
+
+    /// Bind this address (e.g. `127.0.0.1:1234`) and bridge it
+    /// bidirectionally onto the guest's serial port: bytes the guest
+    /// writes to `SERDAT` go to the connected client, and bytes the
+    /// client sends arrive at the guest's `SERDATR` the same way
+    /// `--serial-script`'s `SEND` does
+    /// (`Chipset::push_serial_in_byte`). See `crate::serial_tcp`'s doc
+    /// comment for the full rationale, the client-lifecycle contract (no
+    /// client yet / connects mid-run / disconnects and reconnects), and
+    /// why TCP was chosen over, say, a PTY.
+    ///
+    /// A byte stream is all this carries -- nothing here is specific to
+    /// any one client. AmiPilot's `WireClient.connect(host, port)` is one
+    /// consumer (its own wire protocol is transport-agnostic; a socket is
+    /// just one carrier it already supports, on equal footing with a real
+    /// serial port), but a plain `nc`, a terminal, or a future debugger
+    /// work identically, since only the guest's serial port is being
+    /// spoken to.
+    ///
+    /// Refused together with `--serial-script`: both compete to be the
+    /// one source of host->guest bytes, and silently picking a priority
+    /// between "a live human/client at a socket" and "a fixed scripted
+    /// sequence" would be a worse answer than making the caller choose.
+    /// `--serial-log` composes fine with this flag (it tees independently
+    /// of where guest output also goes), and guest output still reaches
+    /// stdout as always.
+    ///
+    /// An interactive session run this way has no natural frame or
+    /// instruction count to end it at -- pair this with `--max-frames 0
+    /// --max-instructions 0` (see their docs) and end the run from
+    /// outside (Ctrl-C) when done, or pass real bounds if a timeout is
+    /// wanted instead.
+    #[arg(long)]
+    pub serial_tcp: Option<String>,
 
     /// Force a genuine 68k illegal-instruction exception into the guest
     /// this many chipset frames after the ROM overlay first clears
