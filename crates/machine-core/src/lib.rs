@@ -435,6 +435,29 @@ impl<'a> MachineBus<'a> {
         self.graphics.as_ref()
     }
 
+    /// Where each of the attached graphics card's own boards was placed
+    /// by AUTOCONFIG, in the card's board order, or `None` for a board
+    /// this variant does not use (Zorro III uses only index 0) or one
+    /// the guest has not configured yet.
+    ///
+    /// Diagnostics want the *card's* boards, not whatever happens to sit
+    /// at the front of the chain. Those were the same thing until fast
+    /// RAM was added, and a reporter that probed chain slots 0 and 1
+    /// then started attributing the memory board's base to the graphics
+    /// card. Nothing depends on a card landing at a particular address --
+    /// AUTOCONFIG assigns them dynamically on real hardware too, and this
+    /// card genuinely moves when the chain changes -- so the mapping has
+    /// to be followed rather than assumed.
+    pub fn graphics_board_bases(&self) -> [Option<u32>; graffity::MAX_GRAFFITY_BOARDS] {
+        let mut out = [None; graffity::MAX_GRAFFITY_BOARDS];
+        for (slot, chain_index) in self.graphics_boards.iter().enumerate() {
+            out[slot] = chain_index
+                .and_then(|i| self.autoconfig.placement(i))
+                .map(|p| p.base);
+        }
+        out
+    }
+
     /// Borrow the attached MIRAGE card, if [`Self::with_mirage`] was
     /// called. Mutable access is what the board layer (or a test) uses
     /// to call [`mirage::Mirage::notify_media_change`] -- the host-side

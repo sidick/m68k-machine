@@ -715,18 +715,18 @@ pub fn format_graphics_state(bus: &MachineBus) -> String {
         Some(b) => format!("{b:#010x}"),
         None => "none".to_string(),
     };
-    // Graffity's own boards always land at the front of the chain, before
-    // anything else this machine's board layers attach -- so probing a
-    // few leading indices and reporting whichever configured is enough,
-    // without this module needing to know how many boards the attached
-    // variant actually uses.
-    let boards: std::vec::Vec<String> = (0..2)
-        .map(|i| {
-            format!(
-                "board[{i}] {}",
-                fmt_base(bus.autoconfig.placement(i).map(|p| p.base))
-            )
-        })
+    // Ask the bus which chain slots are actually this card's, rather
+    // than probing the front of the chain. Those were the same thing
+    // until fast RAM added a third board: the memory board can win the
+    // first Zorro III slot, and this then reported its base as the
+    // graphics card's while the card sat somewhere else entirely. The
+    // card really does move -- AUTOCONFIG assigns dynamically, as on real
+    // hardware -- and nothing should assume otherwise.
+    let boards: std::vec::Vec<String> = bus
+        .graphics_board_bases()
+        .iter()
+        .enumerate()
+        .map(|(i, base)| format!("board[{i}] {}", fmt_base(*base)))
         .collect();
     let boards = boards.join("  ");
     match card.decoded_mode() {
