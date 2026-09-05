@@ -260,7 +260,7 @@
 //! exposes for a driver's `TD_CHANGENUM`-style polling.
 
 use crate::autoconfig::{BoardSpec, ERTF_DIAGVALID, ERT_ZORROIII};
-use crate::gayle::{BlockDevice, SECTOR_BYTES};
+use crate::block::{BlockDevice, SECTOR_BYTES};
 
 /// **Placeholder, but a *reserved* one.** NDK 3.2
 /// `libraries/configregs.h` sets aside manufacturer 2011 (`$7DB`) for

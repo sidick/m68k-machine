@@ -47,7 +47,7 @@ use std::path::Path;
 
 use m68k::{CpuCore, CycleBatchControl, CycleBatchExit};
 
-use machine_core::gayle::BlockDevice;
+use machine_core::block::BlockDevice;
 use machine_core::{MachineBus, CHIP_RAM_SIZE};
 
 use crate::bus::Bus;
@@ -195,32 +195,9 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
             Err(_) => unreachable!("boxed_slice has exactly CHIP_RAM_SIZE elements"),
         };
 
-    // Opened before `machine_bus` (which borrows it, `with_hd`'s `&'a mut`)
-    // and outside the `Option` match below so the file, once opened, lives
-    // long enough regardless of which branch runs.
-    let mut hd_device = match &args.hd {
-        Some(path) => match FileBlockDevice::open(path, args.hd_writable) {
-            Ok(dev) => {
-                console.diag(&format!(
-                    "hd: {} ({} sectors, {})",
-                    path.display(),
-                    dev.sector_count(),
-                    if dev.writable() {
-                        "read-write"
-                    } else {
-                        "read-only"
-                    }
-                ));
-                Some(dev)
-            }
-            Err(e) => return setup_error(console, format!("opening --hd {}: {e}", path.display())),
-        },
-        None => None,
-    };
-
-    // Same lifetime reasoning as `hd_device`: `with_hostblk` also
-    // borrows `&'a mut`, so this must be opened and live outside the
-    // `Option` match, ahead of `machine_bus`.
+    // Opened before `machine_bus` (which borrows it, `with_hostblk`'s
+    // `&'a mut`) and outside the `Option` match below so the file, once
+    // opened, lives long enough regardless of which branch runs.
     let mut hostblk_device = match &args.hostblk {
         Some(path) => match FileBlockDevice::open(path, args.hostblk_writable) {
             Ok(dev) => {
@@ -247,8 +224,9 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     };
 
     // Heap-allocated, and opened (allocated) outside the `Option` match
-    // below for the same lifetime reason `hd_device` is: `with_graphics`
-    // borrows it `&'a mut`, so it must outlive `machine_bus`. Only
+    // below for the same lifetime reason `hostblk_device` is:
+    // `with_graphics` borrows it `&'a mut`, so it must outlive
+    // `machine_bus`. Only
     // allocated at all when `--graphics` is passed -- a plain boot run
     // pays nothing for it, matching `with_graphics`'s own "absent unless
     // attached" contract.
@@ -258,14 +236,15 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         Vec::new()
     };
 
-    // Same "only allocated at all when asked for" shape as `graphics_vram`
-    // above: a plain boot run pays nothing for fast RAM, and the flag's
-    // absence must leave the AUTOCONFIG chain (and so every existing
-    // baseline) untouched -- `MachineBus::with_fast_ram`'s own doc
-    // comment on why this is off by default.
-    let mut fast_ram: Vec<u8> = match args.fast_ram_mb {
-        Some(mb) => vec![0u8; mb as usize * 1024 * 1024],
-        None => Vec::new(),
+    // Same "only allocated at all when needed" shape as `graphics_vram`
+    // above: `--fast-ram-mb 0` (opt-out; the flag itself defaults to 256,
+    // `cli.rs`'s own doc comment) must leave the AUTOCONFIG chain -- and
+    // so every baseline that predates fast RAM -- untouched, the same
+    // guarantee `MachineBus::with_fast_ram`'s doc comment gives.
+    let mut fast_ram: Vec<u8> = if args.fast_ram_mb > 0 {
+        vec![0u8; args.fast_ram_mb as usize * 1024 * 1024]
+    } else {
+        Vec::new()
     };
 
     let machine_bus = MachineBus::new(&mut chip_ram, &rom_bytes);
@@ -275,14 +254,9 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     };
     let machine_bus = machine_bus.with_floppy(args.floppy.into());
     console.diag(&format!("floppy: {:?}", args.floppy));
-    let machine_bus = match &mut hd_device {
-        Some(dev) => machine_bus.with_hd(dev),
-        None => machine_bus,
-    };
     let machine_bus = match &mut hostblk_device {
-        // Not writable-by-default matters here too: `hostblk` is
-        // brand new (this crate's brief) and unproven end to end, same
-        // reasoning `--hd-writable`'s doc comment gives.
+        // Not writable-by-default matters here too: see
+        // `--hostblk-writable`'s doc comment.
         Some(dev) => {
             let write_protect = !dev.writable();
             machine_bus.with_hostblk(0, dev, write_protect)
@@ -319,13 +293,13 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     // baseline -- exactly the risk `docs/device-ledger.md`'s fast RAM row
     // and this flag's own doc comment call out.
     let machine_bus = match args.fast_ram_mb {
-        Some(mb) => {
+        mb if mb > 0 => {
             console.diag(&format!(
                 "fast-ram: {mb} MB, Zorro III AUTOCONFIG board (ERTF_MEMLIST)"
             ));
             machine_bus.with_fast_ram(&mut fast_ram)
         }
-        None => machine_bus,
+        _ => machine_bus,
     };
     let blitter_trace = match &args.blitter_trace {
         Some(path) => match crate::blitter_trace::BlitterTrace::open(path) {

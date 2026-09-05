@@ -45,12 +45,12 @@
 
 pub mod autoconfig;
 pub mod blitter;
+pub mod block;
 pub mod chipset;
 pub mod cia;
 pub mod cirrus;
 pub mod display;
 pub mod fastram;
-pub mod gayle;
 pub mod graffity;
 pub mod hostblk;
 pub mod mirage;
@@ -59,9 +59,9 @@ pub mod rom;
 
 use autoconfig::AutoConfig;
 use blitter::Blitter;
+use block::BlockDevice;
 use chipset::Chipset;
 use cia::{Cia, CiaId, FloppyDrive, FloppyPresence};
-use gayle::{BlockDevice, Gayle};
 use graffity::Graffity;
 use hostblk::Hostblk;
 use mirage::Mirage;
@@ -153,15 +153,9 @@ pub struct MachineBus<'a> {
     /// on the bus, not on either `Cia`, because it is wired between the
     /// two chips (CIA-B drives it, CIA-A reads it back).
     pub floppy: FloppyDrive,
-    /// Gayle and its IDE interface — the bring-up storage device (see
-    /// [`gayle`]). Absent unless a board layer attaches one.
-    pub gayle: Gayle,
     /// The Zorro AUTOCONFIG chain (§9). Every expansion this machine
     /// offers is discovered through it.
     pub autoconfig: AutoConfig,
-    /// The disk behind Gayle's IDE port, supplied by the board layer
-    /// since this crate has no file I/O of its own.
-    hd: Option<&'a mut dyn BlockDevice>,
 
     /// The Graffity graphics card, when the board layer has attached
     /// one via [`Self::with_graphics`] or
@@ -183,9 +177,9 @@ pub struct MachineBus<'a> {
     /// attached at least one unit via [`Self::with_mirage`]. Absent by
     /// default -- with no call to `with_mirage`, neither its AUTOCONFIG
     /// board nor this field's routing branch exist, so a machine with no
-    /// MIRAGE attached is unaffected (Gayle's IDE port is unrelated and
-    /// keeps working the same as ever -- ledger: MIRAGE is Gayle's
-    /// successor, not its replacement, until it can boot unaided).
+    /// MIRAGE attached is unaffected. Kept as MIRAGE's own reference
+    /// implementation, off the boot path, per `docs/device-ledger.md`
+    /// (`hostblk` is what actually retired Gayle).
     mirage: Option<Mirage<'a>>,
     /// AUTOCONFIG chain index MIRAGE's single board landed at, once
     /// [`Self::with_mirage`] has registered it. The whole seam between
@@ -289,9 +283,7 @@ impl<'a> MachineBus<'a> {
             // under both 1.3 and 3.2.3. `with_floppy` overrides this for
             // the `--floppy empty` diagnostic mode.
             floppy: FloppyDrive::new(FloppyPresence::None),
-            gayle: Gayle::new(),
             autoconfig: AutoConfig::new(),
-            hd: None,
             graphics: None,
             graphics_boards: [None; graffity::MAX_GRAFFITY_BOARDS],
             mirage: None,
@@ -304,19 +296,13 @@ impl<'a> MachineBus<'a> {
         }
     }
 
-    /// Attach a disk to Gayle's IDE port.
-    pub fn with_hd(mut self, hd: &'a mut dyn BlockDevice) -> Self {
-        self.hd = Some(hd);
-        self
-    }
-
     /// Attach a disk to MIRAGE unit `unit` (0-7, `mirage` module docs).
     /// Registers MIRAGE's single AUTOCONFIG board the first time this is
     /// called; further calls with other unit numbers just attach more
     /// units to the same card. Never called at all, the card and its
     /// address-space routing simply don't exist (this field's own doc
-    /// comment) -- Gayle stays available regardless, per the device
-    /// ledger's "MIRAGE retires Gayle only once it boots unaided" rule.
+    /// comment) -- MIRAGE is kept as its own reference implementation,
+    /// off the boot path, per `docs/device-ledger.md`.
     pub fn with_mirage(mut self, unit: u8, device: &'a mut dyn BlockDevice) -> Self {
         if self.mirage.is_none() {
             self.mirage_board = self.autoconfig.add_board(Mirage::board_spec());
@@ -333,8 +319,8 @@ impl<'a> MachineBus<'a> {
     /// AUTOCONFIG board the first time this is called; further calls with
     /// other unit numbers just attach more units to the same card. Never
     /// called at all, the card and its address-space routing simply don't
-    /// exist (this field's own doc comment) -- Gayle and MIRAGE stay
-    /// available regardless, all three coexist.
+    /// exist (this field's own doc comment) -- MIRAGE stays available
+    /// regardless, and the two coexist.
     pub fn with_hostblk(
         mut self,
         unit: u8,
@@ -391,8 +377,9 @@ impl<'a> MachineBus<'a> {
     /// the chain. Absent a call to this, the chain and every address this
     /// board would occupy are untouched -- the same "nothing changes
     /// unless attached" guarantee [`Self::with_mirage`]/
-    /// [`Self::with_hostblk`] already give, and the reason a `--fast-ram`
-    /// flag can default to off without perturbing any existing baseline.
+    /// [`Self::with_hostblk`] already give, and what lets a caller opt
+    /// out of fast RAM entirely (`machine-hosted`'s `--fast-ram-mb 0`)
+    /// without perturbing any baseline that predates it.
     /// `mem.len()` need not be one of the extended-table's discrete
     /// sizes; the board declares the next size up and anything past the
     /// real buffer simply reads open bus / discards writes, same as an
@@ -539,9 +526,8 @@ impl<'a> MachineBus<'a> {
                 card.signal_vertical_retrace();
             }
             // Zorro's INT2 pin is the same physical, level-triggered
-            // line Gayle and CIA-A already share on this machine (see
-            // the write-path comment on `MachineBus::write_byte`'s Gayle
-            // arm) -- Graffity is simply a third source pulling it.
+            // line CIA-A already drives on this machine -- Graffity is
+            // simply another source pulling it.
             if card.irq_pending() {
                 self.chipset.raise_int(chipset::intbit::PORTS);
             }
@@ -561,8 +547,8 @@ impl<'a> MachineBus<'a> {
         // `hostblk`'s engine advances the same way: one step per call,
         // not scaled to `cpu_clocks` -- see `hostblk`'s module docs on
         // why "at most one request per tick" is the right grain here,
-        // and why this may run entirely independently of MIRAGE and
-        // Gayle (all three coexist).
+        // and why this may run entirely independently of MIRAGE (both
+        // coexist).
         //
         // The card is lifted out of its `Option` for the call because it
         // needs a `&mut dyn GuestMemory` view of the whole bus -- it
@@ -632,28 +618,6 @@ impl<'a> MachineBus<'a> {
             self.chip_ram[(address - CHIP_RAM_BASE) as usize]
         } else if AutoConfig::responds_to(address) {
             self.autoconfig.read(address)
-        } else if Gayle::responds_to(address) {
-            // Reborrow the device rather than moving it out: Gayle
-            // needs it only for the duration of this access.
-            let device: Option<&mut dyn BlockDevice> = match &mut self.hd {
-                Some(d) => Some(&mut **d),
-                None => None,
-            };
-            let value = self.gayle.read(address, device);
-            // Reads can raise Gayle's interrupt too, not just writes:
-            // draining the last word of a block in a multi-sector READ
-            // SECTORS makes the drive fetch the next block and assert
-            // INTRQ ("data ready"), and that happens inside a data-
-            // register *read*. Without this mirror of `write_byte`'s
-            // propagation, every per-sector interrupt after the first
-            // was lost and scsi.device stalled mid-transfer until an
-            // unrelated CIA interrupt rescued it -- or timed out and
-            // retried, which is how a multi-sector file read turned into
-            // a DOS "object not found" during boot.
-            if self.gayle.irq_pending() {
-                self.chipset.raise_int(chipset::intbit::PORTS);
-            }
-            value
         } else if (CIA_BASE..CIA_END).contains(&address) {
             self.read_cia(address)
         } else if (CUSTOM_BASE..CUSTOM_END).contains(&address) {
@@ -682,13 +646,14 @@ impl<'a> MachineBus<'a> {
                 Some(m) => {
                     let value = m.read(offset);
                     // Mirror the write path's interrupt check on the
-                    // read path too: `gayle`'s own read arm carries the
-                    // hard-won reminder that a device whose interrupt
-                    // can change state on a read (there, a per-sector
-                    // refill; here, none currently does -- `mirage`'s
-                    // module docs explain why the fetch moved to
-                    // `tick()` instead) must not only ever check after a
-                    // write, on pain of a silently missed interrupt.
+                    // read path too: this machine's now-retired Gayle IDE
+                    // interface carried the hard-won reminder that a
+                    // device whose interrupt can change state on a read
+                    // (there, a per-sector refill; here, none currently
+                    // does -- `mirage`'s module docs explain why the
+                    // fetch moved to `tick()` instead) must not only ever
+                    // check after a write, on pain of a silently missed
+                    // interrupt.
                     if m.irq_pending() {
                         self.chipset.raise_int(chipset::intbit::PORTS);
                     }
@@ -705,13 +670,13 @@ impl<'a> MachineBus<'a> {
             match &self.hostblk {
                 Some(h) => h.read(offset),
                 // `hostblk::Hostblk::read` never asserts an interrupt as
-                // a side effect of reading -- unlike Gayle/MIRAGE, no
+                // a side effect of reading -- unlike MIRAGE, no
                 // register read here changes engine state (module docs:
                 // discovery registers are pure queries, and the
                 // completion queue only ever drains via
                 // `COMPLETION_ADVANCE`, a write) -- so there is no
                 // read-path interrupt check to mirror here. Still routed
-                // through the same `Option` shape as Gayle/MIRAGE for
+                // through the same `Option` shape as MIRAGE for
                 // consistency, not because this arm needs it.
                 None => OPEN_BUS_BYTE,
             }
@@ -897,16 +862,6 @@ impl<'a> MachineBus<'a> {
             self.chip_ram[(address - CHIP_RAM_BASE) as usize] = value;
         } else if AutoConfig::responds_to(address) {
             self.autoconfig.write(address, value);
-        } else if Gayle::responds_to(address) {
-            let device: Option<&mut dyn BlockDevice> = match &mut self.hd {
-                Some(d) => Some(&mut **d),
-                None => None,
-            };
-            self.gayle.write(address, value, device);
-            // The A1200 wires Gayle's interrupt to INT2 alongside CIA-A.
-            if self.gayle.irq_pending() {
-                self.chipset.raise_int(chipset::intbit::PORTS);
-            }
         } else if (CIA_BASE..CIA_END).contains(&address) {
             self.write_cia(address, value);
         } else if (CUSTOM_BASE..CUSTOM_END).contains(&address) {
@@ -943,7 +898,7 @@ impl<'a> MachineBus<'a> {
                 // A `DOORBELL` write can never itself raise INT2 --
                 // `hostblk`'s module docs' "Deferred completion" section
                 // is the whole point of this check being a no-op today.
-                // Kept for the same reason Gayle/MIRAGE check after
+                // Kept for the same reason MIRAGE checks after
                 // every write rather than only where it currently
                 // matters: a future register (e.g. an immediate-reject
                 // path) raising synchronously must not require
@@ -1097,13 +1052,19 @@ mod tests {
 
         // A representative sample of proposal §6.1's open-bus ranges:
         // slow RAM/unused, RTC, Gary/Ramsey, and the Gayle ID register the
-        // A1200 3.2 ROM specifically probes.
-        // $DE1000 is deliberately absent: that is the Gayle ID
-        // register, which now genuinely answers there (see `gayle`).
-        // §11.1 expected it to read as absent under the open-bus rule
-        // and allowed for a stub if it did not; this is that stub grown
-        // into a real interface.
-        for &addr in &[0x00C0_0000u32, 0x00D8_0000, 0x00DE_0000, 0x00DD_0000] {
+        // A1200 3.2 ROM specifically probes ($DE1000). §11.1 expected
+        // that register to read as absent under the open-bus rule, with
+        // a two-register stub as the documented fallback if it did not;
+        // Gayle briefly grew into a full interface there and has since
+        // been retired (`docs/device-ledger.md`), so $DE1000 is open bus
+        // again, the same as every other address in this list.
+        for &addr in &[
+            0x00C0_0000u32,
+            0x00D8_0000,
+            0x00DE_0000,
+            0x00DD_0000,
+            0x00DE_1000,
+        ] {
             assert_eq!(bus.read_byte(addr), 0xFF, "byte at {addr:#x}");
             assert_eq!(bus.read_word(addr), 0xFFFF, "word at {addr:#x}");
             assert_eq!(bus.read_long(addr), 0xFFFF_FFFF, "long at {addr:#x}");
@@ -1258,88 +1219,6 @@ mod tests {
         assert_eq!(bus.pending_irq_level(), 3, "VERTB is level 3");
     }
 
-    /// A tiny in-memory disk for exercising Gayle through the bus.
-    struct MemDisk {
-        sectors: std::vec::Vec<[u8; gayle::SECTOR_BYTES]>,
-    }
-
-    impl gayle::BlockDevice for MemDisk {
-        fn sector_count(&self) -> u64 {
-            self.sectors.len() as u64
-        }
-        fn read_sector(&mut self, lba: u64, buf: &mut [u8; gayle::SECTOR_BYTES]) -> bool {
-            self.sectors.get(lba as usize).map(|s| *buf = *s).is_some()
-        }
-        fn write_sector(&mut self, lba: u64, buf: &[u8; gayle::SECTOR_BYTES]) -> bool {
-            match self.sectors.get_mut(lba as usize) {
-                Some(s) => {
-                    *s = *buf;
-                    true
-                }
-                None => false,
-            }
-        }
-    }
-
-    /// The per-sector "next block ready" interrupt of a multi-sector READ
-    /// SECTORS is raised while the guest *reads* the data register (the
-    /// drive asserts INTRQ the moment the next block lands in its
-    /// buffer), so the bus must sample Gayle's interrupt line on the read
-    /// path as well as the write path. When only `write_byte` propagated
-    /// it, every per-sector interrupt after the first was lost and
-    /// scsi.device stalled mid-transfer -- surfacing as file reads
-    /// failing ("object not found") partway through the AmigaOS 3.2.2
-    /// Startup-Sequence.
-    #[test]
-    fn multi_sector_read_raises_ports_interrupt_between_sectors() {
-        let mut ram = boxed_chip_ram();
-        let rom = [0u8; ROM_WINDOW_SIZE];
-        let mut disk = MemDisk {
-            sectors: std::vec![[0u8; gayle::SECTOR_BYTES]; 4],
-        };
-        let mut bus = new_bus(&mut ram, &rom).with_hd(&mut disk);
-
-        // Enable Gayle's IDE interrupt, then issue READ SECTORS for two
-        // sectors from LBA 0.
-        bus.write_byte(gayle::reg::GAYLE_INTENA, gayle::GAYLE_IRQ_IDE);
-        bus.write_byte(gayle::reg::IDE_SELECT, 0xE0); // LBA mode, LBA 27..24 = 0
-        bus.write_byte(gayle::reg::IDE_HCYL, 0);
-        bus.write_byte(gayle::reg::IDE_LCYL, 0);
-        bus.write_byte(gayle::reg::IDE_SECTOR, 0);
-        bus.write_byte(gayle::reg::IDE_NSECTOR, 2);
-        bus.write_byte(gayle::reg::IDE_STATUS, gayle::cmd::READ_SECTORS);
-
-        let ports = 1u16 << chipset::intbit::PORTS;
-        assert_eq!(
-            bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
-            ports,
-            "first block ready raises PORTS via the command write"
-        );
-
-        // Acknowledge both latches the way the driver's INT2 server
-        // does: read IDE status (drops Gayle's INTRQ) and clear the
-        // chipset's PORTS request bit.
-        let _ = bus.read_byte(gayle::reg::IDE_STATUS);
-        bus.write_word(CUSTOM_BASE + chipset::reg::INTREQ as u32, ports);
-        assert_eq!(
-            bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
-            0
-        );
-
-        // Drain the whole first sector through data-register reads. The
-        // final read makes Gayle fetch sector two and assert INTRQ --
-        // entirely inside `read_byte`.
-        for _ in 0..gayle::SECTOR_BYTES / 2 {
-            let _ = bus.read_byte(gayle::reg::IDE_DATA);
-            let _ = bus.read_byte(gayle::reg::IDE_DATA + 1);
-        }
-        assert_eq!(
-            bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
-            ports,
-            "the second block's per-sector interrupt must reach the chipset"
-        );
-    }
-
     // ---- Graffity routing --------------------------------------------
 
     /// Configure both of Graffity's boards through the AUTOCONFIG
@@ -1403,7 +1282,7 @@ mod tests {
 
         // VRAM at $20xxxx, 2 MB long -- so it spans $200000-$3FFFFF.
         // Register window at $50xxxx, well clear of it and of chip RAM,
-        // the AUTOCONFIG window, Gayle, the CIAs and the custom chips.
+        // the AUTOCONFIG window, the CIAs and the custom chips.
         configure_graffity(&mut bus, 0x20, 0x50);
         assert_eq!(
             bus.autoconfig.placement(0).map(|p| p.base),
@@ -1461,9 +1340,8 @@ mod tests {
     /// End-to-end: once the guest arms CR11 (bit 5 clear, bit 4 set), a
     /// frame boundary crossed through `tick` raises the shared PORTS/INT2
     /// bit, acknowledging it (CRTC clear + `INTREQ`) drops it, and the
-    /// next frame re-latches -- level-triggered, not a one-shot, mirrors
-    /// `multi_sector_read_raises_ports_interrupt_between_sectors` for
-    /// Gayle on the very same line.
+    /// next frame re-latches -- level-triggered, not a one-shot, the same
+    /// shape every other device sharing this line uses.
     #[test]
     fn armed_graffity_raises_ports_once_per_frame_and_reacknowledges() {
         let mut ram = boxed_chip_ram();
@@ -1490,7 +1368,8 @@ mod tests {
         );
 
         // Acknowledge: clear CR11 bit 4, then the chipset's own PORTS
-        // latch, same two-step shape the Gayle test above uses.
+        // latch, the same two-step shape every device sharing this line
+        // uses.
         bus.write_byte(0x0050_03D4, 0x11);
         bus.write_byte(0x0050_03D5, 0x00);
         bus.write_word(CUSTOM_BASE + chipset::reg::INTREQ as u32, ports);
@@ -1571,27 +1450,26 @@ mod tests {
 
     // ---- MIRAGE wiring ---------------------------------------------------
 
-    /// A tiny in-memory disk for exercising MIRAGE through the bus,
-    /// distinct from `MemDisk` above only in name -- kept local to this
-    /// section so it's obvious at a glance which device a given test is
-    /// wiring up.
+    /// A tiny in-memory disk for exercising MIRAGE through the bus, kept
+    /// local to this section so it's obvious at a glance which device a
+    /// given test is wiring up.
     struct MirageDisk {
-        sectors: std::vec::Vec<[u8; gayle::SECTOR_BYTES]>,
+        sectors: std::vec::Vec<[u8; block::SECTOR_BYTES]>,
     }
 
     impl MirageDisk {
         fn new(count: usize) -> Self {
             Self {
-                sectors: std::vec![[0u8; gayle::SECTOR_BYTES]; count],
+                sectors: std::vec![[0u8; block::SECTOR_BYTES]; count],
             }
         }
     }
 
-    impl gayle::BlockDevice for MirageDisk {
+    impl block::BlockDevice for MirageDisk {
         fn sector_count(&self) -> u64 {
             self.sectors.len() as u64
         }
-        fn read_sector(&mut self, lba: u64, buf: &mut [u8; gayle::SECTOR_BYTES]) -> bool {
+        fn read_sector(&mut self, lba: u64, buf: &mut [u8; block::SECTOR_BYTES]) -> bool {
             match self.sectors.get(lba as usize) {
                 Some(s) => {
                     *buf = *s;
@@ -1600,7 +1478,7 @@ mod tests {
                 None => false,
             }
         }
-        fn write_sector(&mut self, lba: u64, buf: &[u8; gayle::SECTOR_BYTES]) -> bool {
+        fn write_sector(&mut self, lba: u64, buf: &[u8; block::SECTOR_BYTES]) -> bool {
             match self.sectors.get_mut(lba as usize) {
                 Some(s) => {
                     *s = *buf;
@@ -1612,18 +1490,16 @@ mod tests {
     }
 
     #[test]
-    fn no_mirage_leaves_the_chain_empty_and_gayle_unaffected() {
+    fn no_mirage_leaves_the_chain_empty() {
         let mut ram = boxed_chip_ram();
         let rom = [0u8; ROM_WINDOW_SIZE];
-        let mut bus = new_bus(&mut ram, &rom);
+        let bus = new_bus(&mut ram, &rom);
 
         // Brief item 8: a machine with no MIRAGE attached is completely
         // unaffected -- no chain entry, no routing branch.
         assert_eq!(bus.mirage_board, None);
         assert!(bus.mirage().is_none());
         assert_eq!(bus.autoconfig.board_at(0x0020_0000), None);
-        // Gayle's own window is untouched by MIRAGE's absence.
-        assert_eq!(bus.read_byte(gayle::reg::IDE_STATUS), OPEN_BUS_BYTE);
     }
 
     #[test]
@@ -1689,7 +1565,7 @@ mod tests {
             mirage::status::DRQ
         );
 
-        for i in 0u32..gayle::SECTOR_BYTES as u32 {
+        for i in 0u32..block::SECTOR_BYTES as u32 {
             bus.write_long(base + mirage::reg::DATA, (i << 24) | (i << 8));
         }
         assert_eq!(
@@ -1708,7 +1584,7 @@ mod tests {
 
         // The bytes really landed in the backing store, independent of
         // the register path above.
-        let mut check = [0u8; gayle::SECTOR_BYTES];
+        let mut check = [0u8; block::SECTOR_BYTES];
         disk.read_sector(5, &mut check);
         assert_eq!(check[0], 0);
         assert_eq!(check[4], 1);
@@ -1728,20 +1604,17 @@ mod tests {
     }
 
     #[test]
-    fn with_hostblk_registers_one_zorro_iii_board_alongside_mirage_and_gayle() {
+    fn with_hostblk_registers_one_zorro_iii_board_alongside_mirage() {
         let mut ram = boxed_chip_ram();
         let rom = [0u8; ROM_WINDOW_SIZE];
-        let mut hd = MirageDisk::new(8);
         let mut mirage_disk = MirageDisk::new(8);
         let mut hostblk_disk = MirageDisk::new(64);
         let mut bus = new_bus(&mut ram, &rom)
-            .with_hd(&mut hd)
             .with_mirage(0, &mut mirage_disk)
             .with_hostblk(0, &mut hostblk_disk, false);
 
-        // All three storage devices coexist: MIRAGE at chain index 0,
-        // hostblk at index 1, Gayle unaffected (it isn't on the
-        // AUTOCONFIG chain at all).
+        // Both storage devices coexist: MIRAGE at chain index 0, hostblk
+        // at index 1.
         assert!(bus.mirage().is_some());
         assert!(bus.hostblk().is_some());
         assert_eq!(bus.mirage_board, Some(0));
@@ -1810,7 +1683,7 @@ mod tests {
         // different fast-RAM address, so both directions are proven
         // without needing access to the device behind the card.
         let pattern: std::vec::Vec<u8> =
-            (0..gayle::SECTOR_BYTES).map(|i| (i as u8) ^ 0x5A).collect();
+            (0..block::SECTOR_BYTES).map(|i| (i as u8) ^ 0x5A).collect();
         let desc_addr = fast_base + 0x100;
         let src_addr = fast_base + 0x1000;
         let dst_addr = fast_base + 0x2000;
@@ -1821,7 +1694,7 @@ mod tests {
         let submit = |bus: &mut MachineBus, cmd: u8, buf: u32| {
             bus.write_byte(desc_addr, cmd);
             bus.write_byte(desc_addr + 1, 0);
-            bus.write_long(desc_addr + 4, gayle::SECTOR_BYTES as u32);
+            bus.write_long(desc_addr + 4, block::SECTOR_BYTES as u32);
             bus.write_long(desc_addr + 8, 0);
             bus.write_long(desc_addr + 12, 0);
             bus.write_long(desc_addr + 16, buf);
@@ -1867,13 +1740,13 @@ mod tests {
         // one sector, device offset 0, buffer at 0x2000.
         let desc_addr = 0x1000u32;
         let buf_addr = 0x2000u32;
-        let pattern: std::vec::Vec<u8> = (0..gayle::SECTOR_BYTES as u32).map(|i| i as u8).collect();
+        let pattern: std::vec::Vec<u8> = (0..block::SECTOR_BYTES as u32).map(|i| i as u8).collect();
         for (i, &b) in pattern.iter().enumerate() {
             bus.write_byte(buf_addr + i as u32, b);
         }
         bus.write_byte(desc_addr, hostblk::cmd::WRITE);
         bus.write_byte(desc_addr + 1, 0); // unit
-        bus.write_long(desc_addr + 4, gayle::SECTOR_BYTES as u32); // length
+        bus.write_long(desc_addr + 4, block::SECTOR_BYTES as u32); // length
         bus.write_long(desc_addr + 8, 0); // offset hi
         bus.write_long(desc_addr + 12, 0); // offset lo
         bus.write_long(desc_addr + 16, buf_addr); // buffer
@@ -1909,7 +1782,7 @@ mod tests {
 
         // The bytes really landed in the backing store, independent of
         // the register path above.
-        let mut check = [0u8; gayle::SECTOR_BYTES];
+        let mut check = [0u8; block::SECTOR_BYTES];
         disk.read_sector(0, &mut check);
         assert_eq!(&check[..], &pattern[..]);
     }

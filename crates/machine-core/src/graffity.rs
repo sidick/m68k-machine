@@ -81,7 +81,7 @@
 //! [`Graffity::irq_pending`] forwards the chip's state; `lib.rs` drives
 //! [`Graffity::signal_vertical_retrace`] once per frame from the
 //! chipset's own frame clock and ORs the result onto the shared INT2
-//! line, the same shape it already uses for Gayle. Nor does it model the
+//! line, the same shape it already uses for MIRAGE and `hostblk`. Nor does it model the
 //! monitor-switch strobe's
 //! actual effect (switching the physical monitor between the chipset's
 //! own display and the RTG one) -- writes to it are accepted and
@@ -360,7 +360,8 @@ impl<'a> Graffity<'a> {
 
     /// Whether the chip is currently asserting its vertical-retrace
     /// interrupt, for `lib.rs` to OR onto the shared INT2 line the same
-    /// way it already does for [`crate::gayle::Gayle::irq_pending`].
+    /// way it already does for other devices sharing that line (MIRAGE,
+    /// `hostblk`).
     pub fn irq_pending(&self) -> bool {
         self.chip.irq_pending()
     }

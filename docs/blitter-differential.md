@@ -219,7 +219,7 @@ corpus, so never exercised) and `c_eq_d` false (also never observed).
 ```sh
 cargo build -p machine-hosted --release
 ./target/release/machine-hosted --rom nondistribution/A1200.47.115.rom \
-  --hd nondistribution/m68k-machine.hdf --screenshot /tmp/planar.png \
+  --hostblk nondistribution/m68k-machine.hdf --screenshot /tmp/planar.png \
   --screenshot-frame 4000 --max-frames 4500 --max-instructions 300000000 \
   --blitter-trace /tmp/blitter_trace.txt
 ```

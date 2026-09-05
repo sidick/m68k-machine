@@ -115,7 +115,7 @@
 //!    exists — see the module-level "What's not here" section below.
 //! 5. **A FIFO depth.** §4.1 says `DATA` is "FIFO-backed" but not how
 //!    deep. This module uses exactly one sector (512 bytes, matching
-//!    `gayle::SECTOR_BYTES`): it's the unit `BlockDevice` already deals
+//!    `block::SECTOR_BYTES`): it's the unit `BlockDevice` already deals
 //!    in, needs no partial-sector bookkeeping, and keeps the
 //!    deferred-completion state machine to one `BUSY`-then-`DRQ` step
 //!    per sector. A real controller streaming from SD might use a
@@ -172,7 +172,7 @@
 //!   the sharpest place where this increment falls short of proposal
 //!   §10.3's "`CAP_DMA` is set" for this machine — flagged rather than
 //!   guessed at.
-//! - **`FLUSH` actually flushing anything.** [`crate::gayle::BlockDevice`]
+//! - **`FLUSH` actually flushing anything.** [`crate::block::BlockDevice`]
 //!   (reused here per the brief, so `machine-hosted`'s `FileBlockDevice`
 //!   works unchanged) has no flush method — every write it accepts is
 //!   already synchronous host file I/O. `FLUSH` here is a real
@@ -209,7 +209,7 @@
 //! commands that will eventually drive it for real.
 
 use crate::autoconfig::{BoardSpec, ERT_ZORROII};
-use crate::gayle::{BlockDevice, SECTOR_BYTES};
+use crate::block::{BlockDevice, SECTOR_BYTES};
 
 /// **Placeholder, but a *reserved* one.** NDK 3.2
 /// `libraries/configregs.h` sets aside manufacturer 2011 (`$7DB`) for

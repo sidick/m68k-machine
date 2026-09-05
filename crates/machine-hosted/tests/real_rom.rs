@@ -288,17 +288,29 @@ fn kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger() {
 /// 4-plane hires screen. So this asserts drawn content rather than a
 /// specific picture -- pixel-exact matching would break on any legitimate
 /// palette or layout change.
-/// **The capture has to be late.** Since the machine gained a Gayle IDE
-/// interface, Kickstart finds an IDE port, probes it, and waits out the
-/// standard timeout before concluding there is no drive — around 30
-/// seconds, or ~1500 frames at 50 Hz, exactly as a real A1200 with no
-/// disk attached does. Before Gayle the ID register read as open bus,
-/// Kickstart concluded there was no interface at all, and the screen
-/// appeared immediately; capturing at frame 200 was fine then and is far
-/// too early now. Frame 2500 is comfortably past the timeout and clear
-/// of `--max-frames`'s own boundary (see the AROS test for why that
-/// matters: a capture taken at the run's final frame can observe a
-/// register mid-write).
+/// **Gayle IDE's retirement (`docs/device-ledger.md`) restored the fast
+/// path this comment used to describe as history.** While Gayle was
+/// attached, Kickstart found an IDE port, probed it, and waited out the
+/// standard ~30 second (~1500 frame) timeout before concluding there was
+/// no drive, so this test's capture frame had to be pushed well past
+/// that. With Gayle gone the ID register is open bus again, Kickstart
+/// concludes there is no such interface at all, and the screen reappears
+/// at essentially the same frame it did before Gayle ever existed
+/// (confirmed directly: distinct content is on screen by frame 200).
+/// Frame 2500 is kept anyway rather than reverted to 200, for two
+/// reasons found while re-verifying this test after Gayle's removal:
+/// first, the picture briefly cycles between two close variants (9 vs 6
+/// distinct colours) in the first few hundred frames -- plausibly a
+/// blinking element in the boot picture -- and only settles for good
+/// once idle; second, without an IDE probe's busy-wait spending cycles,
+/// Kickstart's post-boot idle loop turns out to cost noticeably more
+/// *instructions* per frame than it used to (confirmed: this fixture
+/// needed roughly 34,000 instructions/frame before Gayle's removal and
+/// roughly 91,000/frame after), so `--max-instructions` below is raised
+/// well past the old value to still comfortably clear frame 2500. Frame
+/// 2500 is also still clear of `--max-frames`'s own boundary (see the
+/// AROS test for why that matters: a capture taken at the run's final
+/// frame can observe a register mid-write).
 #[test]
 #[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
 fn kickstart_3_2_2_a1200_screenshot_shows_the_boot_screen() {
@@ -313,7 +325,7 @@ fn kickstart_3_2_2_a1200_screenshot_shows_the_boot_screen() {
         "--max-frames",
         "2600",
         "--max-instructions",
-        "200000000",
+        "400000000",
         "--screenshot",
         path.to_str().unwrap(),
         "--screenshot-frame",
@@ -441,14 +453,22 @@ fn aros_68k_screenshot_shows_boot_screen_content_without_boot_media() {
 
 /// Phase 3 regression test (this task's brief, `docs/storage.md`): attach
 /// the file-backed `BlockDevice` (`crate::hd_image::FileBlockDevice`,
-/// wired via `--hd`) to Gayle's IDE port and drive a real Kickstart all
-/// the way through disk boot.
+/// wired via `--hostblk`) to `hostblk` unit 0 and drive a real Kickstart
+/// all the way through disk boot.
+///
+/// **This test originally drove the same boot through Gayle's IDE port
+/// (`--hd`).** Gayle IDE is now retired (`docs/device-ledger.md`):
+/// `hostblk` boots this identical image unaided, byte-identical to the
+/// Gayle capture, and was soaked (`docs/hostblk-soak.md`) before the
+/// switch. Only the attach flag changed; the assertions below (including
+/// the exact non-background pixel count) are unchanged from the Gayle
+/// version of this test.
 ///
 /// **What actually happens, confirmed by inspecting the captured PNG
 /// (not just pixel-difference counts):** the RDB is read, `DH0:` mounts,
 /// FFS loads it, `Startup-Sequence` runs, and Intuition opens a real
 /// Workbench screen with a titled window and the `RAM Disk` and `SYS`
-/// icons drawn. The whole storage path -- ID gate, RDB, partition,
+/// icons drawn. The whole storage path -- discovery, RDB, partition,
 /// filesystem, DOS, Workbench -- has to work to get here.
 ///
 /// This test previously asserted that boot ended at Intuition's "Please
@@ -462,8 +482,8 @@ fn aros_68k_screenshot_shows_boot_screen_content_without_boot_media() {
 /// furthest point boot happened to reach.
 ///
 /// Frame timing: unlike the no-disk boot-screen test above (stable by
-/// frame 2500), a real disk boot keeps Kickstart busy well past the IDE
-/// probe window into actual filesystem and Workbench work. Sweeping
+/// frame 2500), a real disk boot keeps Kickstart busy well past the
+/// discovery window into actual filesystem and Workbench work. Sweeping
 /// `--screenshot-every` while preparing this test found the desktop
 /// already fully drawn and pixel-stable from frame 4000 onward (no change
 /// at all through 5500); frame 4000 is used here with `--max-frames 4500`
@@ -484,7 +504,7 @@ fn kickstart_3_2_2_a1200_boots_from_hd_to_the_workbench_desktop() {
     let (status, stdout) = run(&[
         "--rom",
         &rom,
-        "--hd",
+        "--hostblk",
         &hd,
         "--max-frames",
         "4500",
@@ -500,7 +520,7 @@ fn kickstart_3_2_2_a1200_boots_from_hd_to_the_workbench_desktop() {
     eprintln!("{stdout}");
 
     assert!(
-        stdout.contains("hd:") && stdout.contains("read-only"),
+        stdout.contains("hostblk:") && stdout.contains("read-only"),
         "expected the runner to report attaching the image read-only by default"
     );
     assert!(
@@ -570,6 +590,10 @@ fn kickstart_3_2_2_a1200_boots_from_hd_to_the_workbench_desktop() {
 /// desktop than the planar boot screen above, and the default 200M
 /// instruction cap stops the run around frame 1427 before the desktop is
 /// even drawn -- hence the large `--max-instructions` here.
+///
+/// **Originally driven through `--hd` (Gayle IDE); switched to
+/// `--hostblk` once Gayle retired (`docs/device-ledger.md`)** --
+/// confirmed byte-identical to the Gayle capture before the switch.
 #[test]
 #[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
 fn kickstart_3_2_2_a1200_rtg_workbench_desktop_is_grey_not_blank_or_corrupt() {
@@ -585,7 +609,7 @@ fn kickstart_3_2_2_a1200_rtg_workbench_desktop_is_grey_not_blank_or_corrupt() {
     let (status, stdout) = run(&[
         "--rom",
         &rom,
-        "--hd",
+        "--hostblk",
         &hd,
         "--graphics",
         "--max-frames",

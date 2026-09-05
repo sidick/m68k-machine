@@ -120,7 +120,6 @@ disjoint borrows of `self`'s fields, not a conflict, but only once
 | Floppy "no drive attached" | permanent | — | never; models absence, not a drive |
 | Planar renderer | capped | RTG | never fully; stops growing (below) |
 | Blitter | capped | RTG | never fully; stops growing (below) |
-| Gayle IDE | **bring-up, criterion met** | `hostblk` (ADR 0003) | *met 2026-09-05* — retire after a devsoak run (§13) |
 | `hostblk` doorbell card | permanent | — | never; the machine's own storage |
 | MIRAGE block plane | permanent, off the boot path | — | never; kept as MIRAGE's reference implementation |
 | Cirrus CL-GD542x | **bring-up** | generic virtual board (ADR 0002) | demoted to compatibility tier, not removed |
@@ -163,15 +162,23 @@ Zorro III extended-size table), and this file's "rule for addresses"
 above for the `hostblk`-facing seam ([`GuestMemory`], implemented on
 `MachineBus` in `lib.rs`) this board's arrival made necessary.
 
-Off by default (`machine-hosted --fast-ram-mb N`): registering an extra
+On by default at 256 MB (`machine-hosted --fast-ram-mb N`, `N=0` to
+disable), inside proposal §13's intended 256-384 MB guest footprint.
+This defaulted off originally, on the theory that registering an extra
 AUTOCONFIG board changes the chain, and where fast RAM sits in it
-relative to a Zorro III Graffity card (`--graphics-bus 3`) can move that
-card's assigned base address and, with it, the RTG screenshot baseline.
-`machine-hosted` registers fast RAM *after* `--graphics` specifically so
-Graffity is always offered to the chain first regardless of whether
-`--fast-ram-mb` is set — confirmed empirically that both the planar and
-both RTG (Zorro II and Zorro III) baselines stay byte-identical with the
-flag on, at 16 MB through 1 GB.
+relative to a Zorro III Graffity card (`--graphics-bus 3`) could move
+that card's assigned base address and, with it, the RTG screenshot
+baseline. `machine-hosted` registers fast RAM *after* `--graphics`
+specifically so Graffity is always offered to the chain first regardless
+of whether `--fast-ram-mb` is set — confirmed empirically that both the
+planar and both RTG (Zorro II and Zorro III) baselines stay
+byte-identical with the flag on, at 16 MB through 1 GB. That confirmation
+is what let the default flip: the risk the off-by-default posture was
+guarding against didn't materialise, and `docs/hostblk-soak.md` records
+a case where the *absence* of fast RAM changed the outcome instead
+(devsoak's concurrent transfer buffers don't fit in 2 MB of chip RAM
+alongside a booted Workbench) — so leaving it off by default was no
+longer the conservative choice for this machine's own storage path.
 
 **Floppy "no drive attached"** models the absence of hardware rather
 than the presence of it. It exists because Kickstart hangs on a black
@@ -232,32 +239,6 @@ would never have surfaced.
 
 ### Bring-up
 
-**Gayle IDE** — `gayle.rs`. Introduced to get a real disk under the
-machine so Workbench could boot at all, using the ROM's own
-`scsi.device` and no 68k code of ours. It works and currently boots
-AmigaOS 3.2.2 from an HDF.
-
-*Successor:* `hostblk` (ADR 0003) — a doorbell-plus-descriptor block
-card with a host-side data path, our own m68k driver, and an
-RDB-mounting boot ROM. This was MIRAGE until ADR 0003 moved the boot
-path off PIO.
-*Retires when:* `hostblk` boots the same image with no Gayle attached.
-**This is now true** (2026-09-05): `--hostblk` alone reaches a full
-Workbench desktop, byte-identical to the Gayle boot, with `SYS`, the
-system assigns and RAM Disk all served through `hostblk.device`.
-
-Gayle is nonetheless **not yet removed**, per this file's own retirement
-procedure: step 2 asks for both paths to run side by side long enough to
-trust the new one. `hostblk`'s driver has booted, but has not been
-soaked — `docs/hostblk-protocol.md` §13's devsoak run is the evidence
-that step wants, and its concurrent load is precisely what would expose
-the submission-ring handling that a single boot never stresses. Retire
-Gayle after that, not before.
-*Cost of keeping:* ~1,000 lines, plus an IDE task-file model and its
-interrupt semantics that must stay correct forever. The per-sector
-INTRQ-on-read bug that cost a debugging cycle is the kind of thing this
-device will keep producing.
-
 **Cirrus CL-GD542x and the Graffity boards** — `cirrus.rs`,
 `graffity.rs`. Emulating specific 1990s silicon purely so that P96's
 shipped `Graffity.card` drives it. This bought a real Workbench desktop
@@ -306,7 +287,71 @@ driver in board ROM — machinery this project has never built. MIRAGE is
 already specified, it replaces the most emulated part of the storage
 path, and once that machinery exists the input board is largely a reuse
 of it. Doing input first would build the same machinery for a smaller
-payoff and leave Gayle in place.
+payoff and leave the bring-up storage device in place longer than
+necessary. (Storage's actual path ended up being `hostblk`, ADR 0003's
+successor to this MIRAGE plan; see the Retired section below for how
+that played out.)
+
+## Retired
+
+**Gayle IDE** — was `gayle.rs`, removed 2026-09-05. Introduced as a
+bring-up device to get a real disk under the machine so Workbench could
+boot at all, using the A1200 ROM's own `scsi.device` and no 68k code of
+ours (proposal §9, §11.1). It worked: it booted AmigaOS 3.2.2 from an
+HDF, all the way to a real Workbench desktop, with only a two-register
+ID gate and an IDE task-file model standing in for a real controller.
+
+*Successor:* `hostblk` (ADR 0003) — a doorbell-plus-descriptor Zorro III
+block card with a host-side data path, our own m68k driver, and an
+RDB-mounting boot ROM. This was MIRAGE until ADR 0003 moved the boot
+path off PIO.
+
+*Retirement criterion and how it was met:* per this file's own
+retirement procedure, `hostblk` had to boot the same image with no
+Gayle attached, verified end to end rather than by unit tests alone,
+and the two paths had to run side by side long enough to trust the new
+one. Both happened: `--hostblk` alone reached a full Workbench desktop
+byte-identical to the Gayle boot, with `SYS`, the system assigns and RAM
+Disk all served through `hostblk.device`; and `hostblk`'s driver was
+soaked against devsoak (`docs/hostblk-soak.md`) — `RESULT PASS`, 0
+errors, clean audits over 16,384 sectors, all three dialects, `quirks: 0
+applied` — which is exactly the concurrent load a single boot never
+stresses. Every rendering baseline (planar and RTG, both Zorro bus
+generations) was re-verified through `hostblk` before Gayle was removed.
+
+*What removing it actually touched:* `gayle.rs` itself; `MachineBus`'s
+`gayle`/`hd` fields, `with_hd`, and both bus-routing arms (`lib.rs`);
+the `--hd`/`--hd-writable` CLI flags (`machine-hosted`); and every test
+that exercised Gayle specifically. `BlockDevice` and `SECTOR_BYTES`
+outlived it — they moved to a new `machine-core::block` module first,
+as their own step, since `hostblk` and `mirage` both already depended on
+them. The two real-ROM tests that used `--hd` only to get *a* disk
+attached (not to exercise Gayle's register interface itself) switched to
+`--hostblk` rather than being deleted, per this procedure's own
+distinction between a device's tests and tests that merely used it as a
+means to an end.
+
+*What retiring it changed elsewhere, found while re-verifying:* with the
+Gayle ID register gone, Kickstart no longer finds *any* IDE-like
+interface on a machine with no `--hostblk` device attached, so the
+~30 second/~1500-frame timeout Gayle's presence used to force is gone
+too — the no-disk boot screen reappears at essentially the frame it did
+before Gayle ever existed (confirmed: distinct content on screen by
+frame 200, matching the pre-Gayle baseline this file's own history
+recorded). The real-ROM test for that screen keeps its frame 2500
+capture point regardless (the picture briefly cycles between two close
+variants in the first few hundred frames before settling), but needed a
+higher `--max-instructions` budget: this machine's post-boot idle loop
+costs roughly 91,000 instructions/frame with Gayle gone, versus roughly
+34,000/frame with it present — apparently the IDE probe's own busy-wait
+was, incidentally, spending cycles the idle loop no longer spends
+elsewhere. Nothing about this suggested a design that still needs Gayle;
+it was a test-budget knob, not a behavioural gap.
+
+*Cost while it was kept:* ~1,000 lines, plus an IDE task-file model and
+its interrupt semantics that had to stay correct — the per-sector
+INTRQ-on-read bug documented in this file's history was exactly the kind
+of cost a device like this keeps producing the longer it stays.
 
 ## How a device gets retired
 

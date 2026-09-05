@@ -107,47 +107,29 @@ pub struct Args {
     #[arg(long)]
     pub screenshot_every: Option<u64>,
 
-    /// Path to a disk image to attach to Gayle's IDE port (proposal §11.1,
-    /// `machine_core::gayle`). Raw sequential sectors -- an `.hdf` file (a
-    /// bare RDB-partitioned image with no ADF/DMS-style wrapper) is
-    /// exactly this shape. Omit for no drive at all, this machine's
-    /// previous behaviour and still the honest story for the eventual
-    /// MIRAGE storage path (proposal §10.3) -- Gayle IDE is bring-up only
-    /// (`gayle.rs`'s module doc comment).
-    #[arg(long)]
-    pub hd: Option<PathBuf>,
-
-    /// Open `--hd` for writing rather than the default read-only. Off by
-    /// default on purpose: this is a brand new, so-far-unproven IDE
-    /// implementation, and a disk image worth attaching is typically a
-    /// licensed-media conversion (`docs/storage.md`) that took real effort
-    /// to build and cannot simply be re-downloaded if a bug corrupts it. A
-    /// full boot to Workbench never needs to write a sector; pass this
-    /// flag once write access is actually wanted (e.g. testing Kickstart's
-    /// write path, or letting Workbench persist state back to the image).
-    #[arg(long, default_value_t = false)]
-    pub hd_writable: bool,
-
     /// Path to a disk image to attach to `hostblk` unit 0 (ADR 0003,
     /// `machine_core::hostblk`) -- this machine's own doorbell block
-    /// card, and `--hd`'s eventual successor per `docs/device-ledger.md`.
-    /// Same raw-sector `.hdf` shape as `--hd`; `machine-hosted`'s
-    /// `FileBlockDevice` works unchanged behind either card (that's the
-    /// point of `hostblk` reusing `machine_core::gayle::BlockDevice`).
-    /// Omit for no `hostblk` card at all. This board now carries a
-    /// DiagArea boot ROM (`m68k/hostblk-rom/`) that proves Kickstart runs
-    /// code from it and that the code can reach the board's own
-    /// registers -- see `--inspect`'s `hostblk state:` section -- but no
-    /// wire-protocol driver or RDB mounter exist yet, so this flag alone
-    /// still cannot boot a machine unaided (`docs/hostblk-protocol.md`
-    /// section 12).
+    /// card, and the boot path Gayle IDE retired into
+    /// (`docs/device-ledger.md`). Raw sequential sectors -- an `.hdf`
+    /// file (a bare RDB-partitioned image with no ADF/DMS-style wrapper)
+    /// is exactly this shape; `machine-hosted`'s `FileBlockDevice` works
+    /// unchanged against it (that's the point of `hostblk` reusing
+    /// `machine_core::block::BlockDevice`). Omit for no `hostblk` card at
+    /// all. This board carries a DiagArea boot ROM (`m68k/hostblk-rom/`)
+    /// with its own wire-protocol driver and RDB mounter, soaked against
+    /// devsoak (`docs/hostblk-soak.md`) -- see `--inspect`'s `hostblk
+    /// state:` section for a host-side view of it.
     #[arg(long)]
     pub hostblk: Option<PathBuf>,
 
     /// Open `--hostblk` for writing rather than the default read-only.
-    /// Same reasoning as `--hd-writable`: this is a brand new, unproven
-    /// implementation and a licensed-media image is not cheaply
-    /// replaced if a bug corrupts it.
+    /// Off by default on purpose: a disk image worth attaching is
+    /// typically a licensed-media conversion (`docs/storage.md`) that
+    /// took real effort to build and cannot simply be re-downloaded if a
+    /// bug corrupts it. A full boot to Workbench never needs to write a
+    /// sector; pass this flag once write access is actually wanted (e.g.
+    /// testing Kickstart's write path, or letting Workbench persist
+    /// state back to the image).
     #[arg(long, default_value_t = false)]
     pub hostblk_writable: bool,
 
@@ -206,17 +188,32 @@ pub struct Args {
     /// Attach fast RAM (`machine_core::fastram`) over heap-allocated
     /// storage, sized in megabytes, and register its single Zorro III
     /// AUTOCONFIG board (`ERTF_MEMLIST` set, so `expansion.library` links
-    /// it into the system free-memory list with no driver of ours). Off
-    /// by default: an extra AUTOCONFIG board changes the chain, which can
-    /// move the base address a `--graphics-bus 3` Graffity card is
-    /// assigned (the two share the Zorro III address pool; a Zorro II
-    /// `--graphics` card, the default, is unaffected -- it draws from a
-    /// separate pool). Verify with `--inspect`'s `MemList` walk, which is
-    /// the only real evidence the guest adopted the memory rather than
-    /// this bus merely answering for it (`docs/device-ledger.md`'s fast
-    /// RAM row).
-    #[arg(long)]
-    pub fast_ram_mb: Option<u32>,
+    /// it into the system free-memory list with no driver of ours).
+    ///
+    /// Defaults to 256 MB, inside proposal §13's intended 256-384 MB
+    /// guest footprint: this was previously off by default on the theory
+    /// that an extra AUTOCONFIG board could move the base address a
+    /// `--graphics-bus 3` Graffity card is assigned (the two share the
+    /// Zorro III address pool). That risk was tested rather than assumed
+    /// -- with both flags set, Zorro III Graffity still lands at the
+    /// same base address and its screenshot baseline stays
+    /// byte-identical, because `machine-hosted` always registers
+    /// Graffity first (see the registration order comment at this
+    /// flag's call site) -- so it no longer justifies defaulting off.
+    /// `docs/hostblk-soak.md` records the other half of the reasoning:
+    /// `hostblk`'s devsoak run genuinely needs fast RAM to have room for
+    /// its concurrent transfer buffers, so leaving this off by default
+    /// was actively the wrong default for the machine's own storage
+    /// path, not merely a conservative one.
+    ///
+    /// Pass `0` to disable fast RAM entirely -- e.g. to reproduce a
+    /// baseline that predates it, or to isolate a test that specifically
+    /// wants to prove behaviour without it. Verify adoption with
+    /// `--inspect`'s `MemList` walk, which is the only real evidence the
+    /// guest adopted the memory rather than this bus merely answering
+    /// for it (`docs/device-ledger.md`'s fast RAM row).
+    #[arg(long, default_value_t = 256)]
+    pub fast_ram_mb: u32,
 }
 
 /// CLI surface for [`machine_core::cia::FloppyPresence`] -- kept as a

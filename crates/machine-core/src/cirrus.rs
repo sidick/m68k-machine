@@ -1124,7 +1124,8 @@ impl<'a> Cirrus542x<'a> {
         // vertical-retrace interrupt by writing it clear (`crtc11`
         // module docs). The shared INT2 line re-latches on the next
         // retrace if still armed -- level-triggered and re-asserted,
-        // not a one-shot, same as Gayle's INTRQ on this line (`lib.rs`).
+        // not a one-shot, same as every other device sharing this line
+        // (`lib.rs`).
         if index == idx::CRTC_END_VERTICAL_RETRACE && value & crtc11::CLEAR_VERTICAL_INTERRUPT == 0
         {
             self.vblank_pending = false;
@@ -1184,8 +1185,8 @@ impl<'a> Cirrus542x<'a> {
 
     /// Whether this chip is currently asserting its vertical-retrace
     /// interrupt line -- what the board layer forwards to `lib.rs` for
-    /// delivery onto the shared INT2 line, the same shape as
-    /// [`crate::gayle::Gayle::irq_pending`].
+    /// delivery onto the shared INT2 line, the same shape every other
+    /// device sharing that line uses.
     pub fn irq_pending(&self) -> bool {
         self.vblank_pending && self.vertical_interrupt_enabled()
     }
