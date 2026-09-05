@@ -6,6 +6,19 @@ license.workspace = true
 description = "x86-64 UEFI board layer for the m68k Machine project, targeting QEMU's q35 machine"
 publish = false
 
+# `test`/`bench` are off because this is a `no_std` UEFI binary whose
+# panic handler comes from the `uefi` crate's `panic_handler` feature. A
+# test harness links `std`, whose `panic_impl` then collides with it
+# (E0152), which is why `cargo test --workspace` used to fail on this
+# crate. There is nothing here a host-target test harness could run in
+# any case: the tests that matter for this board are the QEMU runs in
+# scripts/ and CI.
+[[bin]]
+name = "board-qemu-q35"
+path = "src/main.rs"
+test = false
+bench = false
+
 [dependencies]
 machine-core = { path = "../machine-core" }
 # `alloc` + `global_allocator`: the `uefi` crate's own boot-services-backed

@@ -22,9 +22,17 @@ publish = false
 #
 # Run under QEMU: scripts/run-qemu-virt.sh
 
+# `test`/`bench` are off because this is a `no_std` bare-metal binary with
+# its own `#[panic_handler]`. A test harness links `std`, whose
+# `panic_impl` then collides with ours (E0152), which is why
+# `cargo test --workspace` used to fail on this crate. There is nothing
+# here a host-target test harness could run in any case: the tests that
+# matter for this board are the QEMU runs in scripts/ and CI.
 [[bin]]
 name = "board-qemu-virt"
 path = "src/main.rs"
+test = false
+bench = false
 
 [dependencies]
 machine-core = { path = "../machine-core" }
