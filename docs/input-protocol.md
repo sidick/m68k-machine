@@ -485,3 +485,48 @@ reached `rts`) exists purely to keep that field non-zero.
   approximately the requested position on a live Workbench desktop, not
   stuck at the top-left corner or absent -- something that could only
   happen by the event actually reaching Intuition's input chain.
+
+## 14. `da_BootPoint` is not about being bootable
+
+Worth stating plainly, because this project recorded it as two unrelated
+traps before noticing it is one rule, and the field's name actively
+misleads.
+
+Two DiagArea failures were hit while building the storage and input
+ROMs, both silent:
+
+- `hostblk`: `da_Config = DAC_WORDWIDE|DAC_NEVER` — the `ConfigDev` was
+  built correctly and the ROM read back correctly *live*, but
+  `expansion.library` never copied the DiagArea into RAM.
+- `input`: `da_BootPoint = 0`, which is honest since this card is never a
+  boot node — same outcome, no copy, no `DiagEntry`, no romtag.
+
+They look like separate gotchas. They are the same one. `libraries/
+configregs.h` gives the `da_Config` timing bits as *when to call
+`da_BootPoint`* — `DAC_CONFIGTIME` is commented "call da_BootPoint when
+first configing the device" — and `da_BootPoint` itself as "where to
+start". So:
+
+> The DiagArea is copied into RAM only when there is code to run *and* a
+> time at which to run it. `DAC_NEVER` removes the time; a zero
+> `da_BootPoint` removes the code. Either way there is nothing to copy
+> for, so nothing is copied.
+
+The copy exists to make the ROM's code runnable — relocated and
+"de-nibbleized" — not as a service to boards that merely want to be
+present. **A board that wants its ROM to run at all needs both**, whether
+or not it has anything to do with booting. Our input card is never a boot
+node and never will be, and it still needs a non-zero `da_BootPoint`
+pointing at a stub that is never reached, purely to satisfy this gate.
+
+One loose end, flagged rather than asserted. The header's wording implies
+`DAC_CONFIGTIME` gets `da_BootPoint` called at configuration time
+unconditionally. What was actually observed in Kickstart 3.2.2's strap
+(disassembled at `$FC746E` while chasing why `hostblk` never booted) is
+narrower: the call is made for a **non-floppy `BootNode`** whose
+`ConfigDev` carries `ERTF_DIAGVALID`, a kept diag copy and
+`DAC_CONFIGTIME`, as that node's entire boot attempt. On the input card,
+which offers no boot node, the stub is believed never to be reached —
+believed, not verified, since nothing depends on it. If a future ROM
+needs code to run at configuration time rather than from `rt_Init`, test
+that assumption before relying on it.

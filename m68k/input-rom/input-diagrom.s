@@ -414,6 +414,10 @@ STACK_SIZE          equ     4096    ; generous headroom for a small
 * (`diag_rom_header_matches_the_documented_diagarea_layout`) recorded the
 * empirical fact behind this the hard way: RKRM's "Events At DIAG Time"
 * documents that a *zero* da_BootPoint means expansion.library never
+* (see docs/input-protocol.md section 14: this and DAC_NEVER are the same
+* rule -- the DiagArea is copied only when there is code to run and a time
+* to run it, so a board wanting its ROM to run at all needs both, whether
+* or not it has anything to do with booting)
 * copies the DiagArea into RAM **at all** -- it is not merely "no boot
 * routine", it silently cancels DiagEntry too, since DiagEntry only ever
 * runs against the copy. So `BootStub` below exists purely to give
