@@ -79,6 +79,7 @@ same change that introduces it.
 | Planar renderer | capped | RTG | never fully; stops growing (below) |
 | Blitter | capped | RTG | never fully; stops growing (below) |
 | Gayle IDE | **bring-up** | MIRAGE (§10.3) | MIRAGE boots the same image unaided |
+| MIRAGE block plane | permanent | — | never; this is what Gayle retires into |
 | Cirrus CL-GD542x | **bring-up** | generic virtual board (ADR 0002) | demoted to compatibility tier, not removed |
 | Graffity Z2/Z3 | **bring-up** | as Cirrus | as Cirrus |
 | Keyboard / mouse | **not built** | native input board | n/a — native-first from the start |
@@ -98,6 +99,27 @@ more load-bearing as the machine becomes less emulated, not less.
 than the presence of it. It exists because Kickstart hangs on a black
 screen without an answer, and matches a real A1200 with no drive fitted.
 There is nothing to retire.
+
+**MIRAGE block plane** — `mirage.rs`. Not a bring-up device: it is
+*native* by the rule above — a board designed for this machine, driven
+by our own m68k code, not a stand-in for real silicon the ROM already
+knows how to talk to. It has no successor and nothing to retire it into,
+by construction: it is the thing Gayle IDE's row above names as *its*
+successor. This entry records the other half of that relationship —
+Gayle stays in the table as bring-up until this device can boot the
+same image unaided (no m68k driver or boot ROM exists yet; this is the
+block plane's register interface only, per §4.1). Once that happens,
+Gayle's row moves to "retired" per this file's own procedure, and this
+row is unaffected.
+*Cost of keeping:* none accounted here — a permanent, intended device
+does not carry a "cost of keeping" the way a bring-up one does. It does
+carry a live cost the RFC still needs to close: §4.1's register sketch
+is under-specified for a real hardware target (no unit discovery, no
+agreed command/status bit encoding, an unreviewed choice between a
+destructive FIFO and a re-readable buffer behind `DATA`) — see
+`mirage.rs`'s module docs for the full list, since this implementation
+is the spec's *reference* implementation, not a second opinion on an
+existing one.
 
 ### Capped
 

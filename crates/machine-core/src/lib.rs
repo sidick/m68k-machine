@@ -48,6 +48,7 @@ pub mod cirrus;
 pub mod display;
 pub mod gayle;
 pub mod graffity;
+pub mod mirage;
 pub mod render;
 pub mod rom;
 
@@ -57,6 +58,7 @@ use chipset::Chipset;
 use cia::{Cia, CiaId, FloppyDrive, FloppyPresence};
 use gayle::{BlockDevice, Gayle};
 use graffity::Graffity;
+use mirage::Mirage;
 
 /// Size in bytes of the chip RAM region, `$000000`-`$1FFFFF` (2 MB).
 ///
@@ -138,6 +140,20 @@ pub struct MachineBus<'a> {
     /// decode from there.
     graphics_boards: [Option<usize>; graffity::MAX_GRAFFITY_BOARDS],
 
+    /// MIRAGE's block plane (see [`mirage`]), when the board layer has
+    /// attached at least one unit via [`Self::with_mirage`]. Absent by
+    /// default -- with no call to `with_mirage`, neither its AUTOCONFIG
+    /// board nor this field's routing branch exist, so a machine with no
+    /// MIRAGE attached is unaffected (Gayle's IDE port is unrelated and
+    /// keeps working the same as ever -- ledger: MIRAGE is Gayle's
+    /// successor, not its replacement, until it can boot unaided).
+    mirage: Option<Mirage<'a>>,
+    /// AUTOCONFIG chain index MIRAGE's single board landed at, once
+    /// [`Self::with_mirage`] has registered it. The whole seam between
+    /// this bus and [`mirage::Mirage`], the same shape as
+    /// [`Self::graphics_boards`] but for a card with only one board.
+    mirage_board: Option<usize>,
+
     /// While set, the ROM is mirrored over the bottom of the address
     /// space so the CPU's reset vector fetch from `$000000`/`$000004`
     /// lands in ROM. Real hardware does this with Gary, driven by CIA-A
@@ -209,6 +225,8 @@ impl<'a> MachineBus<'a> {
             hd: None,
             graphics: None,
             graphics_boards: [None; graffity::MAX_GRAFFITY_BOARDS],
+            mirage: None,
+            mirage_board: None,
             overlay: true,
         }
     }
@@ -216,6 +234,24 @@ impl<'a> MachineBus<'a> {
     /// Attach a disk to Gayle's IDE port.
     pub fn with_hd(mut self, hd: &'a mut dyn BlockDevice) -> Self {
         self.hd = Some(hd);
+        self
+    }
+
+    /// Attach a disk to MIRAGE unit `unit` (0-7, `mirage` module docs).
+    /// Registers MIRAGE's single AUTOCONFIG board the first time this is
+    /// called; further calls with other unit numbers just attach more
+    /// units to the same card. Never called at all, the card and its
+    /// address-space routing simply don't exist (this field's own doc
+    /// comment) -- Gayle stays available regardless, per the device
+    /// ledger's "MIRAGE retires Gayle only once it boots unaided" rule.
+    pub fn with_mirage(mut self, unit: u8, device: &'a mut dyn BlockDevice) -> Self {
+        if self.mirage.is_none() {
+            self.mirage_board = self.autoconfig.add_board(Mirage::board_spec());
+            self.mirage = Some(Mirage::new());
+        }
+        if let Some(m) = &mut self.mirage {
+            m.attach_unit(unit, device);
+        }
         self
     }
 
@@ -283,6 +319,20 @@ impl<'a> MachineBus<'a> {
         self.graphics.as_ref()
     }
 
+    /// Borrow the attached MIRAGE card, if [`Self::with_mirage`] was
+    /// called. Mutable access is what the board layer (or a test) uses
+    /// to call [`mirage::Mirage::notify_media_change`] -- the host-side
+    /// stand-in for the management-plane `ATTACH`/`DETACH` commands this
+    /// increment doesn't build (`mirage` module docs).
+    pub fn mirage(&self) -> Option<&Mirage<'a>> {
+        self.mirage.as_ref()
+    }
+
+    /// Mutable access to the attached MIRAGE card, see [`Self::mirage`].
+    pub fn mirage_mut(&mut self) -> Option<&mut Mirage<'a>> {
+        self.mirage.as_mut()
+    }
+
     /// Advance time by `cpu_clocks`, ticking the frame clock and both
     /// CIAs. Call this from the CPU's `sync` hook so device time and
     /// guest time stay in step.
@@ -321,6 +371,17 @@ impl<'a> MachineBus<'a> {
             // the write-path comment on `MachineBus::write_byte`'s Gayle
             // arm) -- Graffity is simply a third source pulling it.
             if card.irq_pending() {
+                self.chipset.raise_int(chipset::intbit::PORTS);
+            }
+        }
+
+        // MIRAGE's deferred-completion state machine advances one step
+        // per call, not scaled to `cpu_clocks` -- see `mirage`'s module
+        // docs on why a pending operation only needs "more than zero"
+        // real asynchronous boundary, not a modelled duration.
+        if let Some(m) = &mut self.mirage {
+            m.tick();
+            if m.irq_pending() {
                 self.chipset.raise_int(chipset::intbit::PORTS);
             }
         }
@@ -421,9 +482,44 @@ impl<'a> MachineBus<'a> {
                 Some(card) => card.read(board, offset),
                 None => OPEN_BUS_BYTE,
             }
+        } else if let Some(offset) = self.mirage_target(address) {
+            match &mut self.mirage {
+                Some(m) => {
+                    let value = m.read(offset);
+                    // Mirror the write path's interrupt check on the
+                    // read path too: `gayle`'s own read arm carries the
+                    // hard-won reminder that a device whose interrupt
+                    // can change state on a read (there, a per-sector
+                    // refill; here, none currently does -- `mirage`'s
+                    // module docs explain why the fetch moved to
+                    // `tick()` instead) must not only ever check after a
+                    // write, on pain of a silently missed interrupt.
+                    if m.irq_pending() {
+                        self.chipset.raise_int(chipset::intbit::PORTS);
+                    }
+                    value
+                }
+                None => OPEN_BUS_BYTE,
+            }
         } else {
             OPEN_BUS_BYTE
         }
+    }
+
+    /// Whether `address` falls inside MIRAGE's configured AUTOCONFIG
+    /// window, and if so, the board-relative offset -- the input to
+    /// [`mirage::Mirage::read`]/[`mirage::Mirage::write`]. `None`
+    /// whenever no card is attached ([`Self::mirage_board`] is `None`
+    /// until [`Self::with_mirage`] runs) or the address belongs to some
+    /// other board. See [`Self::graphics_target`], the same shape for
+    /// Graffity.
+    fn mirage_target(&self, address: u32) -> Option<u32> {
+        let idx = self.mirage_board?;
+        if self.autoconfig.board_at(address) != Some(idx) {
+            return None;
+        }
+        let base = self.autoconfig.placement(idx)?.base;
+        Some(address - base)
     }
 
     /// Whether `address` falls inside one of the attached Graffity
@@ -584,6 +680,13 @@ impl<'a> MachineBus<'a> {
         } else if let Some((board, offset)) = self.graphics_target(address) {
             if let Some(card) = &mut self.graphics {
                 card.write(board, offset, value);
+            }
+        } else if let Some(offset) = self.mirage_target(address) {
+            if let Some(m) = &mut self.mirage {
+                m.write(offset, value);
+                if m.irq_pending() {
+                    self.chipset.raise_int(chipset::intbit::PORTS);
+                }
             }
         }
         // ROM and open-bus writes: discarded.
@@ -1148,5 +1251,150 @@ mod tests {
         // sub-apertures is open bus.
         bus.write_byte(0x4040_0060, 0);
         assert_eq!(bus.read_byte(0x4000_1000), OPEN_BUS_BYTE);
+    }
+
+    // ---- MIRAGE wiring ---------------------------------------------------
+
+    /// A tiny in-memory disk for exercising MIRAGE through the bus,
+    /// distinct from `MemDisk` above only in name -- kept local to this
+    /// section so it's obvious at a glance which device a given test is
+    /// wiring up.
+    struct MirageDisk {
+        sectors: std::vec::Vec<[u8; gayle::SECTOR_BYTES]>,
+    }
+
+    impl MirageDisk {
+        fn new(count: usize) -> Self {
+            Self {
+                sectors: std::vec![[0u8; gayle::SECTOR_BYTES]; count],
+            }
+        }
+    }
+
+    impl gayle::BlockDevice for MirageDisk {
+        fn sector_count(&self) -> u64 {
+            self.sectors.len() as u64
+        }
+        fn read_sector(&mut self, lba: u64, buf: &mut [u8; gayle::SECTOR_BYTES]) -> bool {
+            match self.sectors.get(lba as usize) {
+                Some(s) => {
+                    *buf = *s;
+                    true
+                }
+                None => false,
+            }
+        }
+        fn write_sector(&mut self, lba: u64, buf: &[u8; gayle::SECTOR_BYTES]) -> bool {
+            match self.sectors.get_mut(lba as usize) {
+                Some(s) => {
+                    *s = *buf;
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
+    #[test]
+    fn no_mirage_leaves_the_chain_empty_and_gayle_unaffected() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom);
+
+        // Brief item 8: a machine with no MIRAGE attached is completely
+        // unaffected -- no chain entry, no routing branch.
+        assert_eq!(bus.mirage_board, None);
+        assert!(bus.mirage().is_none());
+        assert_eq!(bus.autoconfig.board_at(0x0020_0000), None);
+        // Gayle's own window is untouched by MIRAGE's absence.
+        assert_eq!(bus.read_byte(gayle::reg::IDE_STATUS), OPEN_BUS_BYTE);
+    }
+
+    #[test]
+    fn with_mirage_registers_one_zorro_ii_board() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut disk = MirageDisk::new(64);
+        let mut bus = new_bus(&mut ram, &rom).with_mirage(0, &mut disk);
+
+        assert!(bus.mirage().is_some());
+        assert_eq!(bus.mirage_board, Some(0));
+        // er_Manufacturer (logical bytes 4-5) reads back MIRAGE's
+        // placeholder ID, complemented per the nybble protocol.
+        assert_eq!(
+            bus.autoconfig.read(autoconfig::AUTOCONFIG_BASE + 16) >> 4,
+            (!(mirage::MANUFACTURER.to_be_bytes()[0])) >> 4
+        );
+    }
+
+    /// Configure MIRAGE's single board at `base_byte << 16` -- the
+    /// Zorro II sequence every board on this bus uses (autoconfig module
+    /// docs).
+    fn configure_mirage(bus: &mut MachineBus, base_byte: u8) {
+        bus.write_byte(
+            autoconfig::AUTOCONFIG_BASE + autoconfig::ec::BASEADDRESS,
+            base_byte,
+        );
+    }
+
+    #[test]
+    fn configured_mirage_routes_its_register_window_and_ticks_a_transfer_end_to_end() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut disk = MirageDisk::new(64);
+        let mut bus = new_bus(&mut ram, &rom).with_mirage(0, &mut disk);
+        configure_mirage(&mut bus, 0x20);
+        let base = 0x0020_0000u32;
+
+        bus.write_byte(
+            base + mirage::reg::INT_ENABLE + 3,
+            mirage::int::XFER_COMPLETE,
+        );
+        bus.write_byte(base + mirage::reg::UNIT_SELECT + 3, 0);
+        bus.write_long(base + mirage::reg::LBA, 5);
+        bus.write_long(base + mirage::reg::COUNT, 1);
+        bus.write_byte(base + mirage::reg::CMD_STATUS + 3, mirage::cmd::WRITE);
+
+        // Not landed yet: the write path's tick check must not fire an
+        // interrupt for a command that hasn't reached a tick boundary.
+        assert_eq!(
+            bus.read_byte(base + mirage::reg::CMD_STATUS + 3),
+            mirage::status::BUSY
+        );
+        let ports = 1u16 << chipset::intbit::PORTS;
+        assert_eq!(
+            bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
+            0
+        );
+
+        bus.tick(1); // MachineBus::tick's MIRAGE arm lands the WritePending step
+        assert_eq!(
+            bus.read_byte(base + mirage::reg::CMD_STATUS + 3),
+            mirage::status::DRQ
+        );
+
+        for i in 0u32..gayle::SECTOR_BYTES as u32 {
+            bus.write_long(base + mirage::reg::DATA, (i << 24) | (i << 8));
+        }
+        assert_eq!(
+            bus.read_byte(base + mirage::reg::CMD_STATUS + 3),
+            mirage::status::BUSY,
+            "full sector queued for commit"
+        );
+
+        bus.tick(1); // commit lands here, on the read path's irq_pending check
+        assert_eq!(bus.read_byte(base + mirage::reg::CMD_STATUS + 3), 0);
+        assert_ne!(
+            bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
+            0,
+            "the committed write raised PORTS via MachineBus::tick's MIRAGE arm"
+        );
+
+        // The bytes really landed in the backing store, independent of
+        // the register path above.
+        let mut check = [0u8; gayle::SECTOR_BYTES];
+        disk.read_sector(5, &mut check);
+        assert_eq!(check[0], 0);
+        assert_eq!(check[4], 1);
     }
 }
