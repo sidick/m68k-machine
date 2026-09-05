@@ -301,7 +301,16 @@ NSDQR_SIZEAVAIL equ     4
 NSDQR_DEVTYPE   equ     8
 NSDQR_DEVSUBTYPE equ    10
 NSDQR_SUPPORTED equ     12
-NSDQR_SIZE      equ     20
+NSDQR_SIZE      equ     16      ; devices/newstyle.h: ULONG DevQueryFormat +
+                                ; ULONG SizeAvailable + UWORD DeviceType +
+                                ; UWORD DeviceSubType + APTR
+                                ; SupportedCommands = 16, not 20. Was 20,
+                                ; which over-claimed both nsdqr_SizeAvailable
+                                ; and io_Actual by four bytes; devsoak
+                                ; rejected the reply as malformed and fell
+                                ; back to the 32-bit CMD dialect only, so
+                                ; TD64/NSD went untested despite being
+                                ; implemented.
 NSDEVTYPE_TRACKDISK equ 5
 
 * exec/interrupts.h: struct Interrupt (22 bytes) -- struct Node
