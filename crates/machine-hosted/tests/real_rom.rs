@@ -14,15 +14,54 @@
 use std::path::Path;
 use std::process::Command;
 
-const KICKSTART_A1200: &str = "/Users/simond/src/amirfb/nondistribution/roms/A1200.47.115.rom";
+/// Resolve a fixture this repo may not carry: an environment variable if
+/// the caller sets one, otherwise `nondistribution/` at the repo root.
+///
+/// These used to be absolute paths into a session-scoped temporary
+/// directory. That directory eventually disappeared, and because every
+/// test here skips when its fixture is missing, they went on reporting
+/// success while exercising nothing at all. Resolving relative to
+/// `CARGO_MANIFEST_DIR` keeps the fixtures somewhere stable, so absence
+/// again means "this machine has no media" rather than "the path rotted".
+fn fixture(env_var: &str, name: &str) -> String {
+    if let Ok(path) = std::env::var(env_var) {
+        return path;
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../nondistribution")
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
+}
 
-/// A bootable AmigaOS 3.2.2 HDF (RDB, one `DH0` FFS partition), built by
-/// `tools/amibake` from licensed media -- see `docs/storage.md` for how it
-/// was built and why, like the Kickstart ROM above, it cannot live in this
-/// repo. User-supplied and machine-local, so (like every other real-ROM
-/// test in this file) the test using it skips cleanly when it is absent.
-const HD_IMAGE: &str = "/private/tmp/claude-501/-Users-simond-src-m68k-machine/\
-f2deab3e-9bac-4e93-ba8a-ac7f5bdec300/scratchpad/hdf2/m68k-machine.hdf";
+/// Kickstart 3.2.2 for the A1200. Cloanto's, so it cannot live in this
+/// repo -- see `nondistribution/README.md`.
+fn kickstart_a1200() -> String {
+    fixture("M68K_TEST_KICKSTART", "A1200.47.115.rom")
+}
+
+/// A bootable AmigaOS 3.2.2 HDF (RDB, one `DH0` FFS partition) with
+/// Picasso96 installed against the Graffity card, built by `tools/amibake`
+/// from licensed media -- see `docs/storage.md` for how it was built and
+/// why, like the Kickstart ROM above, it cannot live in this repo.
+///
+/// One image serves both the planar and the RTG test: they differ only by
+/// whether the runner is given `--graphics`, not by their media.
+fn hd_image() -> String {
+    fixture("M68K_TEST_HDF", "m68k-machine.hdf")
+}
+
+/// Skip the calling test unless every fixture it needs is present, so a
+/// clean clone with no licensed media still goes green.
+fn have_fixtures(paths: &[&str]) -> bool {
+    for path in paths {
+        if !Path::new(path).exists() {
+            eprintln!("SKIP: {path} not present -- see nondistribution/README.md");
+            return false;
+        }
+    }
+    true
+}
 
 // Vendored in-repo (assets/aros/PROVENANCE.md) -- freely redistributable,
 // so unlike the Kickstart tests below, the AROS tests in this file run
@@ -92,13 +131,13 @@ fn dominant_pixel(rgba: &[u8]) -> [u8; 4] {
 #[test]
 #[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
 fn kickstart_3_2_2_a1200() {
-    if !Path::new(KICKSTART_A1200).exists() {
-        eprintln!("SKIP: {KICKSTART_A1200} not present");
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
         return;
     }
     let (status, stdout) = run(&[
         "--rom",
-        KICKSTART_A1200,
+        &rom,
         "--max-frames",
         "200",
         "--max-instructions",
@@ -123,13 +162,13 @@ fn kickstart_3_2_2_a1200() {
 #[test]
 #[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
 fn kickstart_3_2_2_a1200_introspection_finds_a_healthy_exec_base() {
-    if !Path::new(KICKSTART_A1200).exists() {
-        eprintln!("SKIP: {KICKSTART_A1200} not present");
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
         return;
     }
     let (status, stdout) = run(&[
         "--rom",
-        KICKSTART_A1200,
+        &rom,
         "--max-frames",
         "200",
         "--max-instructions",
@@ -175,8 +214,8 @@ fn kickstart_3_2_2_a1200_introspection_finds_a_healthy_exec_base() {
 #[test]
 #[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
 fn kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger() {
-    if !Path::new(KICKSTART_A1200).exists() {
-        eprintln!("SKIP: {KICKSTART_A1200} not present");
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
         return;
     }
     let script = concat!(
@@ -185,7 +224,7 @@ fn kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger() {
     );
     let (status, stdout) = run(&[
         "--rom",
-        KICKSTART_A1200,
+        &rom,
         "--trigger-illegal-after-frames",
         "20",
         "--serial-script",
@@ -263,14 +302,14 @@ fn kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger() {
 #[test]
 #[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
 fn kickstart_3_2_2_a1200_screenshot_shows_the_boot_screen() {
-    if !Path::new(KICKSTART_A1200).exists() {
-        eprintln!("SKIP: {KICKSTART_A1200} not present");
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
         return;
     }
     let path = screenshot_path("kickstart");
     let (status, stdout) = run(&[
         "--rom",
-        KICKSTART_A1200,
+        &rom,
         "--max-frames",
         "2600",
         "--max-instructions",
@@ -408,41 +447,45 @@ fn aros_68k_screenshot_shows_boot_screen_content_without_boot_media() {
 /// **What actually happens, confirmed by inspecting the captured PNG
 /// (not just pixel-difference counts):** the RDB is read, `DH0:` mounts,
 /// FFS loads it, `Startup-Sequence` runs, and Intuition opens a real
-/// Workbench screen. `S/Startup-Sequence` line 17 in this image is
-/// `AddBuffers >NIL: DF0: 15` -- an ordinary line that references `DF0:`,
-/// which this machine (like a real A1200 with no floppy drive, and
-/// matching `--floppy none`'s default) does not have. DOS itself, not the
-/// command, raises Intuition's "Please insert volume DF0: in any drive"
-/// System Request over the Workbench screen as a result. That is a
-/// correct outcome for this exact image/configuration, not a stall: by
-/// the time it appears, the entire storage path -- ID gate, RDB,
-/// partition, filesystem, DOS, Workbench -- has already worked.
+/// Workbench screen with a titled window and the `RAM Disk` and `SYS`
+/// icons drawn. The whole storage path -- ID gate, RDB, partition,
+/// filesystem, DOS, Workbench -- has to work to get here.
+///
+/// This test previously asserted that boot ended at Intuition's "Please
+/// insert volume DF0: in any drive" System Request, which an earlier
+/// image raised from an `AddBuffers >NIL: DF0: 15` line in its
+/// `Startup-Sequence` -- an ordinary line referencing a drive this
+/// machine, like a real A1200 with no floppy fitted, does not have.
+/// `tools/amibake` no longer emits that line, so the requester is gone
+/// and the desktop is reached directly. The assertions below describe the
+/// desktop; the requester was never the interesting part, only the
+/// furthest point boot happened to reach.
 ///
 /// Frame timing: unlike the no-disk boot-screen test above (stable by
 /// frame 2500), a real disk boot keeps Kickstart busy well past the IDE
 /// probe window into actual filesystem and Workbench work. Sweeping
-/// `--screenshot-every` while preparing this test found the requester
-/// screen already fully drawn and pixel-stable from frame 4000 onward (no
-/// change at all through 5500); frame 4000 is used here with `--max-frames
-/// 4500` for margin clear of the capture boundary (same reasoning as the
-/// AROS test's frame-400-of-500 margin).
+/// `--screenshot-every` while preparing this test found the desktop
+/// already fully drawn and pixel-stable from frame 4000 onward (no change
+/// at all through 5500); frame 4000 is used here with `--max-frames 4500`
+/// for margin clear of the capture boundary (same reasoning as the AROS
+/// test's frame-400-of-500 margin).
 #[test]
 #[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
-fn kickstart_3_2_2_a1200_boots_from_hd_to_the_insert_df0_requester() {
-    if !Path::new(KICKSTART_A1200).exists() {
-        eprintln!("SKIP: {KICKSTART_A1200} not present");
+fn kickstart_3_2_2_a1200_boots_from_hd_to_the_workbench_desktop() {
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
         return;
     }
-    if !Path::new(HD_IMAGE).exists() {
-        eprintln!("SKIP: {HD_IMAGE} not present");
+    let hd = hd_image();
+    if !have_fixtures(&[&hd]) {
         return;
     }
     let path = screenshot_path("kickstart-hd");
     let (status, stdout) = run(&[
         "--rom",
-        KICKSTART_A1200,
+        &rom,
         "--hd",
-        HD_IMAGE,
+        &hd,
         "--max-frames",
         "4500",
         "--max-instructions",
@@ -478,15 +521,17 @@ fn kickstart_3_2_2_a1200_boots_from_hd_to_the_insert_df0_requester() {
     let background = dominant_pixel(&rgba);
     let non_background = rgba.chunks(4).filter(|px| *px != background).count();
     // A specific, meaningful floor rather than "some pixels changed": the
-    // requester's window border, title bar, gadgets and two lines of text
-    // account for a stable ~5,400 non-background pixels on this exact
-    // image (see this test's doc comment) -- comfortably below that would
-    // mean something much smaller than a whole requester drew.
+    // Workbench screen's title bar, window border and furniture, and the
+    // two icons with their labels account for a stable 13,507
+    // non-background pixels on this exact image (see this test's doc
+    // comment). Comfortably below that would mean something much smaller
+    // than a whole desktop drew -- an empty screen, or a bare backdrop
+    // with no window on it.
     assert!(
-        non_background > 3_000,
-        "expected the 'insert volume DF0' requester drawn over the \
-         Workbench screen, got {non_background} non-background pixels -- \
-         see this test's doc comment"
+        non_background > 8_000,
+        "expected a drawn Workbench desktop -- title bar, window and the \
+         RAM Disk and SYS icons -- got {non_background} non-background \
+         pixels; see this test's doc comment"
     );
 
     let mut colours: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
@@ -495,10 +540,134 @@ fn kickstart_3_2_2_a1200_boots_from_hd_to_the_insert_df0_requester() {
     }
     assert!(
         colours.len() >= 4,
-        "expected the requester's title bar, borders, gadgets and text to \
-         show up as several distinct colours over the Workbench grey, got \
-         {} distinct colours",
+        "expected the desktop's title bar, window borders, gadgets, icons \
+         and text to show up as several distinct colours over the \
+         Workbench grey, got {} distinct colours",
         colours.len()
+    );
+}
+
+/// RTG regression test: pins the Workbench desktop Picasso96's Cirrus
+/// driver paints once it brings up a real 640x480 8bpp RTG screen on the
+/// Graffity card (`--graphics`). Before this test there was no coverage at
+/// all of the RTG present path (`render_rtg` in `render.rs`, fed by
+/// `Cirrus542x::palette_argb` in `cirrus.rs`), so a future change to
+/// either could silently blank the desktop or corrupt its palette and
+/// nothing would catch it.
+///
+/// Structure only, not exact pixels -- window furniture, gadget layout and
+/// icon placement are free to change with any legitimate driver or asset
+/// change. What must always hold for a healthy RTG Workbench desktop:
+/// the driver-programmed mode is exactly 640x480 (`decoded_mode`'s
+/// geometry, independent of the planar renderer's fixed
+/// `MAX_WIDTH`/`MAX_HEIGHT` canvas the non-`--graphics` tests above use);
+/// several distinct colours are on screen (a flat single-colour fill is
+/// what a blanked or mis-painted screen looks like); and each screen
+/// quadrant has some non-background content, since a real desktop has
+/// window furniture and icons spread across it rather than bunched in one
+/// corner. Frame 5000 (`--max-frames 5200` for margin) is used because
+/// `--graphics` runs need many more instructions to reach a stable
+/// desktop than the planar boot screen above, and the default 200M
+/// instruction cap stops the run around frame 1427 before the desktop is
+/// even drawn -- hence the large `--max-instructions` here.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_rtg_workbench_desktop_is_grey_not_blank_or_corrupt() {
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
+        return;
+    }
+    let hd = hd_image();
+    if !have_fixtures(&[&hd]) {
+        return;
+    }
+    let path = screenshot_path("kickstart-rtg");
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hd",
+        &hd,
+        "--graphics",
+        "--max-frames",
+        "5200",
+        "--max-instructions",
+        "3000000000",
+        "--screenshot",
+        path.to_str().unwrap(),
+        "--screenshot-frame",
+        "5000",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    assert!(
+        stdout.contains("screenshot: frame 5000"),
+        "expected the capture to actually fire by frame 5000"
+    );
+
+    let (width, height, rgba) = decode_png(&path);
+    assert_eq!(
+        (width, height),
+        (640, 480),
+        "an RTG screenshot's dimensions come from the driver-programmed \
+         mode, not the planar renderer's MAX_WIDTH/MAX_HEIGHT canvas"
+    );
+
+    let background = dominant_pixel(&rgba);
+    // Documented hardware behaviour, not this implementation's own
+    // assumption: the RAMDAC holds six bits per gun (VGA/Cirrus DAC
+    // convention), so a genuine grey background pen has R, G and B
+    // already equal *before* the renderer's 6-to-8-bit gun expansion --
+    // replicating the top two bits (`palette_argb`'s `expand6`) preserves
+    // that equality. A background where the channels differ can only mean
+    // a non-grey colour landed in the background palette entry, which is
+    // exactly this task's original defect (a hardware-cursor colour write
+    // landing in the screen palette instead of the cursor's own table).
+    assert_eq!(
+        (background[0], background[1]),
+        (background[1], background[2]),
+        "expected a neutral grey background (equal R/G/B), got {background:?} -- \
+         a tinted background means something other than the intended pen \
+         landed in the background palette entry"
+    );
+
+    let non_background = rgba.chunks(4).filter(|px| *px != background).count();
+    assert!(
+        non_background > 5_000,
+        "expected the desktop's window furniture, gadgets and icons to be \
+         drawn, got only {non_background} non-background pixels"
+    );
+
+    let mut colours: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    for px in rgba.chunks(4) {
+        colours.insert(px);
+    }
+    assert!(
+        colours.len() >= 3,
+        "expected window furniture, text and icons to show up as several \
+         distinct colours over the background, got {} distinct colours",
+        colours.len()
+    );
+
+    // Each screen quadrant should have some non-background content: a
+    // real desktop's furniture and icons spread across the screen rather
+    // than clustering in one corner, which is what a partially-drawn or
+    // mis-clipped screen would look like.
+    let mut quadrant_has_content = [false; 4];
+    for (i, px) in rgba.chunks(4).enumerate() {
+        if *px == background {
+            continue;
+        }
+        let x = (i as u32) % width;
+        let y = (i as u32) / width;
+        let qx = usize::from(x >= width / 2);
+        let qy = usize::from(y >= height / 2);
+        quadrant_has_content[qy * 2 + qx] = true;
+    }
+    assert!(
+        quadrant_has_content.iter().all(|&has| has),
+        "expected non-background content in every screen quadrant, got {quadrant_has_content:?}"
     );
 }
 

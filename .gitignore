@@ -9,3 +9,9 @@
 *.hdf
 *.hdz
 /tools/amibake/out/
+
+# Licensed media that tests need but this repo may not carry: Kickstart
+# ROMs and built AmigaOS images. Ignored wholesale so nothing in here can
+# be committed by accident, with only the README explaining what belongs.
+/nondistribution/*
+!/nondistribution/README.md
