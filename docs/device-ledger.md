@@ -78,8 +78,9 @@ same change that introduces it.
 | Floppy "no drive attached" | permanent | — | never; models absence, not a drive |
 | Planar renderer | capped | RTG | never fully; stops growing (below) |
 | Blitter | capped | RTG | never fully; stops growing (below) |
-| Gayle IDE | **bring-up** | MIRAGE (§10.3) | MIRAGE boots the same image unaided |
-| MIRAGE block plane | permanent | — | never; this is what Gayle retires into |
+| Gayle IDE | **bring-up** | `hostblk` (ADR 0003) | `hostblk` boots the same image unaided |
+| `hostblk` doorbell card | permanent | — | never; the machine's own storage |
+| MIRAGE block plane | permanent, off the boot path | — | never; kept as MIRAGE's reference implementation |
 | Cirrus CL-GD542x | **bring-up** | generic virtual board (ADR 0002) | demoted to compatibility tier, not removed |
 | Graffity Z2/Z3 | **bring-up** | as Cirrus | as Cirrus |
 | Keyboard / mouse | **not built** | native input board | n/a — native-first from the start |
@@ -100,26 +101,31 @@ than the presence of it. It exists because Kickstart hangs on a black
 screen without an answer, and matches a real A1200 with no drive fitted.
 There is nothing to retire.
 
-**MIRAGE block plane** — `mirage.rs`. Not a bring-up device: it is
-*native* by the rule above — a board designed for this machine, driven
-by our own m68k code, not a stand-in for real silicon the ROM already
-knows how to talk to. It has no successor and nothing to retire it into,
-by construction: it is the thing Gayle IDE's row above names as *its*
-successor. This entry records the other half of that relationship —
-Gayle stays in the table as bring-up until this device can boot the
-same image unaided (no m68k driver or boot ROM exists yet; this is the
-block plane's register interface only, per §4.1). Once that happens,
-Gayle's row moves to "retired" per this file's own procedure, and this
-row is unaffected.
-*Cost of keeping:* none accounted here — a permanent, intended device
-does not carry a "cost of keeping" the way a bring-up one does. It does
-carry a live cost the RFC still needs to close: §4.1's register sketch
-is under-specified for a real hardware target (no unit discovery, no
-agreed command/status bit encoding, an unreviewed choice between a
-destructive FIFO and a re-readable buffer behind `DATA`) — see
-`mirage.rs`'s module docs for the full list, since this implementation
-is the spec's *reference* implementation, not a second opinion on an
-existing one.
+**`hostblk` doorbell card.** The machine's own storage, and what Gayle
+retires into. A doorbell-plus-descriptor card whose data path runs on
+the host, with INT2 completion — see ADR 0003 for why the boot path is
+not PIO. Not yet built.
+
+**MIRAGE block plane** — `mirage.rs`. Native rather than bring-up: a
+board designed for this machine and driven by our own m68k code, not a
+stand-in for silicon the ROM already knows. It was Gayle's named
+successor until ADR 0003 moved the boot path to `hostblk`, on the
+grounds that MIRAGE's shape is dictated by a Zorro II bus and an SD
+backend that this machine does not have.
+
+It is kept deliberately, off the boot path, because it is MIRAGE's
+**reference implementation** — no other exists — and because keeping it
+makes ADR 0003 cheap to reverse if a real MIRAGE board is ever built.
+Its register model still runs in CI. What is deferred is driver-level
+conformance, not the interface.
+*Cost of keeping:* ~1,100 lines including tests, carried without being
+on any critical path. It also carries a live cost the RFC still needs to
+close: §4.1's register sketch is under-specified for a real hardware
+target — no unit discovery, no agreed command/status bit encoding, and
+an unreviewed choice between a destructive FIFO and a re-readable buffer
+behind `DATA`. See `mirage.rs`'s module docs for the full list, which
+matters more than usual because this implementation *is* the spec's
+reference, not a second opinion on an existing one.
 
 ### Capped
 
@@ -142,9 +148,11 @@ machine so Workbench could boot at all, using the ROM's own
 `scsi.device` and no 68k code of ours. It works and currently boots
 AmigaOS 3.2.2 from an HDF.
 
-*Successor:* MIRAGE (§10.3) — a native block card with a host-side
-backend, our own m68k driver, and an RDB-mounting boot ROM.
-*Retires when:* MIRAGE boots the same image with no Gayle attached.
+*Successor:* `hostblk` (ADR 0003) — a doorbell-plus-descriptor block
+card with a host-side data path, our own m68k driver, and an
+RDB-mounting boot ROM. This was MIRAGE until ADR 0003 moved the boot
+path off PIO.
+*Retires when:* `hostblk` boots the same image with no Gayle attached.
 *Cost of keeping:* ~1,000 lines, plus an IDE task-file model and its
 interrupt semantics that must stay correct forever. The per-sector
 INTRQ-on-read bug that cost a debugging cycle is the kind of thing this
