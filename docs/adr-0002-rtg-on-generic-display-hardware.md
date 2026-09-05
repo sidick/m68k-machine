@@ -5,7 +5,9 @@ has just made the emulated-silicon path work end to end, which is what
 makes the alternative worth stating precisely; and because one of its
 consequences bears directly on ADR 0001, which is still open.
 
-**Context:** proposal §8.2; roadmap Phases 3, 5; ADR 0001.
+**Context:** proposal §8.2; roadmap Phases 3, 5; ADR 0001;
+`device-ledger.md`, which records the Cirrus card's status as scaffolding
+and what this ADR's option B would demote it to.
 
 ---
 

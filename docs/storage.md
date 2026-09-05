@@ -10,7 +10,10 @@ register map gets a mountable, bootable disk with no m68k code of our own
 §10.3) remains the architecture's real storage story** — a Zorro III card
 with its own m68k driver — and still has to be built. Gayle IDE is the
 bring-up device that lets the rest of the machine be exercised against a
-real filesystem and a real Workbench before that chain exists.
+real filesystem and a real Workbench before that chain exists. That
+classification is now tracked rather than merely intended: see
+`device-ledger.md`, which records what retires Gayle and what keeping it
+costs in the meantime.
 
 This document covers the host side: how a disk image gets attached to
 that interface in `machine-hosted`, how the one image this has actually
