@@ -48,8 +48,16 @@ mod execbase {
     pub const THIS_TASK: u32 = 276;
     pub const ATTN_FLAGS: u32 = 296;
     pub const RES_MODULES: u32 = 300;
-    // MemList/ResourceList/DeviceList/IntrList/LibList/PortList, each a
-    // 14-byte `struct List`, sit between here and TaskReady.
+    // RES_MODULES is the APTR at 300..304; TaskTrapCode/TaskExceptCode/
+    // TaskExitCode/TaskSigAlloc (four 4-byte fields) run 304..320, then
+    // TaskTrapAlloc (UWORD) runs 320..322 -- MemList starts right after.
+    /// `ExecBase->MemList` (`exec/execbase.h`'s "System Lists (private!)"
+    /// block): the guest's actual free-memory list -- what `--fast-ram`'s
+    /// verification reads to confirm `expansion.library` really linked
+    /// the AUTOCONFIG board in, not merely that this bus answers for it.
+    /// ResourceList/DeviceList/IntrList/LibList/PortList, each a 14-byte
+    /// `struct List`, sit between here and TaskReady.
+    pub const MEM_LIST: u32 = 322;
     pub const TASK_READY: u32 = 406;
     pub const TASK_WAIT: u32 = 420;
     // SoftInts[5] of `struct SoftIntList` (14 + 2 = 16 bytes each) = 80
@@ -72,6 +80,26 @@ mod node {
 mod list {
     pub const LH_HEAD: u32 = 0;
 }
+
+/// Byte offsets into `struct MemHeader` (`exec/memory.h`), past the
+/// embedded `struct Node mh_Node` (14 bytes, `node::SIZE`).
+mod memheader {
+    use super::node;
+
+    pub const MH_ATTRIBUTES: u32 = node::SIZE; // UWORD
+    pub const MH_LOWER: u32 = node::SIZE + 6; // + mh_Attributes(2) + mh_First(4)
+    pub const MH_UPPER: u32 = MH_LOWER + 4;
+    pub const MH_FREE: u32 = MH_UPPER + 4;
+}
+
+/// `exec/memory.h`'s `MEMF_*` attribute bits, the ones worth naming in a
+/// report: `MEMF_FAST` absent (and `MEMF_CHIP` present) is exactly what
+/// distinguishes the 2 MB chip region every boot already has from a
+/// `--fast-ram` board `expansion.library` has actually linked in.
+const MEMF_PUBLIC: u16 = 1 << 0;
+const MEMF_CHIP: u16 = 1 << 1;
+const MEMF_FAST: u16 = 1 << 2;
+const MEMF_LOCAL: u16 = 1 << 8;
 
 /// Byte offsets into `struct Task` (`exec/tasks.h`), past the embedded
 /// `struct Node tc_Node` (14 bytes).
@@ -153,6 +181,21 @@ pub struct ResidentEntry {
     pub node_type: u8,
 }
 
+/// One `struct MemHeader` found on `ExecBase->MemList` -- one contiguous
+/// region `expansion.library`/Kickstart's own memory-sizing code has
+/// actually linked into the free-memory pool. This is the direct evidence
+/// `--fast-ram`'s verification needs: our own bus and AUTOCONFIG chain
+/// answering for a board proves nothing about whether the guest adopted
+/// it, but an entry here of the right size and attributes does.
+pub struct MemListEntry {
+    pub address: u32,
+    pub name: String,
+    pub attributes: u16,
+    pub lower: u32,
+    pub upper: u32,
+    pub free: u32,
+}
+
 /// A task found on `TaskReady` or `TaskWait`.
 pub struct TaskEntry {
     pub address: u32,
@@ -177,6 +220,7 @@ pub struct Report {
     pub task_ready: Vec<TaskEntry>,
     pub task_wait: Vec<TaskEntry>,
     pub this_task: Option<TaskEntry>,
+    pub mem_list: Vec<MemListEntry>,
 }
 
 /// Cap every walk (resident array, task lists) well above anything a real
@@ -273,6 +317,39 @@ fn read_task(bus: &mut MachineBus, task_addr: u32) -> Option<TaskEntry> {
     })
 }
 
+/// Walk `ExecBase->MemList`: a `struct List` of `struct MemHeader` nodes
+/// (`exec/memory.h`), one per contiguous region `AddMemList` has linked
+/// into the system free-memory pool. Every real Kickstart always has at
+/// least one entry (chip RAM); a `--fast-ram` board shows up here, with
+/// `MEMF_FAST` set and `mh_Upper - mh_Lower` matching what was declared,
+/// only once `expansion.library` has actually adopted it -- which is the
+/// entire question this walk exists to answer (module docs). Same
+/// termination shape as [`walk_task_list`]: the list header's own
+/// `lh_Tail` slot is `NULL`, and the real last node's `ln_Succ` points at
+/// that slot, so reading through it yields 0 and stops the walk without
+/// special-casing the header.
+fn walk_mem_list(bus: &mut MachineBus, list_addr: u32) -> Vec<MemListEntry> {
+    let mut out = Vec::new();
+    let mut node_addr = bus.read_long(list_addr + list::LH_HEAD);
+    for _ in 0..MAX_WALK_ENTRIES {
+        let succ = bus.read_long(node_addr + node::LN_SUCC);
+        if succ == 0 {
+            break;
+        }
+        let (name, _pri) = read_node_name(bus, node_addr);
+        out.push(MemListEntry {
+            address: node_addr,
+            name,
+            attributes: bus.read_word(node_addr + memheader::MH_ATTRIBUTES),
+            lower: bus.read_long(node_addr + memheader::MH_LOWER),
+            upper: bus.read_long(node_addr + memheader::MH_UPPER),
+            free: bus.read_long(node_addr + memheader::MH_FREE),
+        });
+        node_addr = succ;
+    }
+    out
+}
+
 /// Walk `ExecBase->ResModules`: a `NULL`-terminated array of `struct
 /// Resident *`, built by `InitCode()` during boot from every ROMTag it
 /// found (`exec/resident.h`). This is the single best artefact for "how
@@ -337,14 +414,27 @@ fn chk_sum_consistent(bus: &mut MachineBus, exec_base: u32) -> bool {
 pub fn inspect(bus: &mut MachineBus) -> Report {
     let ptr = bus.read_long(0x0000_0004);
 
-    // Plausibility gate before trusting anything at `ptr`: ExecBase is
-    // allocated by `InitCode()` out of chip memory (this machine has no
-    // fast RAM yet -- proposal §6.1, Zorro III/fast RAM is Phase 3), so it
-    // must land inside chip RAM, be long-aligned (`AllocMem` never returns
-    // an odd address), and its `LIB_NODE.ln_Type` must read `NT_LIBRARY`.
+    // Plausibility gate before trusting anything at `ptr`: must be
+    // long-aligned (`AllocMem` never returns an odd address) and its
+    // `LIB_NODE.ln_Type` must read `NT_LIBRARY`.
+    //
+    // `ptr` landing inside chip RAM specifically was this gate's original
+    // check, on the reasoning that `InitCode()` allocates `ExecBase`
+    // before `expansion.library` has linked in anything else. That
+    // reasoning covers the *initial* placement but not the final one: a
+    // real Kickstart 3.2.2 boot with a Zorro III `--fast-ram` board
+    // attached moves `ExecBase` itself into that fast RAM by the time the
+    // guest goes idle -- confirmed against Copperline (this project's
+    // oracle) booting the same `nondistribution/A1200.47.115.rom` with a
+    // 16 MB Zorro III board of its own: both land `ExecBase` at the
+    // identical address, `$4000089c`. So "is this address real, backed
+    // RAM at all" (any region [`machine_core::GuestMemory::ram_slice`]
+    // resolves) is the actual invariant, not "is this address inside chip
+    // RAM specifically" -- the latter would silently reject a perfectly
+    // healthy guest the moment `--fast-ram` starts working.
     let exec_base = if ptr != 0
         && ptr.is_multiple_of(4)
-        && ptr < machine_core::CHIP_RAM_SIZE as u32
+        && machine_core::GuestMemory::ram_slice(bus, ptr, execbase::LIB_NODE_LN_TYPE + 1).is_some()
         && bus.read_byte(ptr + execbase::LIB_NODE_LN_TYPE) == NT_LIBRARY
     {
         Some(ptr)
@@ -367,6 +457,7 @@ pub fn inspect(bus: &mut MachineBus) -> Report {
             task_ready: Vec::new(),
             task_wait: Vec::new(),
             this_task: None,
+            mem_list: Vec::new(),
         };
     };
 
@@ -399,6 +490,7 @@ pub fn inspect(bus: &mut MachineBus) -> Report {
         task_ready: walk_task_list(bus, base + execbase::TASK_READY),
         task_wait: walk_task_list(bus, base + execbase::TASK_WAIT),
         this_task: read_task(bus, this_task_ptr),
+        mem_list: walk_mem_list(bus, base + execbase::MEM_LIST),
     }
 }
 
@@ -505,6 +597,11 @@ pub fn format_report(report: &Report) -> String {
             "    {:#010x}  pri {:>4}  v{:<3}  type {:<3}  {:<20} {}\n",
             m.address, m.priority, m.version, m.node_type, m.name, m.id_string
         ));
+    }
+
+    out.push_str(&format!("  MemList ({}):\n", report.mem_list.len()));
+    for m in &report.mem_list {
+        out.push_str(&format!("    {}\n", mem_list_line(m)));
     }
 
     out.push_str(&format!(
@@ -656,6 +753,41 @@ pub fn format_graphics_state(bus: &MachineBus) -> String {
              decoded_mode is None (driver has not programmed a presentable mode yet)"
         ),
     }
+}
+
+/// Format one `MemList` entry, decoding the `MEMF_*` attribute bits that
+/// matter for telling chip RAM apart from an adopted fast-RAM board --
+/// `--fast-ram`'s whole verification question (module docs on
+/// [`walk_mem_list`]).
+fn mem_list_line(m: &MemListEntry) -> String {
+    let mut kinds = Vec::new();
+    if m.attributes & MEMF_CHIP != 0 {
+        kinds.push("CHIP");
+    }
+    if m.attributes & MEMF_FAST != 0 {
+        kinds.push("FAST");
+    }
+    if m.attributes & MEMF_PUBLIC != 0 {
+        kinds.push("PUBLIC");
+    }
+    if m.attributes & MEMF_LOCAL != 0 {
+        kinds.push("LOCAL");
+    }
+    let kinds = if kinds.is_empty() {
+        "none recognised".to_string()
+    } else {
+        kinds.join("|")
+    };
+    format!(
+        "{:#010x}  {:<20} attrs {:#06x} ({kinds})  {:#010x}-{:#010x} ({} bytes)  free {} bytes",
+        m.address,
+        m.name,
+        m.attributes,
+        m.lower,
+        m.upper,
+        m.upper.wrapping_sub(m.lower),
+        m.free,
+    )
 }
 
 fn task_line(task: Option<&TaskEntry>) -> String {
@@ -844,5 +976,67 @@ mod tests {
         assert_eq!(report.task_ready.len(), 1);
         assert_eq!(report.task_ready[0].name, "input.device");
         assert_eq!(report.task_ready[0].sig_wait, 0x0000_0100);
+    }
+
+    /// `--fast-ram`'s whole verification question, at unit-test scale:
+    /// two `MemHeader`s on `ExecBase->MemList` (chip, then a stand-in fast
+    /// region) must both come back, with `MEMF_FAST` distinguishing the
+    /// second from the first -- the same list shape a real Kickstart that
+    /// adopted a `--fast-ram` board would leave behind.
+    #[test]
+    fn mem_list_walk_finds_chip_and_fast_regions() {
+        let mut ram = boxed_ram();
+        let mut bus = new_bus(&mut ram);
+        let base = 0x0004_0000;
+        plant_exec_base(&mut bus, base);
+
+        let list_addr = base + execbase::MEM_LIST;
+        let chip_hdr = base + 0x5000;
+        let fast_hdr = base + 0x5100;
+        let chip_name = base + 0x5200;
+        let fast_name = base + 0x5210;
+
+        // lh_Head -> chip_hdr -> fast_hdr -> &lh_Tail (NULL), the same
+        // two-real-node chain shape `task_list_walk_...` above builds.
+        bus.write_long(list_addr + list::LH_HEAD, chip_hdr);
+        bus.write_long(chip_hdr + node::LN_SUCC, fast_hdr);
+        bus.write_long(fast_hdr + node::LN_SUCC, list_addr + 4);
+        bus.write_long(list_addr + 4, 0);
+
+        bus.write_long(chip_hdr + node::LN_NAME, chip_name);
+        for (i, b) in b"chip memory".iter().enumerate() {
+            bus.write_byte(chip_name + i as u32, *b);
+        }
+        bus.write_word(chip_hdr + memheader::MH_ATTRIBUTES, MEMF_CHIP | MEMF_PUBLIC);
+        bus.write_long(chip_hdr + memheader::MH_LOWER, 0);
+        bus.write_long(chip_hdr + memheader::MH_UPPER, CHIP_RAM_SIZE as u32);
+        bus.write_long(chip_hdr + memheader::MH_FREE, 0x0010_0000);
+
+        let fast_base = 0x4000_0000u32;
+        let fast_size = 0x0800_0000u32; // 128 MB
+        bus.write_long(fast_hdr + node::LN_NAME, fast_name);
+        for (i, b) in b"fast memory".iter().enumerate() {
+            bus.write_byte(fast_name + i as u32, *b);
+        }
+        bus.write_word(fast_hdr + memheader::MH_ATTRIBUTES, MEMF_FAST | MEMF_PUBLIC);
+        bus.write_long(fast_hdr + memheader::MH_LOWER, fast_base);
+        bus.write_long(fast_hdr + memheader::MH_UPPER, fast_base + fast_size);
+        bus.write_long(fast_hdr + memheader::MH_FREE, fast_size);
+
+        let report = inspect(&mut bus);
+        assert_eq!(report.mem_list.len(), 2);
+        assert_eq!(report.mem_list[0].name, "chip memory");
+        assert_eq!(report.mem_list[0].attributes & MEMF_FAST, 0);
+        assert_eq!(report.mem_list[1].name, "fast memory");
+        assert_eq!(report.mem_list[1].attributes & MEMF_FAST, MEMF_FAST);
+        assert_eq!(
+            report.mem_list[1].upper - report.mem_list[1].lower,
+            fast_size,
+            "adopted size matches what the board declared"
+        );
+
+        let text = format_report(&report);
+        assert!(text.contains("fast memory"));
+        assert!(text.contains("FAST"));
     }
 }

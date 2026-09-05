@@ -17,10 +17,13 @@
 //! | `$F80000`-`$FFFFFF` | 512 KB Kickstart ROM window, read-only |
 //! | everything else | open bus |
 //!
-//! Still absent, by phase: the software blitter and renderer (Phase 2),
-//! Zorro III board space and fast RAM (Phase 3). Those addresses fall
-//! through to the open-bus rule below, which is exactly what an
-//! unpopulated real machine would do at them today.
+//! Zorro II/III board space (MIRAGE, `hostblk`, Graffity, and now fast
+//! RAM -- [`fastram`]) is discovered through [`autoconfig::AutoConfig`]
+//! rather than fixed in this table, since AUTOCONFIG is what assigns
+//! those boards' addresses at boot; none of it exists unless a board
+//! layer attaches the corresponding board. Any address no attached board
+//! has claimed falls through to the open-bus rule below, which is
+//! exactly what an unpopulated real machine would do at it.
 //!
 //! # Open-bus rule
 //!
@@ -46,6 +49,7 @@ pub mod chipset;
 pub mod cia;
 pub mod cirrus;
 pub mod display;
+pub mod fastram;
 pub mod gayle;
 pub mod graffity;
 pub mod hostblk;
@@ -85,6 +89,39 @@ pub const ROM_END: u32 = ROM_BASE + ROM_WINDOW_SIZE as u32;
 
 /// A byte value returned by every open-bus read.
 pub const OPEN_BUS_BYTE: u8 = 0xFF;
+
+/// A validated view onto this machine's actual RAM, for a device whose
+/// transfer engine moves guest-supplied buffers directly -- `hostblk`'s
+/// doorbell descriptor and per-sector transfer buffers are the motivating
+/// case -- rather than one byte at a time through
+/// [`MachineBus::read_byte`]/[`MachineBus::write_byte`].
+///
+/// `MachineBus` is the only thing that knows the *whole* memory map (every
+/// region any board layer has attached, and where AUTOCONFIG placed each
+/// one), so it is the only thing that can legitimately answer "is this
+/// guest address actually RAM, and how much of it". A device holding a
+/// hardcoded range instead -- `hostblk`'s buffer bounds check currently
+/// compares against `0..CHIP_RAM_SIZE` directly -- hardcodes a guess about
+/// a memory map that is decided at configuration time, and breaks again
+/// the moment a second RAM region exists (fast RAM, here) or an
+/// AUTOCONFIG-assigned base moves. This trait exists so a device can ask
+/// instead of assuming: [`MachineBus`] implements it once, correctly, and
+/// every future RAM region this machine ever grows only needs to be added
+/// to that one implementation, not to every device that moves bytes
+/// around.
+pub trait GuestMemory {
+    /// A read-only view of `len` bytes at guest address `addr`, or `None`
+    /// if that whole span does not lie entirely within exactly one
+    /// attached RAM region -- unmapped, out of bounds, straddling two
+    /// regions, or `addr + len` overflowing `u32` all read as "no". Guest
+    /// addresses are hostile input (proposal's standing rule, see
+    /// `hostblk`'s own module docs): this must clip and reject, never
+    /// panic or silently alias one region's bytes onto another's request.
+    fn ram_slice(&self, addr: u32, len: u32) -> Option<&[u8]>;
+
+    /// The mutable equivalent of [`GuestMemory::ram_slice`].
+    fn ram_slice_mut(&mut self, addr: u32, len: u32) -> Option<&mut [u8]>;
+}
 
 /// The m68k-visible address space of the machine.
 ///
@@ -169,6 +206,23 @@ pub struct MachineBus<'a> {
     /// as [`Self::mirage_board`].
     hostblk_board: Option<usize>,
 
+    /// Fast RAM (`fastram`), when the board layer has attached some via
+    /// [`Self::with_fast_ram`]. Absent by default -- with no call to
+    /// `with_fast_ram`, neither its AUTOCONFIG board nor this field's
+    /// routing branch exist, so a machine with no fast RAM attached is
+    /// completely unaffected, and every existing baseline (planar and
+    /// RTG) stays bit-identical (the same guarantee [`Self::mirage`],
+    /// [`Self::hostblk`] and [`Self::graphics`] already give). Unlike
+    /// those, this is plain borrowed storage rather than a device with
+    /// its own register model -- `fastram`'s whole job is the AUTOCONFIG
+    /// identity that gets it linked into the guest's free-memory list,
+    /// not any behaviour once mapped.
+    fast_ram: Option<&'a mut [u8]>,
+    /// AUTOCONFIG chain index fast RAM's single board landed at, once
+    /// [`Self::with_fast_ram`] has registered it -- the same seam shape
+    /// as [`Self::mirage_board`]/[`Self::hostblk_board`].
+    fast_ram_board: Option<usize>,
+
     /// While set, the ROM is mirrored over the bottom of the address
     /// space so the CPU's reset vector fetch from `$000000`/`$000004`
     /// lands in ROM. Real hardware does this with Gary, driven by CIA-A
@@ -244,6 +298,8 @@ impl<'a> MachineBus<'a> {
             mirage_board: None,
             hostblk: None,
             hostblk_board: None,
+            fast_ram: None,
+            fast_ram_board: None,
             overlay: true,
         }
     }
@@ -326,6 +382,26 @@ impl<'a> MachineBus<'a> {
         }
         self.graphics_boards = chain;
         self.graphics = Some(card);
+        self
+    }
+
+    /// Attach fast RAM over caller-owned storage (borrowed, like chip RAM
+    /// and VRAM -- this crate has no allocator) and register its single
+    /// Zorro III AUTOCONFIG board (`fastram::autoconfig_board_spec`) on
+    /// the chain. Absent a call to this, the chain and every address this
+    /// board would occupy are untouched -- the same "nothing changes
+    /// unless attached" guarantee [`Self::with_mirage`]/
+    /// [`Self::with_hostblk`] already give, and the reason a `--fast-ram`
+    /// flag can default to off without perturbing any existing baseline.
+    /// `mem.len()` need not be one of the extended-table's discrete
+    /// sizes; the board declares the next size up and anything past the
+    /// real buffer simply reads open bus / discards writes, same as an
+    /// undersized VRAM backing store (`fastram` module docs).
+    pub fn with_fast_ram(mut self, mem: &'a mut [u8]) -> Self {
+        self.fast_ram_board = self
+            .autoconfig
+            .add_board(fastram::autoconfig_board_spec(mem.len() as u32));
+        self.fast_ram = Some(mem);
         self
     }
 
@@ -569,6 +645,11 @@ impl<'a> MachineBus<'a> {
                 }
                 None => OPEN_BUS_BYTE,
             }
+        } else if let Some(offset) = self.fast_ram_target(address) {
+            match &self.fast_ram {
+                Some(mem) => mem.get(offset as usize).copied().unwrap_or(OPEN_BUS_BYTE),
+                None => OPEN_BUS_BYTE,
+            }
         } else if let Some(offset) = self.hostblk_target(address) {
             match &self.hostblk {
                 Some(h) => h.read(offset),
@@ -596,6 +677,20 @@ impl<'a> MachineBus<'a> {
     /// other board. See [`Self::mirage_target`], the same shape.
     fn hostblk_target(&self, address: u32) -> Option<u32> {
         let idx = self.hostblk_board?;
+        if self.autoconfig.board_at(address) != Some(idx) {
+            return None;
+        }
+        let base = self.autoconfig.placement(idx)?.base;
+        Some(address - base)
+    }
+
+    /// Whether `address` falls inside fast RAM's configured AUTOCONFIG
+    /// window, and if so, the board-relative offset. `None` whenever no
+    /// board is attached ([`Self::fast_ram_board`] is `None` until
+    /// [`Self::with_fast_ram`] runs) or the address belongs to some other
+    /// board. See [`Self::mirage_target`], the same shape.
+    fn fast_ram_target(&self, address: u32) -> Option<u32> {
+        let idx = self.fast_ram_board?;
         if self.autoconfig.board_at(address) != Some(idx) {
             return None;
         }
@@ -785,6 +880,12 @@ impl<'a> MachineBus<'a> {
                     self.chipset.raise_int(chipset::intbit::PORTS);
                 }
             }
+        } else if let Some(offset) = self.fast_ram_target(address) {
+            if let Some(mem) = &mut self.fast_ram {
+                if let Some(slot) = mem.get_mut(offset as usize) {
+                    *slot = value;
+                }
+            }
         } else if let Some(offset) = self.hostblk_target(address) {
             if let Some(h) = &mut self.hostblk {
                 h.write(offset, value);
@@ -823,6 +924,58 @@ impl<'a> MachineBus<'a> {
     pub fn write_long(&mut self, address: u32, value: u32) {
         self.write_word(address, (value >> 16) as u16);
         self.write_word(address.wrapping_add(2), value as u16);
+    }
+
+    /// `[addr, addr + len)`'s position within chip RAM, if it lies
+    /// entirely inside it. Shared by both [`GuestMemory`] methods below.
+    fn chip_ram_span(&self, addr: u32, len: u32) -> Option<core::ops::Range<usize>> {
+        let end = addr.checked_add(len)?;
+        if end > CHIP_RAM_END {
+            return None;
+        }
+        let start = (addr - CHIP_RAM_BASE) as usize;
+        Some(start..start + len as usize)
+    }
+
+    /// `[addr, addr + len)`'s position within fast RAM's *real* backing
+    /// store, if fast RAM is attached, configured, and the whole span
+    /// lies inside both its declared AUTOCONFIG window and the actual
+    /// buffer a board layer supplied (which may be shorter than the
+    /// window -- `with_fast_ram`'s doc comment). The AUTOCONFIG base is
+    /// never assumed here: it comes from `self.autoconfig.placement`,
+    /// wherever `expansion.library` actually put it.
+    fn fast_ram_span(&self, addr: u32, len: u32) -> Option<core::ops::Range<usize>> {
+        let idx = self.fast_ram_board?;
+        let placement = self.autoconfig.placement(idx)?;
+        let end = addr.checked_add(len)?;
+        if addr < placement.base || end > placement.base.checked_add(placement.size_bytes)? {
+            return None;
+        }
+        let start = (addr - placement.base) as usize;
+        let end = start + len as usize;
+        (end <= self.fast_ram.as_ref()?.len()).then_some(start..end)
+    }
+}
+
+impl<'a> GuestMemory for MachineBus<'a> {
+    fn ram_slice(&self, addr: u32, len: u32) -> Option<&[u8]> {
+        if let Some(span) = self.chip_ram_span(addr, len) {
+            return Some(&self.chip_ram[span]);
+        }
+        if let Some(span) = self.fast_ram_span(addr, len) {
+            return Some(&self.fast_ram.as_ref()?[span]);
+        }
+        None
+    }
+
+    fn ram_slice_mut(&mut self, addr: u32, len: u32) -> Option<&mut [u8]> {
+        if let Some(span) = self.chip_ram_span(addr, len) {
+            return Some(&mut self.chip_ram[span]);
+        }
+        if let Some(span) = self.fast_ram_span(addr, len) {
+            return Some(&mut self.fast_ram.as_mut()?[span]);
+        }
+        None
     }
 }
 
@@ -1624,5 +1777,165 @@ mod tests {
         let mut check = [0u8; gayle::SECTOR_BYTES];
         disk.read_sector(0, &mut check);
         assert_eq!(&check[..], &pattern[..]);
+    }
+
+    // ---- fast RAM wiring ------------------------------------------------
+
+    #[test]
+    fn no_fast_ram_leaves_the_chain_empty_and_everything_else_unaffected() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let bus = new_bus(&mut ram, &rom);
+
+        assert_eq!(bus.fast_ram_board, None);
+        assert_eq!(bus.autoconfig.board_at(0x4000_0000), None);
+    }
+
+    #[test]
+    fn with_fast_ram_registers_a_zorro_iii_memlist_board() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut fast = std::vec![0u8; 0x0100_0000]; // 16 MB
+        let mut bus = new_bus(&mut ram, &rom).with_fast_ram(&mut fast);
+
+        assert_eq!(bus.fast_ram_board, Some(0));
+        assert_eq!(
+            bus.autoconfig.read(autoconfig::AUTOCONFIG_BASE + 4) >> 4,
+            !fastram::PRODUCT >> 4,
+            "fast RAM's own product number answers at chain index 0"
+        );
+        // er_Type (byte 0, uncomplemented) must carry ERTF_MEMLIST -- the
+        // entire point of this board (fastram module docs): without it
+        // expansion.library would never add this RAM to the free pool.
+        assert_eq!(
+            bus.autoconfig.read(autoconfig::AUTOCONFIG_BASE) & (autoconfig::ERTF_MEMLIST << 4),
+            autoconfig::ERTF_MEMLIST << 4
+        );
+    }
+
+    #[test]
+    fn configured_fast_ram_routes_reads_and_writes_and_clips_past_the_real_buffer() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut fast = std::vec![0u8; 0x0100_0000]; // 16 MB real backing store
+        let mut bus = new_bus(&mut ram, &rom).with_fast_ram(&mut fast);
+
+        let base = 0x4000_0000u32;
+        configure_hostblk_z3(&mut bus, base); // same Z3 base-write sequence
+
+        assert_eq!(bus.autoconfig.placement(0).map(|p| p.base), Some(base));
+
+        bus.write_byte(base + 0x1234, 0xAB);
+        assert_eq!(bus.read_byte(base + 0x1234), 0xAB);
+
+        // Chip RAM stays untouched by a fast-RAM write at an unrelated
+        // address -- the two regions are disjoint address spaces, not
+        // aliases of one array.
+        assert_eq!(bus.read_byte(0x0000_1234), OPEN_BUS_BYTE.wrapping_sub(0xFF));
+
+        // Right at the end of the real 16 MB buffer: still routes.
+        bus.write_byte(base + 0x00FF_FFFF, 0xCD);
+        assert_eq!(bus.read_byte(base + 0x00FF_FFFF), 0xCD);
+    }
+
+    #[test]
+    fn fast_ram_alongside_zorro_ii_graphics_leaves_graffitys_placement_untouched() {
+        // Zorro II boards draw from the 24-bit Z2 pool; a Zorro III fast-
+        // RAM board draws from the separate Z3 pool at $40000000 and up
+        // (autoconfig module docs on Z2 vs Z3 base-write mechanics). They
+        // are different chain *entries* answering at different physical
+        // windows, so registering fast RAM first must not change which
+        // address Graffity's own `EC_BASEADDRESS` byte write lands at --
+        // only chain *order* (which board answers when) could do that,
+        // and Zorro II configuration addresses Graffity directly via its
+        // own byte write regardless of how many Zorro III boards precede
+        // it in the chain.
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut fast = std::vec![0u8; 0x0100_0000];
+        let mut vram = std::vec![0u8; 0x0020_0000];
+        let mut bus = new_bus(&mut ram, &rom)
+            .with_fast_ram(&mut fast)
+            .with_graphics(&mut vram);
+
+        // Fast RAM is chain index 0 (registered first), Graffity's VRAM
+        // and register boards are indices 1 and 2.
+        assert_eq!(bus.fast_ram_board, Some(0));
+
+        // Configure fast RAM's Z3 window, then Graffity's two Z2 boards,
+        // exactly as `expansion.library` would walk the chain in order.
+        configure_hostblk_z3(&mut bus, 0x4000_0000);
+        configure_graffity(&mut bus, 0x20, 0x50);
+
+        assert_eq!(
+            bus.autoconfig.placement(1).map(|p| p.base),
+            Some(0x0020_0000),
+            "Graffity VRAM lands exactly where the Z2 byte write says, \
+             independent of the Z3 board ahead of it in the chain"
+        );
+        assert_eq!(
+            bus.autoconfig.placement(2).map(|p| p.base),
+            Some(0x0050_0000)
+        );
+    }
+
+    // ---- GuestMemory: the seam `hostblk` needs (brief item 4) -----------
+
+    #[test]
+    fn guest_memory_resolves_chip_ram_and_rejects_out_of_range() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom);
+
+        GuestMemory::ram_slice_mut(&mut bus, 0x1000, 4)
+            .unwrap()
+            .copy_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(
+            GuestMemory::ram_slice(&bus, 0x1000, 4),
+            Some(&[1, 2, 3, 4][..])
+        );
+
+        // Straddling the end of chip RAM: rejected, not silently clipped.
+        assert_eq!(
+            GuestMemory::ram_slice(&bus, CHIP_RAM_END - 2, 4),
+            None,
+            "must not return a short slice or wrap into fast RAM/open bus"
+        );
+        // A length whose end overflows u32 must not panic.
+        assert_eq!(GuestMemory::ram_slice(&bus, u32::MAX - 1, 8), None);
+    }
+
+    #[test]
+    fn guest_memory_resolves_fast_ram_at_its_autoconfig_placed_base() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut fast = std::vec![0u8; 0x0100_0000]; // 16 MB
+        let mut bus = new_bus(&mut ram, &rom).with_fast_ram(&mut fast);
+
+        // Unconfigured yet: no address should resolve, including the
+        // address it will eventually land at -- there is no address to
+        // hardcode here, which is the entire point.
+        assert_eq!(GuestMemory::ram_slice(&bus, 0x4000_0000, 4), None);
+
+        let base = 0x4000_0000u32;
+        configure_hostblk_z3(&mut bus, base); // same Z3 write sequence
+
+        GuestMemory::ram_slice_mut(&mut bus, base + 0x2000, 4)
+            .unwrap()
+            .copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(
+            GuestMemory::ram_slice(&bus, base + 0x2000, 4),
+            Some(&[0xDE, 0xAD, 0xBE, 0xEF][..])
+        );
+
+        // Past the real 16 MB backing store but still inside the
+        // declared AUTOCONFIG window: rejected, not a panic.
+        assert_eq!(
+            GuestMemory::ram_slice(&bus, base + 0x0100_0000 - 2, 4),
+            None
+        );
+        // A span crossing from fast RAM into whatever (if anything)
+        // follows it must not be silently accepted as a short read.
+        assert_eq!(GuestMemory::ram_slice(&bus, base - 2, 4), None);
     }
 }

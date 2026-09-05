@@ -198,6 +198,21 @@ pub struct Args {
     /// nothing observable (`blitter_trace.rs`'s module doc comment).
     #[arg(long)]
     pub blitter_trace: Option<PathBuf>,
+
+    /// Attach fast RAM (`machine_core::fastram`) over heap-allocated
+    /// storage, sized in megabytes, and register its single Zorro III
+    /// AUTOCONFIG board (`ERTF_MEMLIST` set, so `expansion.library` links
+    /// it into the system free-memory list with no driver of ours). Off
+    /// by default: an extra AUTOCONFIG board changes the chain, which can
+    /// move the base address a `--graphics-bus 3` Graffity card is
+    /// assigned (the two share the Zorro III address pool; a Zorro II
+    /// `--graphics` card, the default, is unaffected -- it draws from a
+    /// separate pool). Verify with `--inspect`'s `MemList` walk, which is
+    /// the only real evidence the guest adopted the memory rather than
+    /// this bus merely answering for it (`docs/device-ledger.md`'s fast
+    /// RAM row).
+    #[arg(long)]
+    pub fast_ram_mb: Option<u32>,
 }
 
 /// CLI surface for [`machine_core::cia::FloppyPresence`] -- kept as a

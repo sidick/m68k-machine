@@ -19,7 +19,7 @@ One Zorro III AUTOCONFIG board:
 
 | Field | Value |
 |---|---|
-| `er_Manufacturer` | `0xFFFF` — **placeholder, unallocated**. Sits outside the historically-assigned Zorro manufacturer range on purpose, so this board is unmistakably a development stand-in. Must be replaced with a real registered manufacturer number before this ships on hardware or as a Copperline plugin (ADR 0003 requires MIT licensing for exactly that reuse). |
+| `er_Manufacturer` | `0x07DB` (2011) — the **reserved "hacker" ID** NDK 3.2 `libraries/configregs.h` sets aside for test use. Was `0xFFFF` until the fast RAM work found real Kickstart 3.2.2 *silently rejects* that value for a board it is asked to add to the memory list, with the base-address write never landing and no error anywhere. This card is not a memory board so it never hit that, but carrying an ID the ROM is known to reject is a trap for whoever next sets `ERTF_MEMLIST`. Still a stand-in: a real registered number is needed before this ships on hardware or as a Copperline plugin (ADR 0003 requires MIT licensing for exactly that reuse). |
 | `er_Product` | `1` — distinct from `mirage`'s `0`, so the two boards remain distinguishable if both are attached at once. |
 | `er_Type` | `ERT_ZORROIII` (extended-table code 0 → 16 MB window; no size bits of its own) |
 | `er_Flags` | `ERFF_ZORRO_III \| ERFF_EXTENDED` |
@@ -65,9 +65,9 @@ byte, never transmutes):
 | `0x08` | 8 | `offset` | byte offset into the unit; multiple of 512; ignored for `FLUSH` |
 | `0x10` | 4 | `buffer` | guest RAM address of the transfer buffer; ignored for `FLUSH` |
 
-The driver allocates this in guest RAM (chip RAM only in this
-increment — there is no fast RAM/Zorro III memory in `machine-core`
-yet), fills it in, and writes its address to `DOORBELL`.
+The driver allocates this in guest RAM (chip RAM only for now -- this
+card's own bounds check has not yet been updated to also accept fast
+RAM, §12), fills it in, and writes its address to `DOORBELL`.
 
 ## 4. Register map
 
@@ -262,6 +262,13 @@ yet — that is driver/interrupt-server work for when the driver exists.
   cannot boot a machine unaided yet.
 - No `TD_ADDCHANGEINT`/change-interrupt delivery to the guest — the
   change counter exists, nothing wakes a waiting task on it yet.
-- No fast RAM / Zorro III memory support: descriptor and buffer
-  addresses must lie in chip RAM (`0..CHIP_RAM_SIZE`).
+- Descriptor and buffer addresses still must lie in chip RAM
+  (`0..CHIP_RAM_SIZE`) -- `machine-core` now has fast RAM
+  (`fastram.rs`, `docs/device-ledger.md`'s fast RAM row), but this
+  card's bounds check has not been updated to reach it yet. The seam it
+  needs (`GuestMemory::ram_slice`/`ram_slice_mut` on `MachineBus`,
+  which already resolves both chip RAM and any attached fast RAM
+  without hardcoding either range) exists in `lib.rs`; only this file's
+  own `read_descriptor`/`transfer` signatures and the `MachineBus::tick`
+  call site remain.
 - No write caching, hence no real flush underneath `FLUSH` (§10).

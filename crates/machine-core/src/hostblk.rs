@@ -256,14 +256,24 @@
 use crate::autoconfig::{BoardSpec, ERT_ZORROIII};
 use crate::gayle::{BlockDevice, SECTOR_BYTES};
 
-/// **Placeholder, unallocated** — same posture as `mirage::MANUFACTURER`
-/// and the same caveat: `0xFFFF` sits outside the historically-allocated
-/// Zorro manufacturer range and marks this board unmistakably as a
-/// development stand-in, not a real assignment. Whoever carries this
-/// forward into hardware (or ships it as a Copperline plugin, ADR 0003's
-/// "MIT licensed... usable by MIRAGE hardware and by Copperline plugins"
-/// requirement) needs to register a real manufacturer number first.
-pub const MANUFACTURER: u16 = 0xFFFF;
+/// **Placeholder, but a *reserved* one.** NDK 3.2
+/// `libraries/configregs.h` sets aside manufacturer 2011 (`$7DB`) for
+/// exactly this: "A special \"hacker\" Manufacturer ID number is
+/// reserved for test use: 2011 ($7DB)."
+///
+/// This was `0xFFFF` until the fast RAM work found real Kickstart 3.2.2
+/// **silently rejects** that value for a board it is asked to add to the
+/// memory list -- the AUTOCONFIG base-address write simply never lands,
+/// with no error anywhere. This card is not a memory board so it never
+/// hit that, but carrying an ID the ROM is known to reject is a trap
+/// waiting for whoever next sets `ERTF_MEMLIST` or wonders why a board
+/// vanished. Product numbers stay distinct, so sharing the manufacturer
+/// with `fastram`/`mirage` costs nothing.
+///
+/// Still a stand-in: whoever carries this into hardware (or ships it as
+/// a Copperline plugin, per ADR 0003's MIT-licensing requirement) needs
+/// a real registered manufacturer number.
+pub const MANUFACTURER: u16 = 0x07DB;
 
 /// This card's product number under [`MANUFACTURER`] — distinct from
 /// `mirage::PRODUCT` (`0`) so the two boards remain distinguishable by

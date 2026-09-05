@@ -67,6 +67,47 @@ Where emulation is chosen anyway, it lands in the table below as
 **bring-up**, with a named successor and a retirement criterion, in the
 same change that introduces it.
 
+## The rule for addresses
+
+**Do not assume or hardcode memory locations.** AUTOCONFIG exists to
+allocate ranges dynamically, and nothing downstream of it should encode
+a guess about where a board landed. Fixed addresses are legitimate only
+where the real hardware fixes them — Gayle's register window, the custom
+chip registers, the ROM overlay — and those are the permanent rows
+below, not new work.
+
+The failure mode is subtle enough to be worth naming, because the
+project walked into it once. `hostblk` validated guest addresses against
+`0..CHIP_RAM_SIZE`, which was true when chip RAM was the only RAM. When
+fast RAM arrived, the tempting fix was to add the second range to the
+check — which would have hardcoded *two* assumptions instead of one, and
+broken again on the third region, or as soon as an AUTOCONFIG-assigned
+base moved.
+
+The right shape is to **ask whatever owns the memory map** rather than
+compare against constants. `MachineBus` is the only thing that
+legitimately knows the layout, so a device that needs to validate a
+guest address asks it. If you find yourself writing an address constant
+or a range comparison for something AUTOCONFIG placed, that is the
+signal to route the question back rather than to widen the constant.
+
+That seam now exists: `lib.rs` defines a `GuestMemory` trait
+(`ram_slice`/`ram_slice_mut`, validated `[addr, addr+len)` views) and
+implements it on `MachineBus`, checking chip RAM's fixed range and fast
+RAM's AUTOCONFIG-placed one (`self.autoconfig.placement`, never a
+hardcoded base) without either range living anywhere but that one
+implementation. `hostblk.rs`'s own `0..CHIP_RAM_SIZE` check has not been
+changed to use it yet — that file is owned by whoever reviews this
+change, per this project's file-ownership convention — but the seam it
+would call through is ready: `tick`/`execute`/`read_descriptor`/
+`transfer` would take `&(mut) dyn GuestMemory` instead of `ram: &mut
+[u8]`, and the `MachineBus::tick` call site would need the `Option::take`
+dance (`let Some(mut h) = self.hostblk.take() { h.tick(self); ...
+self.hostblk = Some(h); }`) to hand `hostblk` a `&mut dyn GuestMemory`
+view of `self` while `self.hostblk` itself is also borrowed — two
+disjoint borrows of `self`'s fields, not a conflict, but only once
+`hostblk` no longer occupies one of them for the duration.
+
 ## The ledger
 
 | Device | Status | Successor | Retires when |
@@ -75,6 +116,7 @@ same change that introduces it.
 | Custom registers + interrupts | permanent | — | never; same |
 | ROM overlay / mirroring | permanent | — | never; part of the machine |
 | Zorro AUTOCONFIG | permanent | — | never; this is how native boards attach |
+| Fast RAM (`fastram`) | permanent | — | never; it is memory, not an emulation of a product |
 | Floppy "no drive attached" | permanent | — | never; models absence, not a drive |
 | Planar renderer | capped | RTG | never fully; stops growing (below) |
 | Blitter | capped | RTG | never fully; stops growing (below) |
@@ -95,6 +137,41 @@ reset vector fetch at `$000000` depends on it.
 legacy in spirit — it is the standard mechanism by which a board
 announces itself, and it is how *native* boards will attach too. It gets
 more load-bearing as the machine becomes less emulated, not less.
+
+**Fast RAM** — `fastram.rs`. A Zorro III AUTOCONFIG memory board
+(`ERTF_MEMLIST` set) over caller-owned storage, exactly like chip RAM and
+VRAM: this crate has no allocator, so it borrows rather than owns. It is
+listed as permanent rather than bring-up because it is not standing in
+for a piece of silicon this machine lacks — it is memory, the same way
+chip RAM is, just reachable a different way. `hostblk` is the immediate
+reason it exists (its transfer buffers were confined to the 2 MB chip
+window purely because that was all there was), but any `MEMF_FAST`
+allocation benefits.
+
+Confirmed adopted by real Kickstart 3.2.2 (`nondistribution/
+A1200.47.115.rom`), not merely accepted by this bus: `--inspect`'s
+`MemList` walk shows a second `MemHeader` (`FAST|PUBLIC`, matching the
+requested size) alongside chip RAM's own entry, and cross-checked byte
+-for-byte against Copperline (this project's oracle) booting the same
+ROM with its own Zorro III fast RAM — both place `ExecBase` itself at
+the identical address once fast RAM is available (`$4000089c` for a
+16 MB board), which is a real AmigaOS behaviour (Kickstart relocates
+`ExecBase` into fast memory once it exists), not an artefact of either
+emulator. See `fastram.rs`'s module docs for the full reasoning trail
+(why AUTOCONFIG rather than a fixed accelerator-style address, and the
+Zorro III extended-size table), and this file's "rule for addresses"
+above for the `hostblk`-facing seam ([`GuestMemory`], implemented on
+`MachineBus` in `lib.rs`) this board's arrival made necessary.
+
+Off by default (`machine-hosted --fast-ram-mb N`): registering an extra
+AUTOCONFIG board changes the chain, and where fast RAM sits in it
+relative to a Zorro III Graffity card (`--graphics-bus 3`) can move that
+card's assigned base address and, with it, the RTG screenshot baseline.
+`machine-hosted` registers fast RAM *after* `--graphics` specifically so
+Graffity is always offered to the chain first regardless of whether
+`--fast-ram-mb` is set — confirmed empirically that both the planar and
+both RTG (Zorro II and Zorro III) baselines stay byte-identical with the
+flag on, at 16 MB through 1 GB.
 
 **Floppy "no drive attached"** models the absence of hardware rather
 than the presence of it. It exists because Kickstart hangs on a black

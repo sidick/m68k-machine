@@ -211,20 +211,24 @@
 use crate::autoconfig::{BoardSpec, ERT_ZORROII};
 use crate::gayle::{BlockDevice, SECTOR_BYTES};
 
-/// **Placeholder, unallocated.** The proposal (§4) states plainly that
-/// MIRAGE's manufacturer/product numbers are TBD. Real Zorro
-/// manufacturer IDs are small, densely-packed numbers CBM/the Amiga
-/// Developers registry assigned to real vendors (e.g. Atéo Concepts'
-/// 2092 in `graffity.rs`); `0xFFFF` is not one of those; it sits outside
-/// the historically-allocated range and several published Zorro ID
-/// lists carry it (or its ilk) as an explicit "invalid/reserved, not for
-/// use on real hardware" sentinel. Using it here means this board is
-/// unmistakably a development stand-in rather than a squat on a real
-/// vendor's identity — but it is **not a real assignment**, and whoever
-/// carries this forward into hardware needs to register (or borrow, the
-/// way `autoconfig.rs`'s docs note some driver-authored boards already
-/// do) an actual manufacturer number before this ships.
-pub const MANUFACTURER: u16 = 0xFFFF;
+/// **Placeholder, but a *reserved* one.** NDK 3.2
+/// `libraries/configregs.h` sets aside manufacturer 2011 (`$7DB`) for
+/// exactly this: "A special \"hacker\" Manufacturer ID number is
+/// reserved for test use: 2011 ($7DB)."
+///
+/// This was `0xFFFF` until the fast RAM work found real Kickstart 3.2.2
+/// **silently rejects** that value for a board it is asked to add to the
+/// memory list -- the AUTOCONFIG base-address write simply never lands,
+/// with no error anywhere. This card is not a memory board so it never
+/// hit that, but carrying an ID the ROM is known to reject is a trap
+/// waiting for whoever next sets `ERTF_MEMLIST` or wonders why a board
+/// vanished. Product numbers stay distinct, so sharing the manufacturer
+/// with `fastram`/`mirage` costs nothing.
+///
+/// Still a stand-in: whoever carries this into hardware (or ships it as
+/// a Copperline plugin, per ADR 0003's MIT-licensing requirement) needs
+/// a real registered manufacturer number.
+pub const MANUFACTURER: u16 = 0x07DB;
 
 /// MIRAGE's only product number so far; meaningless while
 /// [`MANUFACTURER`] is a placeholder.

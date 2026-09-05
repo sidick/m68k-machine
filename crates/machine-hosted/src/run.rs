@@ -258,6 +258,16 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         Vec::new()
     };
 
+    // Same "only allocated at all when asked for" shape as `graphics_vram`
+    // above: a plain boot run pays nothing for fast RAM, and the flag's
+    // absence must leave the AUTOCONFIG chain (and so every existing
+    // baseline) untouched -- `MachineBus::with_fast_ram`'s own doc
+    // comment on why this is off by default.
+    let mut fast_ram: Vec<u8> = match args.fast_ram_mb {
+        Some(mb) => vec![0u8; mb as usize * 1024 * 1024],
+        None => Vec::new(),
+    };
+
     let machine_bus = MachineBus::new(&mut chip_ram, &rom_bytes);
     let machine_bus = match &ext_rom_bytes {
         Some(ext) => machine_bus.with_ext_rom(ext),
@@ -291,6 +301,31 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         }
     } else {
         machine_bus
+    };
+    // Registered *after* `--graphics`, deliberately: Zorro II and Zorro
+    // III boards are placed from separate address pools (Zorro II's
+    // 24-bit space, Zorro III's own at $40000000 and up), but a Zorro III
+    // Graffity (`--graphics-bus 3`) shares fast RAM's pool, and
+    // `expansion.library` configures whichever board is *first in the
+    // AUTOCONFIG chain* before moving to the next. Fast RAM after
+    // Graffity here means Graffity is always offered first regardless of
+    // whether `--fast-ram` is set, so its own placement never depends on
+    // fast RAM's presence -- confirmed empirically: with both flags set,
+    // Zorro III Graffity still lands at the same base address, and
+    // `--graphics-bus 3`'s screenshot baseline stays byte-identical. Were
+    // this reversed, fast RAM being 128M-Zorro-III-aligned (it must place
+    // on its own size's natural boundary, same as Graffity's Z3 window)
+    // could easily push Graffity to a different base and move the RTG
+    // baseline -- exactly the risk `docs/device-ledger.md`'s fast RAM row
+    // and this flag's own doc comment call out.
+    let machine_bus = match args.fast_ram_mb {
+        Some(mb) => {
+            console.diag(&format!(
+                "fast-ram: {mb} MB, Zorro III AUTOCONFIG board (ERTF_MEMLIST)"
+            ));
+            machine_bus.with_fast_ram(&mut fast_ram)
+        }
+        None => machine_bus,
     };
     let blitter_trace = match &args.blitter_trace {
         Some(path) => match crate::blitter_trace::BlitterTrace::open(path) {
