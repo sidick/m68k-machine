@@ -456,11 +456,32 @@ DiagStart:
 DiagMarker:
         dc.l    0
 
-* da_BootPoint's target -- never actually called (see the DiagArea
-* comment above); exists only so da_BootPoint is non-zero. Inside the
-* copied region since da_BootPoint, like da_DiagPoint, is an offset into
-* the RAM copy, not this ROM.
+* Second scratch cell, immediately after DiagMarker (offset 18), written
+* only by BootStub. It exists to answer a question this project had left
+* open: libraries/configregs.h describes DAC_CONFIGTIME as "call
+* da_BootPoint when first configing the device", which reads as
+* unconditional, but what was actually observed in Kickstart 3.2.2's
+* strap is narrower -- the call is made for a non-floppy BootNode as that
+* node's whole boot attempt. This card offers no BootNode, so the two
+* readings disagree about whether BootStub ever runs, and nothing
+* depended on the answer. A marker costs four bytes and settles it.
+BootMarker:
+        dc.l    0
+
+* da_BootPoint's target. Required non-zero purely so the DiagArea is
+* copied at all (docs/input-protocol.md section 14: DAC_NEVER removes the
+* time to run code, a zero da_BootPoint removes the code, and either way
+* nothing is copied). Inside the copied region since da_BootPoint, like
+* da_DiagPoint, is an offset into the RAM copy rather than into this ROM.
+*
+* Writes BootMarker so "is this reached?" is answerable rather than
+* assumed -- see BootMarker above. A2 is not guaranteed here the way it is
+* for DiagEntry, so the RAM copy's base is recovered from this routine's
+* own address with a PC-relative LEA instead.
 BootStub:
+        lea     BootStub(pc),a1
+        move.l  #$B007B007,(BootMarker-BootStub)(a1)
+        moveq   #1,d0
         rts
 
 *-----------------------------------------------------------------------------

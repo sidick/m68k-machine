@@ -349,6 +349,19 @@ pub const ROM_BASE: u32 = 0x1000;
 /// `hostblk::DIAG_MARKER_OFFSET` uses for `hostblk`'s own boot ROM.
 pub const DIAG_MARKER_OFFSET: u32 = 14;
 
+/// Offset into the DiagArea's RAM copy of the cell `BootStub` writes
+/// (`$B007B007`), immediately after [`DIAG_MARKER_OFFSET`]'s.
+///
+/// Answers whether `da_BootPoint` is reached on a board that offers no
+/// `BootNode`. `libraries/configregs.h` describes `DAC_CONFIGTIME` as
+/// "call da_BootPoint when first configing the device", which reads as
+/// unconditional; what was observed in Kickstart 3.2.2's strap is
+/// narrower, the call being made for a non-floppy `BootNode` as that
+/// node's whole boot attempt. This card has no boot node, so the two
+/// readings disagree, and nothing depended on the answer -- which is
+/// exactly why it was worth four bytes to stop guessing.
+pub const BOOT_MARKER_OFFSET: u32 = 18;
+
 /// Reuses `hostblk`'s reserved manufacturer ID rather than minting a
 /// second placeholder: both are the same NDK 3.2 `libraries/configregs.h`
 /// "hacker" ID (`$7DB`, decimal 2011) reserved for test use, and

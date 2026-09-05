@@ -519,14 +519,23 @@ or not it has anything to do with booting. Our input card is never a boot
 node and never will be, and it still needs a non-zero `da_BootPoint`
 pointing at a stub that is never reached, purely to satisfy this gate.
 
-One loose end, flagged rather than asserted. The header's wording implies
-`DAC_CONFIGTIME` gets `da_BootPoint` called at configuration time
-unconditionally. What was actually observed in Kickstart 3.2.2's strap
-(disassembled at `$FC746E` while chasing why `hostblk` never booted) is
-narrower: the call is made for a **non-floppy `BootNode`** whose
-`ConfigDev` carries `ERTF_DIAGVALID`, a kept diag copy and
-`DAC_CONFIGTIME`, as that node's entire boot attempt. On the input card,
-which offers no boot node, the stub is believed never to be reached —
-believed, not verified, since nothing depends on it. If a future ROM
-needs code to run at configuration time rather than from `rt_Init`, test
-that assumption before relying on it.
+That loose end is now closed, and the answer is the narrower one.
+
+The header's wording implies `DAC_CONFIGTIME` gets `da_BootPoint` called
+at configuration time unconditionally. What Kickstart 3.2.2's strap
+actually does (disassembled at `$FC746E` while chasing why `hostblk`
+never booted) is narrower: the call is made for a **non-floppy
+`BootNode`** whose `ConfigDev` carries `ERTF_DIAGVALID`, a kept diag copy
+and `DAC_CONFIGTIME`, as that node's entire boot attempt.
+
+Measured rather than argued. `BootStub` now writes `$B007B007` to a
+marker cell at `input::BOOT_MARKER_OFFSET`, reported by `--inspect`. On a
+booted machine with the input card attached and no boot node offered, it
+reads **zero**: `da_BootPoint` is never called.
+
+So on this Kickstart `DAC_CONFIGTIME` does **not** by itself get code run
+at configuration time. A board with no `BootNode` gets its DiagArea
+copied and its `da_DiagPoint` called, and that is all -- anything further
+must come from a `struct Resident`'s `rt_Init`, which is what both this
+ROM and `hostblk`'s do. A future ROM wanting code to run at configuration
+time cannot get it this way.

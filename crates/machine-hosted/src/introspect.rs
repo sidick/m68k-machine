@@ -1135,7 +1135,10 @@ pub fn format_input_state(bus: &mut MachineBus) -> String {
                 )),
                 None => out.push_str(
                     "  no DiagArea RAM copy found anywhere in chip RAM by signature scan \
-                     -- expansion.library never copied it at all\n",
+                     -- not copied there. Note this scan covers chip RAM \
+                     only, so a copy placed in fast RAM is not found by it; \
+                     trust the cd_Rom.er_Reserved0c line below over this one \
+                     when they disagree\n",
                 ),
             }
             if cd.diag_copy_addr == 0 {
@@ -1150,6 +1153,18 @@ pub fn format_input_state(bus: &mut MachineBus) -> String {
                 out.push_str(&format!(
                     "  DiagArea RAM copy kept at {:#010x} (DiagEntry returned success)\n",
                     cd.diag_copy_addr
+                ));
+                let boot_marker =
+                    bus.read_long(cd.diag_copy_addr + machine_core::input::BOOT_MARKER_OFFSET);
+                // Settles whether da_BootPoint is reached on a board with no
+                // BootNode -- see input::BOOT_MARKER_OFFSET.
+                out.push_str(&format!(
+                    "  BootMarker {boot_marker:#010x} -- da_BootPoint (BootStub) {}\n",
+                    if boot_marker == 0xB007_B007 {
+                        "WAS called, despite this board offering no BootNode"
+                    } else {
+                        "was never called; DAC_CONFIGTIME alone does not reach it without a BootNode"
+                    }
                 ));
                 out.push_str(&format!(
                     "  DiagMarker {marker:#010x}{}\n",
@@ -1231,7 +1246,10 @@ pub fn format_hostblk_state(bus: &mut MachineBus, exec_base: Option<u32>) -> Str
                 )),
                 None => out.push_str(
                     "  no DiagArea RAM copy found anywhere in chip RAM by signature scan \
-                     -- expansion.library never copied it at all\n",
+                     -- not copied there. Note this scan covers chip RAM \
+                     only, so a copy placed in fast RAM is not found by it; \
+                     trust the cd_Rom.er_Reserved0c line below over this one \
+                     when they disagree\n",
                 ),
             }
             if cd.diag_copy_addr == 0 {
