@@ -218,6 +218,34 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         None => None,
     };
 
+    // Same lifetime reasoning as `hd_device`: `with_hostblk` also
+    // borrows `&'a mut`, so this must be opened and live outside the
+    // `Option` match, ahead of `machine_bus`.
+    let mut hostblk_device = match &args.hostblk {
+        Some(path) => match FileBlockDevice::open(path, args.hostblk_writable) {
+            Ok(dev) => {
+                console.diag(&format!(
+                    "hostblk: unit 0 = {} ({} sectors, {})",
+                    path.display(),
+                    dev.sector_count(),
+                    if dev.writable() {
+                        "read-write"
+                    } else {
+                        "read-only"
+                    }
+                ));
+                Some(dev)
+            }
+            Err(e) => {
+                return setup_error(
+                    console,
+                    format!("opening --hostblk {}: {e}", path.display()),
+                )
+            }
+        },
+        None => None,
+    };
+
     // Heap-allocated, and opened (allocated) outside the `Option` match
     // below for the same lifetime reason `hd_device` is: `with_graphics`
     // borrows it `&'a mut`, so it must outlive `machine_bus`. Only
@@ -239,6 +267,16 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     console.diag(&format!("floppy: {:?}", args.floppy));
     let machine_bus = match &mut hd_device {
         Some(dev) => machine_bus.with_hd(dev),
+        None => machine_bus,
+    };
+    let machine_bus = match &mut hostblk_device {
+        // Not writable-by-default matters here too: `hostblk` is
+        // brand new (this crate's brief) and unproven end to end, same
+        // reasoning `--hd-writable`'s doc comment gives.
+        Some(dev) => {
+            let write_protect = !dev.writable();
+            machine_bus.with_hostblk(0, dev, write_protect)
+        }
         None => machine_bus,
     };
     let machine_bus = if args.graphics {

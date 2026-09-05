@@ -48,6 +48,7 @@ pub mod cirrus;
 pub mod display;
 pub mod gayle;
 pub mod graffity;
+pub mod hostblk;
 pub mod mirage;
 pub mod render;
 pub mod rom;
@@ -58,6 +59,7 @@ use chipset::Chipset;
 use cia::{Cia, CiaId, FloppyDrive, FloppyPresence};
 use gayle::{BlockDevice, Gayle};
 use graffity::Graffity;
+use hostblk::Hostblk;
 use mirage::Mirage;
 
 /// Size in bytes of the chip RAM region, `$000000`-`$1FFFFF` (2 MB).
@@ -154,6 +156,19 @@ pub struct MachineBus<'a> {
     /// [`Self::graphics_boards`] but for a card with only one board.
     mirage_board: Option<usize>,
 
+    /// `hostblk`'s doorbell block card (ADR 0003, [`hostblk`]), when the
+    /// board layer has attached at least one unit via
+    /// [`Self::with_hostblk`]. Absent by default -- with no call to
+    /// `with_hostblk`, neither its AUTOCONFIG board nor this field's
+    /// routing branch exist, so a machine with no `hostblk` attached is
+    /// completely unaffected, the same guarantee [`Self::mirage`] and
+    /// [`Self::graphics`] already give.
+    hostblk: Option<Hostblk<'a>>,
+    /// AUTOCONFIG chain index `hostblk`'s single board landed at, once
+    /// [`Self::with_hostblk`] has registered it -- the same seam shape
+    /// as [`Self::mirage_board`].
+    hostblk_board: Option<usize>,
+
     /// While set, the ROM is mirrored over the bottom of the address
     /// space so the CPU's reset vector fetch from `$000000`/`$000004`
     /// lands in ROM. Real hardware does this with Gary, driven by CIA-A
@@ -227,6 +242,8 @@ impl<'a> MachineBus<'a> {
             graphics_boards: [None; graffity::MAX_GRAFFITY_BOARDS],
             mirage: None,
             mirage_board: None,
+            hostblk: None,
+            hostblk_board: None,
             overlay: true,
         }
     }
@@ -251,6 +268,29 @@ impl<'a> MachineBus<'a> {
         }
         if let Some(m) = &mut self.mirage {
             m.attach_unit(unit, device);
+        }
+        self
+    }
+
+    /// Attach a disk to `hostblk` unit `unit` (0-7, [`hostblk::UNIT_COUNT`]),
+    /// optionally write-protected. Registers `hostblk`'s single Zorro III
+    /// AUTOCONFIG board the first time this is called; further calls with
+    /// other unit numbers just attach more units to the same card. Never
+    /// called at all, the card and its address-space routing simply don't
+    /// exist (this field's own doc comment) -- Gayle and MIRAGE stay
+    /// available regardless, all three coexist.
+    pub fn with_hostblk(
+        mut self,
+        unit: u8,
+        device: &'a mut dyn BlockDevice,
+        write_protect: bool,
+    ) -> Self {
+        if self.hostblk.is_none() {
+            self.hostblk_board = self.autoconfig.add_board(Hostblk::board_spec());
+            self.hostblk = Some(Hostblk::new());
+        }
+        if let Some(h) = &mut self.hostblk {
+            h.attach_unit(unit, device, write_protect);
         }
         self
     }
@@ -333,6 +373,20 @@ impl<'a> MachineBus<'a> {
         self.mirage.as_mut()
     }
 
+    /// Borrow the attached `hostblk` card, if [`Self::with_hostblk`] was
+    /// called -- e.g. to call [`hostblk::Hostblk::notify_media_change`],
+    /// the host-side hook standing in for a guest-triggered eject in this
+    /// increment (`hostblk` module docs).
+    pub fn hostblk(&self) -> Option<&Hostblk<'a>> {
+        self.hostblk.as_ref()
+    }
+
+    /// Mutable access to the attached `hostblk` card, see
+    /// [`Self::hostblk`].
+    pub fn hostblk_mut(&mut self) -> Option<&mut Hostblk<'a>> {
+        self.hostblk.as_mut()
+    }
+
     /// Advance time by `cpu_clocks`, ticking the frame clock and both
     /// CIAs. Call this from the CPU's `sync` hook so device time and
     /// guest time stay in step.
@@ -382,6 +436,20 @@ impl<'a> MachineBus<'a> {
         if let Some(m) = &mut self.mirage {
             m.tick();
             if m.irq_pending() {
+                self.chipset.raise_int(chipset::intbit::PORTS);
+            }
+        }
+
+        // `hostblk`'s engine advances the same way: one step per call,
+        // not scaled to `cpu_clocks` -- see `hostblk`'s module docs on
+        // why "at most one request per tick" is the right grain here,
+        // and why this may run entirely independently of MIRAGE and
+        // Gayle (all three coexist). `self.chip_ram` is a disjoint field
+        // from `self.hostblk`, the same borrow shape `run_blitter`
+        // already relies on for the blitter's own guest-RAM access.
+        if let Some(h) = &mut self.hostblk {
+            h.tick(self.chip_ram);
+            if h.irq_pending() {
                 self.chipset.raise_int(chipset::intbit::PORTS);
             }
         }
@@ -501,9 +569,38 @@ impl<'a> MachineBus<'a> {
                 }
                 None => OPEN_BUS_BYTE,
             }
+        } else if let Some(offset) = self.hostblk_target(address) {
+            match &self.hostblk {
+                Some(h) => h.read(offset),
+                // `hostblk::Hostblk::read` never asserts an interrupt as
+                // a side effect of reading -- unlike Gayle/MIRAGE, no
+                // register read here changes engine state (module docs:
+                // discovery registers are pure queries, and the
+                // completion queue only ever drains via
+                // `COMPLETION_ADVANCE`, a write) -- so there is no
+                // read-path interrupt check to mirror here. Still routed
+                // through the same `Option` shape as Gayle/MIRAGE for
+                // consistency, not because this arm needs it.
+                None => OPEN_BUS_BYTE,
+            }
         } else {
             OPEN_BUS_BYTE
         }
+    }
+
+    /// Whether `address` falls inside `hostblk`'s configured AUTOCONFIG
+    /// window, and if so, the board-relative offset -- the input to
+    /// [`hostblk::Hostblk::read`]/[`hostblk::Hostblk::write`]. `None`
+    /// whenever no card is attached ([`Self::hostblk_board`] is `None`
+    /// until [`Self::with_hostblk`] runs) or the address belongs to some
+    /// other board. See [`Self::mirage_target`], the same shape.
+    fn hostblk_target(&self, address: u32) -> Option<u32> {
+        let idx = self.hostblk_board?;
+        if self.autoconfig.board_at(address) != Some(idx) {
+            return None;
+        }
+        let base = self.autoconfig.placement(idx)?.base;
+        Some(address - base)
     }
 
     /// Whether `address` falls inside MIRAGE's configured AUTOCONFIG
@@ -685,6 +782,21 @@ impl<'a> MachineBus<'a> {
             if let Some(m) = &mut self.mirage {
                 m.write(offset, value);
                 if m.irq_pending() {
+                    self.chipset.raise_int(chipset::intbit::PORTS);
+                }
+            }
+        } else if let Some(offset) = self.hostblk_target(address) {
+            if let Some(h) = &mut self.hostblk {
+                h.write(offset, value);
+                // A `DOORBELL` write can never itself raise INT2 --
+                // `hostblk`'s module docs' "Deferred completion" section
+                // is the whole point of this check being a no-op today.
+                // Kept for the same reason Gayle/MIRAGE check after
+                // every write rather than only where it currently
+                // matters: a future register (e.g. an immediate-reject
+                // path) raising synchronously must not require
+                // remembering to add this check back in.
+                if h.irq_pending() {
                     self.chipset.raise_int(chipset::intbit::PORTS);
                 }
             }
@@ -1396,5 +1508,121 @@ mod tests {
         disk.read_sector(5, &mut check);
         assert_eq!(check[0], 0);
         assert_eq!(check[4], 1);
+    }
+
+    // ---- hostblk wiring: brief item 7 ("all three coexist", "unaffected") -
+
+    #[test]
+    fn no_hostblk_leaves_the_chain_empty_and_everything_else_unaffected() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let bus = new_bus(&mut ram, &rom);
+
+        assert_eq!(bus.hostblk_board, None);
+        assert!(bus.hostblk().is_none());
+        assert_eq!(bus.autoconfig.board_at(0x4000_0000), None);
+    }
+
+    #[test]
+    fn with_hostblk_registers_one_zorro_iii_board_alongside_mirage_and_gayle() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut hd = MirageDisk::new(8);
+        let mut mirage_disk = MirageDisk::new(8);
+        let mut hostblk_disk = MirageDisk::new(64);
+        let mut bus = new_bus(&mut ram, &rom)
+            .with_hd(&mut hd)
+            .with_mirage(0, &mut mirage_disk)
+            .with_hostblk(0, &mut hostblk_disk, false);
+
+        // All three storage devices coexist: MIRAGE at chain index 0,
+        // hostblk at index 1, Gayle unaffected (it isn't on the
+        // AUTOCONFIG chain at all).
+        assert!(bus.mirage().is_some());
+        assert!(bus.hostblk().is_some());
+        assert_eq!(bus.mirage_board, Some(0));
+        assert_eq!(bus.hostblk_board, Some(1));
+        assert_eq!(
+            bus.autoconfig.read(autoconfig::AUTOCONFIG_BASE + 4) >> 4,
+            !hostblk::PRODUCT >> 4,
+            "hostblk's own product number, not MIRAGE's, answers at chain index 1"
+        );
+    }
+
+    /// Configure `hostblk`'s single Zorro III board at `base`, via the
+    /// two-byte-write sequence to `EC_Z3_BASEADDRESS` (autoconfig module
+    /// docs).
+    fn configure_hostblk_z3(bus: &mut MachineBus, base: u32) {
+        bus.write_byte(
+            autoconfig::AUTOCONFIG_BASE + autoconfig::ec::Z3_BASEADDRESS,
+            (base >> 24) as u8,
+        );
+        bus.write_byte(
+            autoconfig::AUTOCONFIG_BASE + autoconfig::ec::Z3_BASEADDRESS + 1,
+            (base >> 16) as u8,
+        );
+    }
+
+    #[test]
+    fn configured_hostblk_routes_its_window_and_completes_a_transfer_via_int2() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut disk = MirageDisk::new(64);
+        let mut bus = new_bus(&mut ram, &rom).with_hostblk(0, &mut disk, false);
+        let base = 0x4000_0000u32;
+        configure_hostblk_z3(&mut bus, base);
+        assert_eq!(bus.autoconfig.placement(0).map(|p| p.base), Some(base));
+
+        bus.write_byte(base + hostblk::reg::INT_ENABLE + 3, 1);
+
+        // Build a descriptor directly in guest chip RAM: WRITE, unit 0,
+        // one sector, device offset 0, buffer at 0x2000.
+        let desc_addr = 0x1000u32;
+        let buf_addr = 0x2000u32;
+        let pattern: std::vec::Vec<u8> = (0..gayle::SECTOR_BYTES as u32).map(|i| i as u8).collect();
+        for (i, &b) in pattern.iter().enumerate() {
+            bus.write_byte(buf_addr + i as u32, b);
+        }
+        bus.write_byte(desc_addr, hostblk::cmd::WRITE);
+        bus.write_byte(desc_addr + 1, 0); // unit
+        bus.write_long(desc_addr + 4, gayle::SECTOR_BYTES as u32); // length
+        bus.write_long(desc_addr + 8, 0); // offset hi
+        bus.write_long(desc_addr + 12, 0); // offset lo
+        bus.write_long(desc_addr + 16, buf_addr); // buffer
+
+        bus.write_long(base + hostblk::reg::DOORBELL, desc_addr);
+
+        // Not landed yet: doorbell write alone must not complete anything.
+        let ports = 1u16 << chipset::intbit::PORTS;
+        assert_eq!(
+            bus.read_long(base + hostblk::reg::COMPLETION_PTR),
+            0,
+            "nothing completed before the first tick"
+        );
+        assert_eq!(
+            bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
+            0
+        );
+
+        bus.tick(1); // MachineBus::tick's hostblk arm executes the request
+        assert_eq!(
+            bus.read_long(base + hostblk::reg::COMPLETION_PTR),
+            desc_addr
+        );
+        assert_eq!(
+            bus.read_byte(base + hostblk::reg::COMPLETION_ERROR + 3),
+            hostblk::err::OK
+        );
+        assert_ne!(
+            bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
+            0,
+            "the completed write raised PORTS via MachineBus::tick's hostblk arm"
+        );
+
+        // The bytes really landed in the backing store, independent of
+        // the register path above.
+        let mut check = [0u8; gayle::SECTOR_BYTES];
+        disk.read_sector(0, &mut check);
+        assert_eq!(&check[..], &pattern[..]);
     }
 }

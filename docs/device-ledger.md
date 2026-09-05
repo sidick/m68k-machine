@@ -102,9 +102,21 @@ screen without an answer, and matches a real A1200 with no drive fitted.
 There is nothing to retire.
 
 **`hostblk` doorbell card.** The machine's own storage, and what Gayle
-retires into. A doorbell-plus-descriptor card whose data path runs on
-the host, with INT2 completion — see ADR 0003 for why the boot path is
-not PIO. Not yet built.
+retires into. A doorbell-plus-descriptor Zorro III card whose transfer
+engine runs on the host, moving data directly to and from guest RAM
+against the same `BlockDevice` trait Gayle and MIRAGE use, with
+asynchronous completion over INT2 via a bounded completion queue — see
+ADR 0003 for why the boot path is not PIO, and `docs/hostblk-protocol.md`
+for the register/wire-format contract.
+
+*Built so far (host side only):* the register interface (`hostblk.rs`),
+the transfer engine, per-unit discovery (attached/size/write-protect/
+change-counter — the gap the MIRAGE review found missing), the
+submission and completion queues and their overflow/backpressure rules,
+and the `machine-hosted --hostblk` CLI flag. **Not yet built:** the m68k
+driver and the DiagArea boot ROM that mounts an RDB from it — this
+increment cannot boot a machine on its own, only exercise the card's
+host-side half end to end.
 
 **MIRAGE block plane** — `mirage.rs`. Native rather than bring-up: a
 board designed for this machine and driven by our own m68k code, not a

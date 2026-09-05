@@ -128,6 +128,25 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub hd_writable: bool,
 
+    /// Path to a disk image to attach to `hostblk` unit 0 (ADR 0003,
+    /// `machine_core::hostblk`) -- this machine's own doorbell block
+    /// card, and `--hd`'s eventual successor per `docs/device-ledger.md`.
+    /// Same raw-sector `.hdf` shape as `--hd`; `machine-hosted`'s
+    /// `FileBlockDevice` works unchanged behind either card (that's the
+    /// point of `hostblk` reusing `machine_core::gayle::BlockDevice`).
+    /// Omit for no `hostblk` card at all -- the increment's boot ROM and
+    /// driver do not exist yet, so this flag exists to exercise the
+    /// register interface and transfer engine, not to boot from it.
+    #[arg(long)]
+    pub hostblk: Option<PathBuf>,
+
+    /// Open `--hostblk` for writing rather than the default read-only.
+    /// Same reasoning as `--hd-writable`: this is a brand new, unproven
+    /// implementation and a licensed-media image is not cheaply
+    /// replaced if a bug corrupts it.
+    #[arg(long, default_value_t = false)]
+    pub hostblk_writable: bool,
+
     /// Attach the Graffity graphics card (`machine_core::graffity`) over
     /// heap-allocated VRAM and register its AUTOCONFIG board(s) on the
     /// chain. Without this flag nothing about the boot path changes --
