@@ -25,6 +25,16 @@
 #   sleep 5
 #   kill "$qemu_pid" 2>/dev/null
 #   grep -q "PHASE0 BOARD-QEMU-VIRT: ALL CHECKS PASSED" out.txt
+#
+# `-device ramfb`: gives the payload a real linear framebuffer to drive
+# (see `src/ramfb.rs`'s module doc comment and `docs/display-boards.md`).
+# `-display none` still keeps the *host* window headless -- ramfb's
+# surface is captured with QEMU's own monitor `screendump` command, not a
+# window, exactly as `docs/display-boards.md` does. Without this flag the
+# payload still runs and boots correctly; `ramfb.rs`'s `find_file_selector`
+# simply reports `DeviceNotPresent` and the payload narrates that over
+# serial and carries on (no display step, everything else unaffected) --
+# see `main.rs`'s `present_to_ramfb` doc comment.
 
 set -euo pipefail
 
@@ -40,6 +50,7 @@ exec qemu-system-aarch64 \
     -cpu cortex-a76 \
     -m 512M \
     -display none \
+    -device ramfb \
     -no-reboot \
     -serial stdio \
     -kernel "$elf"

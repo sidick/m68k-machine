@@ -25,17 +25,24 @@
 
 extern crate alloc;
 
+mod present;
+
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
+use alloc::vec::Vec;
 use core::arch::asm;
 use core::fmt::Write;
 use core::ptr::addr_of_mut;
 
 use m68k::{AddressBus, CpuCore, CpuType, CycleBatchControl, CycleBatchExit};
-use machine_core::{MachineBus, CHIP_RAM_SIZE, ROM_WINDOW_SIZE};
+use machine_core::display::{Framebuffer, MAX_HEIGHT, MAX_WIDTH};
+use machine_core::render::Renderer;
+use machine_core::{MachineBus, CHIP_RAM_BASE, CHIP_RAM_SIZE, ROM_WINDOW_SIZE};
+use uefi::boot::ScopedProtocol;
 use uefi::prelude::*;
+use uefi::proto::console::gop::{BltOp, BltPixel, BltRegion, GraphicsOutput};
 
 /// COM1 I/O port base, per the standard PC UART memory map.
 const COM1_PORT: u16 = 0x3F8;
@@ -159,9 +166,16 @@ fn run_checks() -> bool {
 
     let mut all_passed = true;
 
-    let open_bus_ok = bus.read_long(0x00DE_1000) == 0xFFFF_FFFF;
+    // This probed $DE1000 until Phase 3, which was the proposal's Gayle ID
+    // address -- chosen because nothing answered there, and then Gayle
+    // landed and legitimately claimed it (`gayle::GAYLE_ID_BASE`), failing
+    // the check on a correctly behaving machine. $C80000 sits in a gap the
+    // memory map actually reserves, between CIA_END ($C00000) and Gayle's
+    // window, rather than one that merely happens to be empty today.
+    const OPEN_BUS_PROBE: u32 = 0x00C8_0000;
+    let open_bus_ok = bus.read_long(OPEN_BUS_PROBE) == 0xFFFF_FFFF;
     report_check(
-        "open-bus read at $DE1000 == $FFFFFFFF",
+        "open-bus read at $C80000 == $FFFFFFFF",
         open_bus_ok,
         &mut all_passed,
     );
@@ -707,5 +721,110 @@ fn boot_aros() {
         BootOutcome::Wedged => print_line(&format!(
             "PHASE1 BOARD-QEMU-Q35: WEDGED -- {total_instructions} instructions, {frames} frames, overlay {overlay_word}, final PC {final_pc:#010x}"
         )),
+    }
+
+    // After -- never before -- the marker line above: CI polls for and
+    // then kills QEMU on an earlier line (`ci-grep-serial.sh`'s doc
+    // comment / `.github/workflows/ci.yml`), so any new narration has to
+    // land after everything CI already asserts (this project's own past
+    // CI race, referenced in the task brief this was written against).
+    present_to_gop(&mut bus);
+}
+
+/// Reconstruct chip RAM's contents through the bus's own bounds-checked
+/// read path. `MachineBus` borrows its backing array exclusively for its
+/// whole lifetime and exposes no direct slice accessor -- same constraint
+/// `machine-hosted`'s `screenshot.rs` documents for its identically-named
+/// function -- so reading every byte back out through `bus.0.read_byte`
+/// is what avoids aliasing the `&mut` `chip_ram` reference `bus` already
+/// holds. Heap-backed (`Vec`), unlike `board-qemu-virt`'s static-buffer
+/// equivalent: this board already uses the `uefi` crate's boot-services
+/// allocator for `chip_ram` itself (this function's caller), so a second
+/// 2 MB heap buffer costs nothing new. One-off cost, called once after
+/// the boot run ends, never per emulated frame.
+fn snapshot_chip_ram(bus: &mut Bus) -> Vec<u8> {
+    (0..CHIP_RAM_SIZE as u32)
+        .map(|offset| bus.0.read_byte(CHIP_RAM_BASE + offset))
+        .collect()
+}
+
+/// Render the boot run's final picture and present it through the UEFI
+/// Graphics Output Protocol, if one is available. Narrates the outcome
+/// over serial (see this function's call site for why that has to happen
+/// after the `PHASE1 BOARD-QEMU-Q35:` marker, not before).
+///
+/// **Uses `blt()`, not a raw framebuffer write.** GOP's `BltBuffer` format
+/// (`gop.rs`'s own doc comment: "BGR 24-bit ... with an 8-bit padding") is
+/// fixed regardless of the real framebuffer's `PixelFormat`/stride --
+/// firmware does the conversion to whatever the hardware actually wants,
+/// including the `PixelFormat::BltOnly` case where there is no
+/// CPU-writable framebuffer to honour a stride for at all. That sidesteps
+/// exactly the red/blue-swap and stride-vs-width mistakes a raw
+/// `frame_buffer()` pointer write would risk, at the cost of one extra
+/// buffer copy (`Vec<BltPixel>`, freed at the end of this function) --
+/// worth it for a single end-of-boot presentation that is not on any hot
+/// path.
+fn present_to_gop(bus: &mut Bus) {
+    let handle = match uefi::boot::get_handle_for_protocol::<GraphicsOutput>() {
+        Ok(h) => h,
+        Err(e) => {
+            print_line(&format!(
+                "display: no GraphicsOutput protocol handle found ({e:?}) -- skipping display presentation"
+            ));
+            return;
+        }
+    };
+    let mut gop: ScopedProtocol<GraphicsOutput> = match uefi::boot::open_protocol_exclusive::<
+        GraphicsOutput,
+    >(handle)
+    {
+        Ok(g) => g,
+        Err(e) => {
+            print_line(&format!(
+                    "display: failed to open GraphicsOutput exclusively ({e:?}) -- skipping display presentation"
+                ));
+            return;
+        }
+    };
+
+    let mode = gop.current_mode_info();
+    let (host_w, host_h) = mode.resolution();
+    print_line(&format!(
+        "display: GOP mode {}x{}, stride {} px/scanline, format {:?}",
+        host_w,
+        host_h,
+        mode.stride(),
+        mode.pixel_format()
+    ));
+
+    let chip_ram = snapshot_chip_ram(bus);
+    let mut staging = vec![0u32; MAX_WIDTH * MAX_HEIGHT];
+    let mut fb = Framebuffer::new(&mut staging, MAX_WIDTH, MAX_HEIGHT)
+        .expect("staging is sized exactly to MAX_WIDTH * MAX_HEIGHT");
+    Renderer::new().render(&bus.0.chipset, &chip_ram, &mut fb);
+
+    let mut host_pixels = vec![0xFF00_0000u32; host_w * host_h]; // opaque black letterbox
+    present::blit_scaled_centered(
+        &mut host_pixels,
+        host_w,
+        host_h,
+        &staging,
+        MAX_WIDTH,
+        MAX_HEIGHT,
+        0xFF00_0000,
+    );
+    let blt_buffer: Vec<BltPixel> = host_pixels.iter().map(|&p| BltPixel::from(p)).collect();
+
+    let factor = present::scale_factor(host_w, host_h, MAX_WIDTH, MAX_HEIGHT);
+    match gop.blt(BltOp::BufferToVideo {
+        buffer: &blt_buffer,
+        src: BltRegion::Full,
+        dest: (0, 0),
+        dims: (host_w, host_h),
+    }) {
+        Ok(()) => print_line(&format!(
+            "display: presented via GOP blt -- host {host_w}x{host_h}, amiga canvas {MAX_WIDTH}x{MAX_HEIGHT} at {factor}x integer scale"
+        )),
+        Err(e) => print_line(&format!("display: GOP blt failed ({e:?})")),
     }
 }

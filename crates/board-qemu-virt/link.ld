@@ -15,12 +15,21 @@ MEMORY
   /* 8M was enough for the Phase 0 bus-only payload. Booting AROS embeds
    * both ~512 KB ROM images via `include_bytes!` (.rodata) and adds a
    * third 2 MB chip-RAM `.bss` buffer for the boot run alongside the two
-   * Phase 0 checks already keep, which alone pushes total image+.bss
-   * past 8M. QEMU virt is configured with 512M (`-m 512M` in
-   * scripts/run-qemu-virt.sh), so 16M leaves generous headroom over the
-   * ~9M actually used without reserving a meaningful fraction of real
-   * guest-visible RAM. */
-  RAM (rwx) : ORIGIN = 0x40080000, LENGTH = 16M
+   * Phase 0 checks already keep, which alone pushed total image+.bss
+   * past 8M, hence the earlier bump to 16M.
+   *
+   * Display bring-up (`ramfb.rs`/`present.rs`) adds three more `.bss`
+   * buffers: a 2 MB scratch copy of chip RAM (reconstructed through the
+   * bus's own read path rather than aliasing the boot run's `&mut`
+   * borrow of `BOOT_CHIP_RAM` -- see `main.rs`'s `snapshot_chip_ram` doc
+   * comment), a ~1.65 MB staging canvas
+   * (`machine_core::display::MAX_WIDTH * MAX_HEIGHT` `u32`s), and a
+   * ~7.3 MB host framebuffer at `ramfb::HOST_WIDTH * HOST_HEIGHT` (see
+   * that constant's doc comment for why that resolution). Total usage is
+   * now ~19-20M; QEMU virt is configured with 512M (`-m 512M` in
+   * scripts/run-qemu-virt.sh), so 32M leaves generous headroom without
+   * reserving a meaningful fraction of real guest-visible RAM. */
+  RAM (rwx) : ORIGIN = 0x40080000, LENGTH = 32M
 }
 
 SECTIONS

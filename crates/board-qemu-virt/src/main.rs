@@ -32,6 +32,8 @@
 #![no_main]
 
 mod heap;
+mod present;
+mod ramfb;
 
 use core::fmt::Write;
 use core::mem::MaybeUninit;
@@ -39,7 +41,9 @@ use core::panic::PanicInfo;
 use core::ptr::addr_of_mut;
 
 use m68k::{AddressBus, CpuCore, CpuType, CycleBatchControl, CycleBatchExit, StepResult};
-use machine_core::{MachineBus, CHIP_RAM_SIZE};
+use machine_core::display::{Framebuffer, MAX_HEIGHT, MAX_WIDTH};
+use machine_core::render::Renderer;
+use machine_core::{MachineBus, CHIP_RAM_BASE, CHIP_RAM_SIZE};
 
 // `_start`: the ELF entry point QEMU's `-kernel` loader jumps to.
 //
@@ -210,6 +214,25 @@ static AROS_EXT_ROM: &[u8] = include_bytes!("../../../assets/aros/aros-amiga-m68
 /// bleeding into another's.
 static mut BOOT_CHIP_RAM: MaybeUninit<[u8; CHIP_RAM_SIZE]> = MaybeUninit::uninit();
 
+/// A second, independent 2 MB chip-RAM buffer used only to reconstruct
+/// the boot run's chip RAM for rendering (see `snapshot_chip_ram`'s doc
+/// comment for why a second copy, rather than a second reference into
+/// `BOOT_CHIP_RAM`, is what avoids an aliasing violation here).
+static mut RENDER_CHIP_RAM: MaybeUninit<[u8; CHIP_RAM_SIZE]> = MaybeUninit::uninit();
+
+/// Scratch canvas the stop-gap renderer draws into, sized to its own
+/// worst-case geometry (`display.rs`'s `MAX_WIDTH`/`MAX_HEIGHT` doc
+/// comments) exactly as `machine-hosted`'s `PngSurface` does.
+static mut RENDER_STAGING: MaybeUninit<[u32; MAX_WIDTH * MAX_HEIGHT]> = MaybeUninit::uninit();
+
+/// The host framebuffer `ramfb` scans out from, at `ramfb::HOST_WIDTH` x
+/// `ramfb::HOST_HEIGHT` -- see that module's doc comment for why this
+/// resolution and why it is a `static`, not a heap allocation (this
+/// board's bump allocator, `heap.rs`, is sized for `m68k::CpuCore`'s own
+/// small internal needs, nowhere near this buffer's ~7.3 MB).
+static mut HOST_FRAMEBUFFER: MaybeUninit<[u32; (ramfb::HOST_WIDTH * ramfb::HOST_HEIGHT) as usize]> =
+    MaybeUninit::uninit();
+
 /// Adapts [`MachineBus`] to m68k-rs's [`AddressBus`] trait, same shape as
 /// the hosted adapter in `tests/hello_guest.rs` (can't share it: the
 /// adapter has to live wherever it's used, since both `MachineBus` and
@@ -282,19 +305,30 @@ pub extern "C" fn main() -> ! {
     let mut bus = MachineBus::new(chip_ram, &TEST_ROM);
     let mut checks = Checks { all_passed: true };
 
-    // Open-bus rule: an address with nothing mapped (proposal's Gayle ID
-    // probe address) reads back as all-ones.
-    let open_bus_value = bus.read_long(0x00DE_1000);
+    // Open-bus rule: an address with nothing mapped reads back as
+    // all-ones.
+    //
+    // This probed $DE1000 until Phase 3. That was the proposal's Gayle ID
+    // address, chosen precisely because nothing answered there -- and then
+    // Gayle landed and legitimately claimed it (`gayle::GAYLE_ID_BASE`),
+    // so the check failed on a machine that was behaving correctly. It sat
+    // red for a while, which is the argument for probing a gap the memory
+    // map actually reserves rather than an address that happens to be
+    // empty today: $C80000 is between CIA_END ($C00000) and Gayle's own
+    // window, and on a real A1200 is the ranger area an unexpanded machine
+    // leaves open.
+    const OPEN_BUS_PROBE: u32 = 0x00C8_0000;
+    let open_bus_value = bus.read_long(OPEN_BUS_PROBE);
     checks.check(
-        "open bus $DE1000 reads $FFFFFFFF",
+        "open bus $C80000 reads $FFFFFFFF",
         open_bus_value == 0xFFFF_FFFF,
     );
 
     // Open-bus writes are silently discarded.
-    bus.write_long(0x00DE_1000, 0xDEAD_BEEF);
-    let after_write = bus.read_long(0x00DE_1000);
+    bus.write_long(OPEN_BUS_PROBE, 0xDEAD_BEEF);
+    let after_write = bus.read_long(OPEN_BUS_PROBE);
     checks.check(
-        "open bus write to $DE1000 is discarded",
+        "open bus write to $C80000 is discarded",
         after_write == 0xFFFF_FFFF,
     );
 
@@ -522,6 +556,93 @@ fn report_rom_identify(label: &str, image: &[u8]) {
     }
 }
 
+/// Reconstruct chip RAM's contents through the bus's own bounds-checked
+/// read path, into the separate `RENDER_CHIP_RAM` static rather than a
+/// fresh reference to `BOOT_CHIP_RAM` itself.
+///
+/// `MachineBus` borrows its backing array exclusively for its whole
+/// lifetime (same constraint `machine-hosted`'s `screenshot.rs` documents
+/// for its own identically-named function, which this mirrors) and
+/// exposes no direct slice accessor, so there is no safe way to get a
+/// second, shared view of `BOOT_CHIP_RAM` while `bus` -- which holds the
+/// `&mut` `MachineBus::new` was given over it -- is still alive: doing so
+/// would alias a live `&mut` reference, which is undefined behaviour even
+/// though this payload is single-threaded and the two accesses could
+/// never actually race in practice. Reading every byte back out through
+/// `bus.0.read_byte` instead goes through the reference `bus` already
+/// owns, so it aliases nothing.
+///
+/// One-off cost, called once after the boot run ends, never per emulated
+/// frame -- 2 MB of individually bounds-checked reads is nothing next to
+/// the millions of guest instructions the run above just interpreted.
+fn snapshot_chip_ram(bus: &mut Bus) -> &'static mut [u8; CHIP_RAM_SIZE] {
+    // SAFETY: single-threaded, no interrupts, no other live reference to
+    // RENDER_CHIP_RAM anywhere else in the program (same reasoning as
+    // every other `static mut` access in this file).
+    let snapshot: &mut [u8; CHIP_RAM_SIZE] =
+        unsafe { (*addr_of_mut!(RENDER_CHIP_RAM)).assume_init_mut() };
+    for (offset, slot) in snapshot.iter_mut().enumerate() {
+        *slot = bus.0.read_byte(CHIP_RAM_BASE + offset as u32);
+    }
+    snapshot
+}
+
+/// Render the boot run's final picture and present it to `ramfb`, if
+/// `ramfb` was ever successfully configured (see `ramfb_status`'s
+/// doc comment on `RamfbStatus`). Narrates the outcome over serial --
+/// deliberately *after* this function's caller has already printed the
+/// `PHASE1 BOARD-QEMU-VIRT:` marker line CI greps for, per this task's
+/// brief on not disturbing existing serial assertions.
+fn present_to_ramfb(bus: &mut Bus, ramfb_status: &ramfb::RamfbStatus) {
+    match ramfb_status {
+        ramfb::RamfbStatus::DeviceNotPresent => {
+            uprintln!("display: ramfb not present in the fw_cfg file directory (no -device ramfb?) -- skipping display presentation");
+            return;
+        }
+        ramfb::RamfbStatus::ConfigureFailed => {
+            uprintln!("display: ramfb DMA configuration reported an error -- skipping display presentation");
+            return;
+        }
+        ramfb::RamfbStatus::Ready => {}
+    }
+
+    let chip_ram = snapshot_chip_ram(bus);
+    // SAFETY: single-threaded, no other live reference to RENDER_STAGING.
+    let staging: &mut [u32; MAX_WIDTH * MAX_HEIGHT] =
+        unsafe { (*addr_of_mut!(RENDER_STAGING)).assume_init_mut() };
+    let mut fb = Framebuffer::new(staging, MAX_WIDTH, MAX_HEIGHT)
+        .expect("RENDER_STAGING is sized exactly to MAX_WIDTH * MAX_HEIGHT");
+    Renderer::new().render(&bus.0.chipset, chip_ram, &mut fb);
+
+    // SAFETY: single-threaded, no other live reference to HOST_FRAMEBUFFER.
+    let host_fb: &mut [u32; (ramfb::HOST_WIDTH * ramfb::HOST_HEIGHT) as usize] =
+        unsafe { (*addr_of_mut!(HOST_FRAMEBUFFER)).assume_init_mut() };
+    present::blit_scaled_centered(
+        host_fb,
+        ramfb::HOST_WIDTH as usize,
+        ramfb::HOST_HEIGHT as usize,
+        staging,
+        MAX_WIDTH,
+        MAX_HEIGHT,
+        0xFF00_0000, // opaque black letterbox border
+    );
+
+    let factor = present::scale_factor(
+        ramfb::HOST_WIDTH as usize,
+        ramfb::HOST_HEIGHT as usize,
+        MAX_WIDTH,
+        MAX_HEIGHT,
+    );
+    uprintln!(
+        "display: presented via ramfb -- host {}x{}, amiga canvas {}x{} at {}x integer scale",
+        ramfb::HOST_WIDTH,
+        ramfb::HOST_HEIGHT,
+        MAX_WIDTH,
+        MAX_HEIGHT,
+        factor
+    );
+}
+
 /// Boot the embedded AROS ROM pair on a real `m68k::CpuCore`, reporting
 /// progress over the polled UART, and print the `PHASE1 BOARD-QEMU-VIRT:`
 /// marker line CI greps for once the run ends.
@@ -544,6 +665,31 @@ fn boot_aros(chip_ram: &mut [u8; CHIP_RAM_SIZE]) {
 
     report_rom_identify("main", AROS_ROM);
     report_rom_identify("ext", AROS_EXT_ROM);
+
+    // Configure ramfb up front, before the boot run: the address it needs
+    // is fixed for the whole program (HOST_FRAMEBUFFER is a `static`), so
+    // there is nothing to gain by waiting, and doing it here means a
+    // ramfb failure is visible in serial narration alongside the ROM
+    // identification above rather than buried after everything else.
+    // SAFETY: single-threaded, no other live reference to HOST_FRAMEBUFFER
+    // at this point in the program.
+    let host_fb_addr =
+        unsafe { (*addr_of_mut!(HOST_FRAMEBUFFER)).assume_init_mut() }.as_ptr() as u64;
+    let ramfb_status = ramfb::init(host_fb_addr);
+    match ramfb_status {
+        ramfb::RamfbStatus::Ready => uprintln!(
+            "display: ramfb configured at {:#010x}, {}x{} XRGB8888",
+            host_fb_addr,
+            ramfb::HOST_WIDTH,
+            ramfb::HOST_HEIGHT
+        ),
+        ramfb::RamfbStatus::DeviceNotPresent => {
+            uprintln!("display: ramfb not present in the fw_cfg file directory")
+        }
+        ramfb::RamfbStatus::ConfigureFailed => {
+            uprintln!("display: ramfb DMA configuration reported an error")
+        }
+    }
 
     let machine_bus = MachineBus::new(chip_ram, AROS_ROM).with_ext_rom(AROS_EXT_ROM);
     let mut bus = Bus(machine_bus);
@@ -762,6 +908,14 @@ fn boot_aros(chip_ram: &mut [u8; CHIP_RAM_SIZE]) {
             if overlay_cleared { "cleared" } else { "still mapped" }
         ),
     }
+
+    // After -- never before -- the marker line above: CI polls for and
+    // then kills QEMU on an earlier line (`ci-grep-serial.sh`'s doc
+    // comment / `.github/workflows/ci.yml`), so any new narration has to
+    // land after everything CI already asserts, never interleaved with
+    // or ahead of it (this project's own past CI race, referenced in the
+    // task brief this was written against).
+    present_to_ramfb(&mut bus, &ramfb_status);
 }
 
 /// Update the exception-storm tracker; returns `true` once the same kind
