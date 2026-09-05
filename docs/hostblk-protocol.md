@@ -262,13 +262,44 @@ yet — that is driver/interrupt-server work for when the driver exists.
   cannot boot a machine unaided yet.
 - No `TD_ADDCHANGEINT`/change-interrupt delivery to the guest — the
   change counter exists, nothing wakes a waiting task on it yet.
-- Descriptor and buffer addresses still must lie in chip RAM
-  (`0..CHIP_RAM_SIZE`) -- `machine-core` now has fast RAM
-  (`fastram.rs`, `docs/device-ledger.md`'s fast RAM row), but this
-  card's bounds check has not been updated to reach it yet. The seam it
-  needs (`GuestMemory::ram_slice`/`ram_slice_mut` on `MachineBus`,
-  which already resolves both chip RAM and any attached fast RAM
-  without hardcoding either range) exists in `lib.rs`; only this file's
-  own `read_descriptor`/`transfer` signatures and the `MachineBus::tick`
-  call site remain.
 - No write caching, hence no real flush underneath `FLUSH` (§10).
+
+Descriptor and buffer addresses are **no longer restricted to chip
+RAM**: the card asks `MachineBus` through `GuestMemory::ram_slice`/
+`ram_slice_mut`, which resolves chip RAM and any attached fast RAM
+without either range being hardcoded here. A driver may allocate its
+buffers `MEMF_FAST`. A span straddling two regions is refused rather
+than silently stitched together.
+
+## 13. Acceptance testing the driver
+
+When the driver exists it is tested with **devsoak** (`~/src/devsoak`),
+a destructive correctness and soak tester for trackdisk-style AmigaOS
+block devices. It runs against known-good drivers — `scsi.device`,
+`trackdisk.device`, `lide.device`, `uaehf.device` — so our results are
+comparable rather than self-referential, the same discipline the
+Copperline blitter differential uses.
+
+Two things it exercises bear directly on the design above.
+
+**Concurrency against the submission ring.** devsoak drives overlapping
+reads, writes and housekeeping from several tasks with multiple requests
+in flight, for hours. That is precisely what overruns §5's submission
+ring, whose depth is `SUBMIT_CAPACITY` and whose overflow behaviour is
+to *drop* the doorbell write with no completion ever produced.
+
+This gives a sharp pass criterion. devsoak's quirks database has a
+`maxinflight N` action for drivers that cannot cope with unbounded
+concurrency. **Our driver should not need one.** If it does, that is not
+a devsoak quirk to record — it means the driver is failing to
+self-limit against `SUBMIT_CAPACITY`, and the bug is ours.
+
+**The 64-bit dialects.** devsoak follows devtest's convention of the
+offset high word in `io_Actual` for TD64/NSD, and tests stale change
+counts and unsupported commands. The descriptor deliberately avoids
+that overloading on the wire (§2), but the driver still has to *accept*
+it from an `IORequest` and translate — so the convention has to be
+handled at the boundary rather than designed away.
+
+devsoak needs bebbo's amiga-gcc, which this project already uses to
+build the boot ROM.
