@@ -90,6 +90,16 @@ single point of maintenance).
 Keeps: instant boot, no host OS, a single self-contained artifact, and
 the Emu68-variant door (§5.3) fully open.
 
+One cost this ADR did not originally record, raised by ADR 0002:
+**runtime display modesetting**. Under UEFI the mode is chosen before
+`ExitBootServices` and is effectively fixed afterwards, so a bare-metal
+board layer advertises the boot-time mode and refuses changes; under
+option B, DRM/KMS makes a guest mode change an ordinary operation.
+Whether the guest can change resolution without restarting the machine
+is user-visible behaviour rather than an implementation detail, and it
+falls out differently under A than under B. See ADR 0002's "Mode
+setting, and what it means for ADR 0001".
+
 ### B. Linux-as-firmware — the Amithlon model
 
 A stripped kernel plus an initramfs holding the machine binary as PID 1.
