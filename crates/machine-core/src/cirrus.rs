@@ -141,6 +141,12 @@ mod idx {
     /// silicon. Read-only.
     pub const CRTC_ID: u8 = 0x27;
     pub const CRTC_LAST_STANDARD: u8 = 0x18;
+    /// End Vertical Retrace register: standard VGA CR11, present on every
+    /// VGA-derived CRTC including the CL-GD542x. Bits 4-5 gate the
+    /// vertical-retrace interrupt this module models -- see
+    /// [`crtc11::DISABLE_VERTICAL_INTERRUPT`] and
+    /// [`crtc11::CLEAR_VERTICAL_INTERRUPT`].
+    pub const CRTC_END_VERTICAL_RETRACE: u8 = 0x11;
 
     // ---- graphics controller: the CL-GD542x BitBLT engine -------------
     //
@@ -263,6 +269,32 @@ mod sr12 {
     pub const CURSOR_PALETTE_SELECT: u8 = 0x02;
 }
 
+/// `idx::CRTC_END_VERTICAL_RETRACE` (CR11) bit flags -- standard VGA, not
+/// a Cirrus extension, so these apply even before the extended registers
+/// are unlocked (CR11 is within `idx::CRTC_LAST_STANDARD`). Confirmed
+/// against FreeVGA's CRTC register reference and, behaviourally (never
+/// for register numbers or code, module docs' usual policy), against
+/// Copperline's `picasso2::gd5426` model, which gates its own
+/// `vertical_interrupt_enabled` on exactly this bit pair.
+mod crtc11 {
+    /// Bit 4, active low: write 0 to acknowledge (clear) a latched
+    /// vertical-retrace interrupt. Unlike most VGA "write 1 to clear"
+    /// conventions, the bit must then be written back to 1 before the
+    /// chip will latch the *next* retrace -- while it reads 0 the
+    /// interrupt condition stays masked, so a driver's ack sequence
+    /// (clear, then re-arm) is what actually re-enables delivery, not a
+    /// self-clearing strobe.
+    pub const CLEAR_VERTICAL_INTERRUPT: u8 = 0x10;
+    /// Bit 5, active high in the inverted sense its name suggests: 1
+    /// *disables* the vertical-retrace interrupt, 0 enables it. Combined
+    /// with `CLEAR_VERTICAL_INTERRUPT` above, "enabled" is bits 5:4 ==
+    /// `0b01` -- both zero (CR11's power-on-reset value) reads as
+    /// "enabled" by bit 5 alone but is held masked by bit 4 being clear,
+    /// so the register's own reset state is disabled without this model
+    /// needing to special-case it.
+    pub const DISABLE_VERTICAL_INTERRUPT: u8 = 0x20;
+}
+
 /// Upper bound on a system-source (host-fed) blit transfer this model
 /// will buffer before running it: `#![no_std]` with no allocator rules
 /// out sizing the buffer to the transfer, like the oracles do. Chosen
@@ -359,6 +391,16 @@ pub struct Cirrus542x<'a> {
     /// completion synchronously inside the register write that starts
     /// it.
     system_blit: Option<SystemBlit>,
+
+    /// Latched vertical-retrace interrupt condition (Input Status 0 bit
+    /// 7 at `port::MISC_OUTPUT`/0x3C2). Set by
+    /// [`Cirrus542x::signal_vertical_retrace`] only while CR11 has the
+    /// interrupt armed (`crtc11` module docs); cleared by a CR11 write
+    /// with bit 4 low. Starts `false` and CR11 starts all-zero, so a
+    /// freshly reset chip never asserts -- the gating this whole feature
+    /// exists to guarantee (see `graffity` module docs and this crate's
+    /// end-to-end boot regression).
+    vblank_pending: bool,
 }
 
 /// State for an in-flight system-source (host-fed) blit: how many bytes
@@ -398,6 +440,7 @@ impl<'a> Cirrus542x<'a> {
             dac_component: 0,
             dac_read_mode: false,
             system_blit: None,
+            vblank_pending: false,
         }
     }
 
@@ -1077,6 +1120,15 @@ impl<'a> Cirrus542x<'a> {
             return;
         }
         self.crtc[index as usize] = value;
+        // CR11 bit 4 active low: the guest acknowledges a latched
+        // vertical-retrace interrupt by writing it clear (`crtc11`
+        // module docs). The shared INT2 line re-latches on the next
+        // retrace if still armed -- level-triggered and re-asserted,
+        // not a one-shot, same as Gayle's INTRQ on this line (`lib.rs`).
+        if index == idx::CRTC_END_VERTICAL_RETRACE && value & crtc11::CLEAR_VERTICAL_INTERRUPT == 0
+        {
+            self.vblank_pending = false;
+        }
     }
 
     // ---- attribute controller --------------------------------------------
@@ -1092,12 +1144,50 @@ impl<'a> Cirrus542x<'a> {
 
     // ---- RAMDAC ------------------------------------------------------------
 
-    /// Real hardware has no readable input-status-0 bits this model
-    /// needs (dot-clock/vsync sensing); a fixed value is indistinguishable
-    /// to a driver that isn't polling real timing, which none of the
-    /// scope here does.
+    /// Real hardware has no *other* readable input-status-0 bits this
+    /// model needs (dot-clock/vsync line sensing); a fixed 0 there is
+    /// indistinguishable to a driver that isn't polling real timing,
+    /// which none of the scope here does. Bit 7, though, is the
+    /// documented vertical-retrace-interrupt-pending flag (module docs),
+    /// and is re-derived from CR11 here rather than returning the raw
+    /// latch -- a driver that disables the interrupt without
+    /// acknowledging it must stop seeing it pending.
     fn input_status_0(&self) -> u8 {
-        0
+        if self.vblank_pending && self.vertical_interrupt_enabled() {
+            0x80
+        } else {
+            0
+        }
+    }
+
+    /// CR11 bits 5:4 both read as "enabled": bit 5 (`DISABLE_VERTICAL_
+    /// INTERRUPT`) low, and bit 4 (`CLEAR_VERTICAL_INTERRUPT`) high, i.e.
+    /// not currently held in its cleared/masked state. See the
+    /// [`crtc11`] module docs for why the register's own reset value
+    /// (all zero) already fails this and needs no special-casing.
+    fn vertical_interrupt_enabled(&self) -> bool {
+        self.crtc[idx::CRTC_END_VERTICAL_RETRACE as usize]
+            & (crtc11::DISABLE_VERTICAL_INTERRUPT | crtc11::CLEAR_VERTICAL_INTERRUPT)
+            == crtc11::CLEAR_VERTICAL_INTERRUPT
+    }
+
+    /// Called once per display frame on vertical retrace (module docs:
+    /// driven from the chipset's own frame boundary, not a second
+    /// clock). Latches the pending flag only while the interrupt is
+    /// armed -- an unprogrammed or interrupt-disabled chip never
+    /// accumulates a request no one asked for.
+    pub fn signal_vertical_retrace(&mut self) {
+        if self.vertical_interrupt_enabled() {
+            self.vblank_pending = true;
+        }
+    }
+
+    /// Whether this chip is currently asserting its vertical-retrace
+    /// interrupt line -- what the board layer forwards to `lib.rs` for
+    /// delivery onto the shared INT2 line, the same shape as
+    /// [`crate::gayle::Gayle::irq_pending`].
+    pub fn irq_pending(&self) -> bool {
+        self.vblank_pending && self.vertical_interrupt_enabled()
     }
 
     fn input_status_1(&self) -> u8 {
@@ -1315,6 +1405,101 @@ mod tests {
         let mut c = Cirrus542x::new(ChipRevision::Gd5428, &mut vram);
         c.reg_write(port::CRTC_INDEX_COLOR, 0x27);
         assert_eq!(c.reg_read(port::CRTC_DATA_COLOR), 0x98);
+    }
+
+    // ---- vertical retrace interrupt -------------------------------------
+
+    #[test]
+    fn vertical_retrace_interrupt_is_disabled_out_of_reset() {
+        // CR11 starts all-zero (`Cirrus542x::new`), which reads as bit 5
+        // (disable) clear -- naively "enabled" -- but bit 4 (clear) is
+        // also clear, holding the interrupt masked. A machine that never
+        // touches CR11 must never see the vblank interrupt pending, on
+        // pain of destabilising a boot this feature is not supposed to
+        // touch (`graffity` module docs).
+        let mut vram = [0u8; 16];
+        let mut c = chip(&mut vram);
+        c.signal_vertical_retrace();
+        assert!(!c.irq_pending(), "disabled by CR11's own reset value");
+        assert_eq!(
+            c.reg_read(port::MISC_OUTPUT),
+            0,
+            "Input Status 0 bit 7 clear"
+        );
+    }
+
+    #[test]
+    fn disable_bit_is_inverted_one_disables_zero_enables() {
+        let mut vram = [0u8; 16];
+        let mut c = chip(&mut vram);
+        // Arm bit 4 (clear/ack bit set) but leave bit 5 (disable) set --
+        // the inverted sense under test: 1 must mean disabled, not
+        // enabled.
+        c.reg_write(port::CRTC_INDEX_COLOR, 0x11);
+        c.reg_write(port::CRTC_DATA_COLOR, 0x30);
+        c.signal_vertical_retrace();
+        assert!(
+            !c.irq_pending(),
+            "bit 5 set (disable) must suppress the interrupt"
+        );
+
+        // Now clear bit 5 (0 == enabled) while keeping bit 4 armed.
+        c.reg_write(port::CRTC_INDEX_COLOR, 0x11);
+        c.reg_write(port::CRTC_DATA_COLOR, 0x10);
+        c.signal_vertical_retrace();
+        assert!(c.irq_pending(), "bit 5 clear (enable) must let it through");
+        assert_eq!(
+            c.reg_read(port::MISC_OUTPUT) & 0x80,
+            0x80,
+            "Input Status 0 bit 7 reports it"
+        );
+    }
+
+    #[test]
+    fn clear_bit_is_also_inverted_zero_clears_one_leaves_it_armed() {
+        let mut vram = [0u8; 16];
+        let mut c = chip(&mut vram);
+        // Enable (bit 5 clear) and arm (bit 4 set), then latch a retrace.
+        c.reg_write(port::CRTC_INDEX_COLOR, 0x11);
+        c.reg_write(port::CRTC_DATA_COLOR, 0x10);
+        c.signal_vertical_retrace();
+        assert!(c.irq_pending());
+
+        // Writing bit 4 back to 1 (still enabled) must not itself clear
+        // an already-latched interrupt -- only writing it to 0 does.
+        c.reg_write(port::CRTC_INDEX_COLOR, 0x11);
+        c.reg_write(port::CRTC_DATA_COLOR, 0x10);
+        assert!(c.irq_pending(), "rewriting bit 4 high leaves it latched");
+
+        // Writing bit 4 low (0) is the inverted-sense clear.
+        c.reg_write(port::CRTC_INDEX_COLOR, 0x11);
+        c.reg_write(port::CRTC_DATA_COLOR, 0x00);
+        assert!(!c.irq_pending(), "bit 4 low acknowledges it");
+
+        // The chip re-latches on the next retrace once re-armed, rather
+        // than staying permanently disabled by having been cleared once
+        // -- the shared INT2 line is level-triggered and re-asserted,
+        // not a one-shot (`lib.rs`'s wiring comment).
+        c.reg_write(port::CRTC_INDEX_COLOR, 0x11);
+        c.reg_write(port::CRTC_DATA_COLOR, 0x10);
+        c.signal_vertical_retrace();
+        assert!(
+            c.irq_pending(),
+            "re-armed and re-latched on the next retrace"
+        );
+    }
+
+    #[test]
+    fn signal_without_arming_never_latches() {
+        // A driver that leaves CR11 at its power-on value and just lets
+        // frames tick past must never accumulate a pending interrupt --
+        // this is the exact regression the whole feature must not cause.
+        let mut vram = [0u8; 16];
+        let mut c = chip(&mut vram);
+        for _ in 0..10 {
+            c.signal_vertical_retrace();
+        }
+        assert!(!c.irq_pending());
     }
 
     // ---- graphics controller --------------------------------------------

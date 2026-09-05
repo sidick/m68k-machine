@@ -75,11 +75,14 @@
 //! # Simpler than the Picasso II
 //!
 //! Also unlike the Picasso II, Graffity has **no interrupt-enable latch
-//! of its own** — INT2 follows the chip's own vertical-blank state
-//! directly rather than being gated by a board register. This module
-//! does not raise INT2 at all yet; that is a later step (vblank
-//! interrupt delivery), left alone here so it cannot disturb a machine
-//! that currently boots. Nor does it model the monitor-switch strobe's
+//! of its own** — INT2 follows the chip's own vertical-retrace state
+//! directly (CR11 bits 4-5, `cirrus::Cirrus542x::signal_vertical_
+//! retrace`/`irq_pending`) rather than being gated by a board register.
+//! [`Graffity::irq_pending`] forwards the chip's state; `lib.rs` drives
+//! [`Graffity::signal_vertical_retrace`] once per frame from the
+//! chipset's own frame clock and ORs the result onto the shared INT2
+//! line, the same shape it already uses for Gayle. Nor does it model the
+//! monitor-switch strobe's
 //! actual effect (switching the physical monitor between the chipset's
 //! own display and the RTG one) -- writes to it are accepted and
 //! discarded, the same simplification the Zorro II register window
@@ -343,6 +346,23 @@ impl<'a> Graffity<'a> {
     /// Look up a palette entry, expanded to eight bits per gun.
     pub fn palette_argb(&self, index: u8) -> u32 {
         self.chip.palette_argb(index)
+    }
+
+    /// Tell the chip a display frame has crossed vertical retrace. The
+    /// chip latches its own interrupt-pending flag from this only while
+    /// CR11 has the interrupt armed -- see [`Cirrus542x::
+    /// signal_vertical_retrace`]. `lib.rs` drives this from the chipset's
+    /// existing frame clock (`BeamAdvance::frames_wrapped`) rather than a
+    /// second clock of the board's own.
+    pub fn signal_vertical_retrace(&mut self) {
+        self.chip.signal_vertical_retrace();
+    }
+
+    /// Whether the chip is currently asserting its vertical-retrace
+    /// interrupt, for `lib.rs` to OR onto the shared INT2 line the same
+    /// way it already does for [`crate::gayle::Gayle::irq_pending`].
+    pub fn irq_pending(&self) -> bool {
+        self.chip.irq_pending()
     }
 
     /// Read a byte from board `board` -- an index into this card's own

@@ -305,6 +305,26 @@ impl<'a> MachineBus<'a> {
             self.cia_b.tod_tick();
         }
 
+        // Graffity's vertical-retrace interrupt rides the same frame
+        // clock as the CIAs' TOD counters above, rather than a second
+        // clock of its own -- see the `graffity` module docs. A tick
+        // spanning several frames (a STOPped CPU resyncing) must signal
+        // each boundary crossed, the same "count, not a flag" reasoning
+        // `BeamAdvance::frames_wrapped` already documents for the TOD
+        // ticks.
+        if let Some(card) = &mut self.graphics {
+            for _ in 0..beam.frames_wrapped {
+                card.signal_vertical_retrace();
+            }
+            // Zorro's INT2 pin is the same physical, level-triggered
+            // line Gayle and CIA-A already share on this machine (see
+            // the write-path comment on `MachineBus::write_byte`'s Gayle
+            // arm) -- Graffity is simply a third source pulling it.
+            if card.irq_pending() {
+                self.chipset.raise_int(chipset::intbit::PORTS);
+            }
+        }
+
         if self.cia_a.tick(cpu_clocks, CPU_CLOCKS_PER_ECLOCK) {
             self.chipset.raise_int(chipset::intbit::PORTS);
         }
@@ -990,6 +1010,88 @@ mod tests {
         // 2 MB, short of the register window's base -- is still open
         // bus, unaffected by the card being present at all.
         assert_eq!(bus.read_byte(0x0045_0000), OPEN_BUS_BYTE);
+    }
+
+    /// End-to-end: an attached, unprogrammed Graffity card must never
+    /// raise INT2 across a full frame boundary -- the gating this
+    /// feature exists to guarantee, exercised through `tick` rather than
+    /// the chip's own unit tests, so a wiring mistake in `tick` itself
+    /// (calling the wrong method, or calling it unconditionally) would
+    /// be caught here even if `cirrus.rs`'s own tests were fine.
+    #[test]
+    fn unprogrammed_graffity_never_raises_ports_across_a_frame() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut vram = std::vec![0u8; 0x0020_0000];
+        let mut bus = new_bus(&mut ram, &rom).with_graphics(&mut vram);
+        configure_graffity(&mut bus, 0x20, 0x50);
+
+        let frame_clocks = chipset::PAL_LINES_PER_FRAME
+            * chipset::PAL_COLOUR_CLOCKS_PER_LINE
+            * CPU_CLOCKS_PER_COLOUR_CLOCK;
+        bus.tick(frame_clocks + 10);
+
+        let ports = 1u16 << chipset::intbit::PORTS;
+        assert_eq!(
+            bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
+            0,
+            "CR11 was never touched -- must stay disabled by its own reset value"
+        );
+    }
+
+    /// End-to-end: once the guest arms CR11 (bit 5 clear, bit 4 set), a
+    /// frame boundary crossed through `tick` raises the shared PORTS/INT2
+    /// bit, acknowledging it (CRTC clear + `INTREQ`) drops it, and the
+    /// next frame re-latches -- level-triggered, not a one-shot, mirrors
+    /// `multi_sector_read_raises_ports_interrupt_between_sectors` for
+    /// Gayle on the very same line.
+    #[test]
+    fn armed_graffity_raises_ports_once_per_frame_and_reacknowledges() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut vram = std::vec![0u8; 0x0020_0000];
+        let mut bus = new_bus(&mut ram, &rom).with_graphics(&mut vram);
+        configure_graffity(&mut bus, 0x20, 0x50);
+
+        // Arm the interrupt: CR11 bit 5 (disable) clear, bit 4 (clear/ack)
+        // set.
+        bus.write_byte(0x0050_03D4, 0x11); // CRTC_INDEX_COLOR
+        bus.write_byte(0x0050_03D5, 0x10); // CRTC_DATA_COLOR
+
+        let frame_clocks = chipset::PAL_LINES_PER_FRAME
+            * chipset::PAL_COLOUR_CLOCKS_PER_LINE
+            * CPU_CLOCKS_PER_COLOUR_CLOCK;
+        bus.tick(frame_clocks + 10);
+
+        let ports = 1u16 << chipset::intbit::PORTS;
+        assert_eq!(
+            bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
+            ports,
+            "armed card raises PORTS on the frame boundary"
+        );
+
+        // Acknowledge: clear CR11 bit 4, then the chipset's own PORTS
+        // latch, same two-step shape the Gayle test above uses.
+        bus.write_byte(0x0050_03D4, 0x11);
+        bus.write_byte(0x0050_03D5, 0x00);
+        bus.write_word(CUSTOM_BASE + chipset::reg::INTREQ as u32, ports);
+        assert_eq!(
+            bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
+            0,
+            "acknowledged"
+        );
+
+        // Re-arm (bit 4 back to 1) and cross another frame boundary: the
+        // card must re-latch rather than staying quiet forever having
+        // been acknowledged once.
+        bus.write_byte(0x0050_03D4, 0x11);
+        bus.write_byte(0x0050_03D5, 0x10);
+        bus.tick(frame_clocks + 10);
+        assert_eq!(
+            bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
+            ports,
+            "re-armed and re-latched on the next frame"
+        );
     }
 
     #[test]
