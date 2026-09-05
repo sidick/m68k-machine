@@ -540,6 +540,9 @@ fn run_guest(
 
             total_instructions += 1;
             let pc = cpu.ppc;
+            // Feed the serial register trace (bus.rs) the PC of the next
+            // instruction to execute, so its accesses get attributed.
+            crate::bus::LAST_PC.store(cpu.pc, std::sync::atomic::Ordering::Relaxed);
 
             if trace {
                 let opcode = bus.0.read_word(pc);

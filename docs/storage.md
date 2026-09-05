@@ -64,6 +64,24 @@ one flag away — `--hostblk-writable` — for whoever actually needs
 Kickstart's or Workbench's write path exercised, at which point the risk
 is a conscious choice rather than a default.
 
+**A silent-failure mode this default enables, seen in the field:** a
+guest startup script whose command line needs a write to the boot volume
+— `SYS:AmiPilotServer SERIAL >SYS:pilot.log` in `S:User-Startup` was the
+real case — dies before the program ever runs, because the shell cannot
+open the redirect file on a read-only volume. Nothing on the host side
+says so, the rest of the boot proceeds normally, and any *stale* log
+from an earlier writable session still sitting in the image reads as
+proof the program started. Debugging that cost a full serial-stack
+investigation before the actual cause surfaced (the whole serial path
+was healthy; the guest program simply was not running). If a `--hostblk`
+guest is expected to *do* something at boot and doesn't, check the
+runner's `hostblk: unit 0 = … (read-only)` startup line before
+suspecting the machinery — and treat in-image log files as evidence only
+when the run that should have written them was a writable one.
+`SERIAL_REG_TRACE=1` (a diagnostic env var on `machine-hosted`) traces
+every serial-register access with the guest PC and settles in one run
+whether the guest is touching the serial hardware at all.
+
 ## The test image
 
 `nondistribution/m68k-machine.hdf` is a bootable AmigaOS 3.2.2 HDF: one

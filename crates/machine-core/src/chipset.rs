@@ -532,6 +532,25 @@ impl Chipset {
             reg::SERDAT => {
                 self.serdat = value;
                 self.push_serial_byte(value as u8);
+                // Transmit completes instantly here (no UART to wait
+                // for), so the buffer really is empty again -- and TBE
+                // has to be *raised*, not merely reported set in
+                // SERDATR. `serial.device` sends one byte and then waits
+                // on this interrupt before sending the next, so without
+                // it a driver blocks for ever after its first byte while
+                // SERDATR cheerfully claims the buffer is free. ROMWack
+                // never noticed because it polls SERDAT directly rather
+                // than taking interrupts, which is why this survived
+                // until a real serial.device client used the port.
+                // Verified live (AmiPilotServer over serial.device,
+                // Kickstart 3.2.2): without this raise exactly one byte
+                // of a reply reaches SERDAT and the driver stalls; with
+                // it, the driver's per-byte cycle -- kick-start via a
+                // manual INTREQ TBE set, write SERDAT from the TX
+                // interrupt, ack TBE, wait for the next raise -- runs to
+                // completion (SERIAL_REG_TRACE=1 in machine-hosted shows
+                // the whole dance).
+                self.raise_int(intbit::TBE);
             }
             reg::SERPER => self.serper = value,
             reg::POTGO => self.potgo = value,
