@@ -25,7 +25,19 @@
 #
 #   ~/src/amibake/.venv/bin/amibake build tools/amibake/m68k-machine.toml
 base     = "os3.2.2"
-machine  = { cpu = "68040", fpu = true, ram = "chip:2M" }
-packages = ["mmulibs"]
+machine  = { cpu = "68040", fpu = true, ram = "chip:2M", rtg = true }
+packages = [
+  # P96 with the Graffity board driver: Graffity.card over the shared
+  # CirrusGD542X.chip, plus DEVS:Monitors/Picasso96, which is what makes
+  # the OS instantiate an RTG monitor at all — without it P96 loads and
+  # simply offers no screenmodes.
+  # fake-native-modes replaces the chip-set screen modes with a 640x480
+  # chunky mode on the board, so Workbench opens on RTG from first boot
+  # with no screenmode-prefs step. P96 forcibly enables this on hardware
+  # with no native Amiga output — the DraCo among them — which is
+  # precisely what this machine is (proposal §3).
+  { name = "picasso96-3", card = "graffity", fake-native-modes = true },
+  "mmulibs",
+]
 output   = ["hdf", "dir"]
 emit     = ["copperline"]
