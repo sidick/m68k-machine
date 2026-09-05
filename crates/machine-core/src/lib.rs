@@ -123,16 +123,20 @@ pub struct MachineBus<'a> {
     hd: Option<&'a mut dyn BlockDevice>,
 
     /// The Graffity graphics card, when the board layer has attached
-    /// one via [`Self::with_graphics`]. Absent by default -- with no
+    /// one via [`Self::with_graphics`] or
+    /// [`Self::with_graphics_zorro_iii`]. Absent by default -- with no
     /// card, nothing about today's boot path changes, since neither its
-    /// two AUTOCONFIG boards nor this field's routing branch exist.
+    /// AUTOCONFIG board(s) nor this field's routing branch exist.
     graphics: Option<Graffity<'a>>,
-    /// Which AUTOCONFIG chain index is Graffity's VRAM aperture, once
-    /// registered.
-    graphics_vram_board: Option<usize>,
-    /// Which AUTOCONFIG chain index is Graffity's register window, once
-    /// registered.
-    graphics_regs_board: Option<usize>,
+    /// AUTOCONFIG chain index for each of the attached card's own board
+    /// indices (registration order), `None` where a variant leaves a
+    /// slot unused (Zorro III only ever fills index 0). This is the
+    /// entire seam between the bus and the card: `MachineBus` knows
+    /// nothing about VRAM, registers, or any other aperture -- it only
+    /// maps a chain index back to one of the card's board indices and
+    /// hands the offset to [`Graffity::read`]/[`Graffity::write`], which
+    /// decode from there.
+    graphics_boards: [Option<usize>; graffity::MAX_GRAFFITY_BOARDS],
 
     /// While set, the ROM is mirrored over the bottom of the address
     /// space so the CPU's reset vector fetch from `$000000`/`$000004`
@@ -204,8 +208,7 @@ impl<'a> MachineBus<'a> {
             autoconfig: AutoConfig::new(),
             hd: None,
             graphics: None,
-            graphics_vram_board: None,
-            graphics_regs_board: None,
+            graphics_boards: [None; graffity::MAX_GRAFFITY_BOARDS],
             overlay: true,
         }
     }
@@ -216,19 +219,36 @@ impl<'a> MachineBus<'a> {
         self
     }
 
-    /// Attach a Graffity graphics card over caller-owned VRAM (borrowed,
-    /// like chip RAM and the ROMs -- this crate has no allocator) and
-    /// register its two AUTOCONFIG boards on the chain. Absent a call to
-    /// this, the chain and every address this card would occupy are
-    /// untouched, which is what keeps today's boot path identical with
-    /// no card attached.
-    pub fn with_graphics(mut self, vram: &'a mut [u8]) -> Self {
-        let card = Graffity::new(vram);
-        let (vram_spec, regs_spec) = card.board_specs();
-        // VRAM offered first, then the register window -- the Picasso
-        // II shape (graffity module docs).
-        self.graphics_vram_board = self.autoconfig.add_board(vram_spec);
-        self.graphics_regs_board = self.autoconfig.add_board(regs_spec);
+    /// Attach a Zorro II Graffity graphics card over caller-owned VRAM
+    /// (borrowed, like chip RAM and the ROMs -- this crate has no
+    /// allocator) and register its two AUTOCONFIG boards on the chain.
+    /// Absent a call to this (or [`Self::with_graphics_zorro_iii`]), the
+    /// chain and every address this card would occupy are untouched,
+    /// which is what keeps today's boot path identical with no card
+    /// attached.
+    pub fn with_graphics(self, vram: &'a mut [u8]) -> Self {
+        self.attach_graphics(Graffity::new(vram))
+    }
+
+    /// Attach a Zorro III Graffity graphics card: the same core, one
+    /// AUTOCONFIG board instead of two (`graffity` module docs).
+    pub fn with_graphics_zorro_iii(self, vram: &'a mut [u8]) -> Self {
+        self.attach_graphics(Graffity::new_zorro_iii(vram))
+    }
+
+    /// Register `card`'s boards on the chain, in the order it offers
+    /// them, and remember which chain index landed at which of the
+    /// card's own board indices -- the entire seam described on
+    /// [`Self::graphics_boards`]. Shared by both `with_graphics*`
+    /// constructors so neither knows anything about VRAM, registers, or
+    /// any other aperture; only [`graffity::Graffity`] does.
+    fn attach_graphics(mut self, card: Graffity<'a>) -> Self {
+        let specs = card.board_specs();
+        let mut chain = [None; graffity::MAX_GRAFFITY_BOARDS];
+        for (board, &spec) in specs.as_slice().iter().enumerate() {
+            chain[board] = self.autoconfig.add_board(spec);
+        }
+        self.graphics_boards = chain;
         self.graphics = Some(card);
         self
     }
@@ -376,10 +396,9 @@ impl<'a> MachineBus<'a> {
             rom::read_mirrored(self.ext_rom, rom::EXT_ROM_BASE, address)
         } else if (ROM_BASE..ROM_END).contains(&address) && !self.rom.is_empty() {
             rom::read_mirrored(self.rom, ROM_BASE, address)
-        } else if let Some((is_vram, offset)) = self.graphics_target(address) {
+        } else if let Some((board, offset)) = self.graphics_target(address) {
             match &mut self.graphics {
-                Some(card) if is_vram => card.vram_read(offset),
-                Some(card) => card.reg_read(offset),
+                Some(card) => card.read(board, offset),
                 None => OPEN_BUS_BYTE,
             }
         } else {
@@ -387,22 +406,24 @@ impl<'a> MachineBus<'a> {
         }
     }
 
-    /// Whether `address` falls inside one of Graffity's two configured
-    /// AUTOCONFIG windows, and if so, which aperture and the offset
-    /// within it. `None` whenever no card is attached (`board_at` can
-    /// never resolve to either of `graphics_{vram,regs}_board`, since
-    /// they are never `Some` without a card) or the address belongs to
-    /// some other board entirely.
-    fn graphics_target(&self, address: u32) -> Option<(bool, u32)> {
+    /// Whether `address` falls inside one of the attached Graffity
+    /// card's configured AUTOCONFIG windows, and if so, which of the
+    /// card's own board indices and the offset within it -- the input
+    /// to [`Graffity::read`]/[`Graffity::write`]. `None` whenever no
+    /// card is attached (`graphics_boards` is never anything but all
+    /// `None` without one) or the address belongs to some other board
+    /// entirely. This function is the whole of what `MachineBus` knows
+    /// about Graffity's address layout: it carries no notion of VRAM,
+    /// registers, or any other aperture, only which chain index maps to
+    /// which board index (`Self::graphics_boards`'s own doc comment).
+    fn graphics_target(&self, address: u32) -> Option<(usize, u32)> {
         let idx = self.autoconfig.board_at(address)?;
         let base = self.autoconfig.placement(idx)?.base;
-        if Some(idx) == self.graphics_vram_board {
-            Some((true, address - base))
-        } else if Some(idx) == self.graphics_regs_board {
-            Some((false, address - base))
-        } else {
-            None
-        }
+        let board = self
+            .graphics_boards
+            .iter()
+            .position(|&chain_idx| chain_idx == Some(idx))?;
+        Some((board, address - base))
     }
 
     /// Decode a CIA access. CIA-A occupies odd addresses, CIA-B even
@@ -540,13 +561,9 @@ impl<'a> MachineBus<'a> {
                 (current & 0xFF00) | value as u16
             };
             self.write_custom_word(aligned, merged);
-        } else if let Some((is_vram, offset)) = self.graphics_target(address) {
+        } else if let Some((board, offset)) = self.graphics_target(address) {
             if let Some(card) = &mut self.graphics {
-                if is_vram {
-                    card.vram_write(offset, value);
-                } else {
-                    card.reg_write(offset, value);
-                }
+                card.write(board, offset, value);
             }
         }
         // ROM and open-bus writes: discarded.
@@ -973,5 +990,61 @@ mod tests {
         // 2 MB, short of the register window's base -- is still open
         // bus, unaffected by the card being present at all.
         assert_eq!(bus.read_byte(0x0045_0000), OPEN_BUS_BYTE);
+    }
+
+    #[test]
+    fn with_graphics_zorro_iii_registers_a_single_board() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut vram = std::vec![0u8; 0x0020_0000]; // 2 MB
+        let mut bus = new_bus(&mut ram, &rom).with_graphics_zorro_iii(&mut vram);
+
+        // er_Product (logical byte 1) is Graffity's Zorro III identity,
+        // and nothing configures a second board behind it.
+        assert_eq!(
+            bus.read_byte(autoconfig::AUTOCONFIG_BASE + 4) >> 4,
+            (!graffity::PRODUCT_Z3) >> 4,
+            "er_Product high nybble is the Zorro III window's"
+        );
+    }
+
+    #[test]
+    fn configured_zorro_iii_graffity_routes_its_three_sub_apertures() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut vram = std::vec![0u8; 0x0020_0000]; // 2 MB
+        let mut bus = new_bus(&mut ram, &rom).with_graphics_zorro_iii(&mut vram);
+
+        // A 16-bit write to EC_Z3_BASEADDRESS ($44), delivered as two
+        // byte writes per `write_word`'s big-endian convention
+        // (autoconfig module docs): hi=$40, lo=$00 -> base $40000000.
+        bus.write_byte(
+            autoconfig::AUTOCONFIG_BASE + autoconfig::ec::Z3_BASEADDRESS,
+            0x40,
+        );
+        bus.write_byte(
+            autoconfig::AUTOCONFIG_BASE + autoconfig::ec::Z3_BASEADDRESS + 1,
+            0x00,
+        );
+        assert_eq!(
+            bus.autoconfig.placement(0).map(|p| p.base),
+            Some(0x4000_0000)
+        );
+
+        // VRAM sub-aperture at board offset $C00000.
+        bus.write_byte(0x40C0_0004, 0xCD);
+        assert_eq!(bus.read_byte(0x40C0_0004), 0xCD);
+
+        // Register sub-aperture at board offset $800000: CRTC index/data,
+        // same protocol as the Zorro II register window.
+        bus.write_byte(0x4080_03D4, 0x0F); // CRTC_INDEX_COLOR
+        bus.write_byte(0x4080_03D5, 0x77); // CRTC_DATA_COLOR
+        assert_eq!(bus.read_byte(0x4080_03D5), 0x77);
+
+        // The switch-strobe trap at board offset $400000 accepts writes
+        // without disturbing anything else, and a gap between
+        // sub-apertures is open bus.
+        bus.write_byte(0x4040_0060, 0);
+        assert_eq!(bus.read_byte(0x4000_1000), OPEN_BUS_BYTE);
     }
 }

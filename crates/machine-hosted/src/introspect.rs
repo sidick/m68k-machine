@@ -603,27 +603,42 @@ pub fn format_disk_state(bus: &MachineBus) -> String {
 /// zero) from "painted, but the wrong colours" (palette entry 0 or 1 set
 /// to something unexpected) without needing a screenshot at all. `None`
 /// when no card is attached.
+///
+/// Prints every AUTOCONFIG board index the card might have registered
+/// rather than naming them "VRAM"/"regs": Zorro II takes two boards,
+/// Zorro III just one, and which board is which aperture is
+/// `machine_core::graffity`'s business, not this diagnostic's --
+/// `machine_core::MachineBus` itself no longer knows either (see that
+/// module's doc comment on the board-index seam).
 pub fn format_graphics_state(bus: &MachineBus) -> String {
     let Some(card) = bus.graphics() else {
         return "graphics state: no card attached".to_string();
     };
-    // Graffity registers its two boards (VRAM, then registers) before
-    // anything else this machine's board layers attach, so chain indices
-    // 0/1 are its own whenever a card is present at all -- see
-    // `graffity`'s module doc comment on the two-board shape.
     let fmt_base = |base: Option<u32>| match base {
         Some(b) => format!("{b:#010x}"),
         None => "none".to_string(),
     };
-    let vram_base = fmt_base(bus.autoconfig.placement(0).map(|p| p.base));
-    let regs_base = fmt_base(bus.autoconfig.placement(1).map(|p| p.base));
+    // Graffity's own boards always land at the front of the chain, before
+    // anything else this machine's board layers attach -- so probing a
+    // few leading indices and reporting whichever configured is enough,
+    // without this module needing to know how many boards the attached
+    // variant actually uses.
+    let boards: std::vec::Vec<String> = (0..2)
+        .map(|i| {
+            format!(
+                "board[{i}] {}",
+                fmt_base(bus.autoconfig.placement(i).map(|p| p.base))
+            )
+        })
+        .collect();
+    let boards = boards.join("  ");
     match card.decoded_mode() {
         Some(mode) => {
             let first_bytes: std::vec::Vec<u8> = (0..8)
                 .map(|i| card.vram_read(mode.start_offset + i))
                 .collect();
             format!(
-                "graphics state: VRAM base {vram_base}  regs base {regs_base}  \
+                "graphics state: {boards}  \
                  decoded_mode {}x{} {:?}  stride {}  start_offset {:#x}  \
                  first VRAM bytes at start_offset {:02x?}  palette[0] {:#010x}  palette[1] {:#010x}",
                 mode.width,
@@ -637,7 +652,7 @@ pub fn format_graphics_state(bus: &MachineBus) -> String {
             )
         }
         None => format!(
-            "graphics state: VRAM base {vram_base}  regs base {regs_base}  \
+            "graphics state: {boards}  \
              decoded_mode is None (driver has not programmed a presentable mode yet)"
         ),
     }

@@ -243,10 +243,14 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     };
     let machine_bus = if args.graphics {
         console.diag(&format!(
-            "graphics: Graffity attached, {} MB VRAM",
-            args.graphics_vram_mb
+            "graphics: Graffity attached (Zorro {}), {} MB VRAM",
+            args.graphics_bus, args.graphics_vram_mb
         ));
-        machine_bus.with_graphics(&mut graphics_vram)
+        if args.graphics_bus == 3 {
+            machine_bus.with_graphics_zorro_iii(&mut graphics_vram)
+        } else {
+            machine_bus.with_graphics(&mut graphics_vram)
+        }
     } else {
         machine_bus
     };

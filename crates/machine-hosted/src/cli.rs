@@ -129,20 +129,29 @@ pub struct Args {
     pub hd_writable: bool,
 
     /// Attach the Graffity graphics card (`machine_core::graffity`) over
-    /// heap-allocated VRAM and register its two AUTOCONFIG boards on the
+    /// heap-allocated VRAM and register its AUTOCONFIG board(s) on the
     /// chain. Without this flag nothing about the boot path changes --
     /// the chain and every address the card would occupy stay exactly as
     /// they are today (`MachineBus::with_graphics`'s own doc comment).
     /// With it, `--screenshot`'s capture path prefers the card's own
     /// `decoded_mode()` framebuffer over the stop-gap planar renderer
     /// once a driver has programmed one (`crate::screenshot`'s RTG
-    /// present path).
+    /// present path). `--graphics-bus` chooses which variant; the
+    /// default (`2`) is exactly this flag's original meaning.
     #[arg(long, default_value_t = false)]
     pub graphics: bool,
 
+    /// Which Zorro bus generation `--graphics`'s Graffity card presents:
+    /// `2` (default) is the original two-board Zorro II shape (VRAM,
+    /// then registers); `3` is the single 16 MB Zorro III window
+    /// (`machine_core::graffity` module docs). Ignored without
+    /// `--graphics`.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(2..=3))]
+    pub graphics_bus: u8,
+
     /// VRAM size, in megabytes, for `--graphics`'s card. 2 MB matches the
-    /// Copperline oracle's `graffityz2` configuration this project checks
-    /// against. Ignored without `--graphics`.
+    /// Copperline oracle's `graffityz2`/`graffityz3` configurations this
+    /// project checks against. Ignored without `--graphics`.
     #[arg(long, default_value_t = 2)]
     pub graphics_vram_mb: u32,
 
