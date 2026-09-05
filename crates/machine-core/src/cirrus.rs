@@ -131,6 +131,11 @@ mod idx {
     /// model cares about; bits 1-3 select depth when the hidden DAC is
     /// in its "extended" state (hidden-DAC low nibble `0x0F`).
     pub const SR_EXTENDED_MODE: u8 = 0x07;
+    /// Graphics Cursor Attribute register. Bit 1
+    /// (`sr12::CURSOR_PALETTE_SELECT`) is the one this module cares about:
+    /// while it is set, DAC-data port accesses address the hardware
+    /// cursor's own colour table instead of the main palette.
+    pub const SR_CURSOR_ATTR: u8 = 0x12;
 
     /// CRTC: the chip-ID register the RTG driver reads to identify the
     /// silicon. Read-only.
@@ -245,6 +250,19 @@ mod blit_status {
     pub const BUSY_MASK: u8 = 0x09;
 }
 
+/// `idx::SR_CURSOR_ATTR` (SR12) bit flags.
+mod sr12 {
+    /// When set, `port::DAC_DATA` reads/writes address the hardware
+    /// cursor's private colour table (`cursor_palette`, indices 0 and
+    /// 0x0F only) instead of the main 256-entry palette. Documented CL-
+    /// GD54xx behaviour, and confirmed against Copperline's Cirrus model
+    /// (`gd5426.rs`): Picasso96's driver sets this bit, writes the
+    /// pointer's background (index 0) and foreground (index 0x0F)
+    /// colours, then clears it again before resuming normal palette
+    /// programming.
+    pub const CURSOR_PALETTE_SELECT: u8 = 0x02;
+}
+
 /// Upper bound on a system-source (host-fed) blit transfer this model
 /// will buffer before running it: `#![no_std]` with no allocator rules
 /// out sizing the buffer to the transfer, like the oracles do. Chosen
@@ -288,6 +306,18 @@ pub struct Cirrus542x<'a> {
 
     /// 256-entry palette, six bits per gun as the RAMDAC holds it.
     palette: [[u8; 3]; 256],
+    /// The hardware cursor's private 16-entry colour table (only indices
+    /// 0x00 and 0x0F are actually meaningful, holding the cursor's
+    /// background and foreground colours respectively). SR12 bit 1
+    /// (`idx::SR_CURSOR_ATTR`, `sr12::CURSOR_PALETTE_SELECT`) redirects
+    /// the DAC-data port here instead of the main 256-entry palette so a
+    /// driver can set the pointer colours without disturbing the screen
+    /// palette entries at the same index -- see the CL-GD54xx datasheet's
+    /// "Hardware Cursor Color" registers. This model never composites the
+    /// cursor onto the framebuffer (out of scope, see module doc comment),
+    /// so the table exists purely to keep these writes from landing in
+    /// `palette` instead.
+    cursor_palette: [[u8; 3]; 16],
 
     seq_index: u8,
     crtc_index: u8,
@@ -351,6 +381,7 @@ impl<'a> Cirrus542x<'a> {
             gr: [0; 64],
             ar: [0; 32],
             palette: [[0; 3]; 256],
+            cursor_palette: [[0; 3]; 16],
             seq_index: 0,
             crtc_index: 0,
             gr_index: 0,
@@ -1097,9 +1128,14 @@ impl<'a> Cirrus542x<'a> {
     }
 
     fn write_dac_data(&mut self, value: u8) {
-        let index = self.dac_write_index as usize;
         let component = self.dac_component as usize;
-        self.palette[index][component] = value & 0x3F;
+        if self.sr[idx::SR_CURSOR_ATTR as usize] & sr12::CURSOR_PALETTE_SELECT != 0 {
+            let index = (self.dac_write_index & 0x0F) as usize;
+            self.cursor_palette[index][component] = value & 0x3F;
+        } else {
+            let index = self.dac_write_index as usize;
+            self.palette[index][component] = value & 0x3F;
+        }
         self.dac_component += 1;
         if self.dac_component == 3 {
             self.dac_component = 0;
@@ -1108,9 +1144,14 @@ impl<'a> Cirrus542x<'a> {
     }
 
     fn read_dac_data(&mut self) -> u8 {
-        let index = self.dac_read_index as usize;
         let component = self.dac_component as usize;
-        let value = self.palette[index][component];
+        let value = if self.sr[idx::SR_CURSOR_ATTR as usize] & sr12::CURSOR_PALETTE_SELECT != 0 {
+            let index = (self.dac_read_index & 0x0F) as usize;
+            self.cursor_palette[index][component]
+        } else {
+            let index = self.dac_read_index as usize;
+            self.palette[index][component]
+        };
         self.dac_component += 1;
         if self.dac_component == 3 {
             self.dac_component = 0;
@@ -1346,6 +1387,60 @@ mod tests {
         let expand = |six: u32| (six << 2) | (six >> 4);
         let expected = 0xFF00_0000 | (expand(0x10) << 16) | (expand(0x20) << 8) | expand(0x30);
         assert_eq!(c.palette_argb(10), expected);
+    }
+
+    #[test]
+    fn cursor_palette_select_redirects_dac_writes_away_from_the_screen_palette() {
+        // CL-GD54xx datasheet: SR12 bit 1 (Cursor Palette Select) steers
+        // the DAC-data port to the hardware cursor's private two-colour
+        // table instead of the main 256-entry palette, so a driver can
+        // set the pointer's colours without touching the screen palette
+        // entry at the same index. Picasso96's Cirrus driver does exactly
+        // this for pointer index 0 (Copperline's `gd5426.rs` model
+        // reproduces the same redirect, cross-checked against ours).
+        let mut vram = [0u8; 16];
+        let mut c = chip(&mut vram);
+        c.reg_write(port::SEQ_INDEX, idx::SR_LOCK);
+        c.reg_write(port::SEQ_DATA, idx::SR_LOCK_UNLOCKED);
+
+        // Screen palette entry 0 starts out grey (as Workbench expects).
+        c.reg_write(port::DAC_WRITE_INDEX, 0);
+        c.reg_write(port::DAC_DATA, 0x2A);
+        c.reg_write(port::DAC_DATA, 0x2A);
+        c.reg_write(port::DAC_DATA, 0x2A);
+        let grey = c.palette_argb(0);
+
+        // Arm the cursor-colour redirect and program the cursor's
+        // background (index 0) to red -- same index the driver just used
+        // in the main palette, which is exactly the collision this
+        // register exists to avoid.
+        c.reg_write(port::SEQ_INDEX, idx::SR_CURSOR_ATTR);
+        c.reg_write(port::SEQ_DATA, sr12::CURSOR_PALETTE_SELECT);
+        c.reg_write(port::DAC_WRITE_INDEX, 0);
+        c.reg_write(port::DAC_DATA, 0x3F);
+        c.reg_write(port::DAC_DATA, 0x00);
+        c.reg_write(port::DAC_DATA, 0x00);
+
+        // The screen palette must be untouched by the cursor-colour write.
+        assert_eq!(
+            c.palette_argb(0),
+            grey,
+            "cursor colour write leaked into the screen palette"
+        );
+
+        // Reading back through the same redirect must see the cursor
+        // colour, not the (unchanged) screen palette entry.
+        c.reg_write(port::DAC_READ_INDEX, 0);
+        assert_eq!(c.reg_read(port::DAC_DATA), 0x3F);
+        assert_eq!(c.reg_read(port::DAC_DATA), 0x00);
+        assert_eq!(c.reg_read(port::DAC_DATA), 0x00);
+
+        // Clearing the bit resumes normal screen-palette access at the
+        // same index, still showing the original grey.
+        c.reg_write(port::SEQ_INDEX, idx::SR_CURSOR_ATTR);
+        c.reg_write(port::SEQ_DATA, 0);
+        c.reg_write(port::DAC_READ_INDEX, 0);
+        assert_eq!(c.reg_read(port::DAC_DATA), 0x2A);
     }
 
     // ---- hidden DAC --------------------------------------------------------
