@@ -54,6 +54,7 @@ use crate::bus::Bus;
 use crate::cli::Args;
 use crate::console::Console;
 use crate::hd_image::FileBlockDevice;
+use crate::input_script::InputScript;
 use crate::rom_image;
 use crate::serial_script::SerialScript;
 
@@ -301,6 +302,16 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         }
         _ => machine_bus,
     };
+    // Same "only exists when asked for" shape as `--hostblk`/`--graphics`:
+    // omitting `--input-script` leaves neither the card's AUTOCONFIG
+    // board nor the bus's routing branch registered at all, so a plain
+    // boot run is completely unaffected (brief's own requirement).
+    let machine_bus = if args.input_script.is_some() {
+        console.diag("input: native input card attached (Zorro III AUTOCONFIG)");
+        machine_bus.with_input()
+    } else {
+        machine_bus
+    };
     let blitter_trace = match &args.blitter_trace {
         Some(path) => match crate::blitter_trace::BlitterTrace::open(path) {
             Ok(t) => {
@@ -331,6 +342,19 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         None => None,
     };
 
+    let mut input_script = match &args.input_script {
+        Some(path) => match InputScript::load(path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                return setup_error(
+                    console,
+                    format!("reading --input-script {}: {e}", path.display()),
+                )
+            }
+        },
+        None => None,
+    };
+
     let mut cpu = CpuCore::new();
     cpu.set_cpu_type(args.cpu.into());
     cpu.reset(&mut bus);
@@ -342,11 +366,28 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         if bus.0.overlay() { "mapped" } else { "clear" }
     ));
 
-    let report = run_guest(args, console, &mut cpu, &mut bus, serial_script.as_mut());
+    let report = run_guest(
+        args,
+        console,
+        &mut cpu,
+        &mut bus,
+        serial_script.as_mut(),
+        input_script.as_mut(),
+    );
 
     if let Some(script) = &serial_script {
         console.diag(&format!(
             "serial-script: {}",
+            if script.is_done() {
+                "completed"
+            } else {
+                "did not finish (run ended first -- see --max-frames/--max-instructions)"
+            }
+        ));
+    }
+    if let Some(script) = &input_script {
+        console.diag(&format!(
+            "input-script: {}",
             if script.is_done() {
                 "completed"
             } else {
@@ -390,6 +431,7 @@ fn run_guest(
     cpu: &mut CpuCore,
     bus: &mut Bus,
     mut serial_script: Option<&mut SerialScript>,
+    mut input_script: Option<&mut InputScript>,
 ) -> Report {
     let mut total_instructions: u64 = 0;
     let mut last_progress_frame: u64 = 0;
@@ -450,6 +492,7 @@ fn run_guest(
                 bus,
                 console,
                 serial_script.as_deref_mut(),
+                input_script.as_deref_mut(),
                 &mut overlay_cleared_frame,
                 &mut last_serviced_frame,
                 &mut illegal_triggered,
@@ -725,11 +768,11 @@ fn drain_serial(bus: &mut Bus, console: &mut Console) {
     }
 }
 
-/// Drive the optional `--serial-script` and `--trigger-illegal-after-frames`
-/// once per changed chipset frame. Only called from the per-instruction
-/// hook -- see that call site's comment for why the CPU is guaranteed to
-/// be actively executing (not `stopped`) there, which
-/// `cpu.take_illegal_exception` needs.
+/// Drive the optional `--serial-script`, `--input-script` and
+/// `--trigger-illegal-after-frames` once per changed chipset frame. Only
+/// called from the per-instruction hook -- see that call site's comment
+/// for why the CPU is guaranteed to be actively executing (not
+/// `stopped`) there, which `cpu.take_illegal_exception` needs.
 #[allow(clippy::too_many_arguments)]
 fn service_host_serial(
     args: &Args,
@@ -737,6 +780,7 @@ fn service_host_serial(
     bus: &mut Bus,
     console: &mut Console,
     script: Option<&mut SerialScript>,
+    input_script: Option<&mut InputScript>,
     overlay_cleared_frame: &mut Option<u64>,
     last_serviced_frame: &mut Option<u64>,
     illegal_triggered: &mut bool,
@@ -768,6 +812,13 @@ fn service_host_serial(
     *last_serviced_frame = Some(frame);
     if let Some(script) = script {
         script.tick(frame, &mut bus.0.chipset, console);
+    }
+    // `input_script`/`bus.0.input_mut()` are independently optional: a
+    // script only ever exists when `--input-script` registered the card
+    // (`run`'s own gating), so this can only tick a script against a
+    // real card, never a dangling one against no card at all.
+    if let (Some(script), Some(dev)) = (input_script, bus.0.input_mut()) {
+        script.tick(frame, dev);
     }
 }
 

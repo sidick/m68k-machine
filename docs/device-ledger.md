@@ -124,7 +124,7 @@ disjoint borrows of `self`'s fields, not a conflict, but only once
 | MIRAGE block plane | permanent, off the boot path | — | never; kept as MIRAGE's reference implementation |
 | Cirrus CL-GD542x | **bring-up** | generic virtual board (ADR 0002) | demoted to compatibility tier, not removed |
 | Graffity Z2/Z3 | **bring-up** | as Cirrus | as Cirrus |
-| Keyboard / mouse | **not built** | native input board | n/a — native-first from the start |
+| `input` native input card | permanent | — | never; the machine's own keyboard/mouse path |
 
 ### Permanent
 
@@ -223,6 +223,55 @@ behind `DATA`. See `mirage.rs`'s module docs for the full list, which
 matters more than usual because this implementation *is* the spec's
 reference, not a second opinion on an existing one.
 
+**`input` native input card** — `input.rs`. Legacy input via the CIA-A
+serial handshake and `JOY0DAT` quadrature counters is roughly half-built
+already (`chipset::mouse_delta`, `mouse_button`, and a verified CIA
+keyboard encoding), and finishing it would be cheap.
+
+It was deliberately not finished first. Input is the first device with
+**no bootstrap dependency at all** — nothing in early Kickstart boot
+needs a mouse or a keyboard, and this machine already reaches Workbench
+with neither. It is therefore the first place where native-first costs
+nothing, and choosing legacy because it is cheap and half-built is
+precisely the reasoning this ledger exists to interrupt.
+
+A native input board carries its driver in its own AUTOCONFIG ROM via
+DiagArea injection, so unlike the RTG case it needs nothing installed on
+the guest — the "needs a file on disk" objection does not apply here.
+
+*Built so far (host side only):* a Zorro III AUTOCONFIG board (no
+DiagArea yet — see below), a bounded host-to-guest event queue (key
+down/up, button down/up, absolute pointer motion), the register
+interface (`docs/input-protocol.md`), an overflow policy that coalesces
+pointer motion so it can never crowd out a key/button event (a stuck-down
+key from a dropped key-up is far worse than a dropped keystroke), and the
+`machine-hosted --input-script` CLI flag for driving it deterministically
+in CI. **Not yet built:** the m68k driver and the DiagArea ROM that would
+let a guest actually see an event — this increment cannot demonstrate a
+keypress reaching Intuition, only exercise the card's host-side half end
+to end, the same honest limitation `hostblk`'s first increment stated.
+
+The design brief this card was built against initially described
+`IECLASS_POINTERPOS` as the class an external driver injects for absolute
+pointer positioning. Checked against the NDK headers and against
+`~/src/amipilot`'s own working `input.device` injection code
+(`server/src/action.c`, BSD 2-Clause) before any driver was written here:
+that description was wrong. `IECLASS_RAWMOUSE` motion is relative-delta
+only, and absolute positioning is actually `IECLASS_NEWPOINTERPOS` with
+`IESUBCLASS_PIXEL`, which needs a `struct Screen *` the driver must
+resolve, not a bare coordinate pair. `docs/input-protocol.md` §6-§7
+records the correction and two further hard-won injection details
+(`IEQUALIFIER_RELATIVEMOUSE` on synthetic button events; `ie_Qualifier`
+needing the full held-modifier/held-button state, not just the current
+transition) so the driver increment doesn't rediscover them at the cost
+`action.c`'s own comments record paying.
+
+Legacy input stays available as a fallback tier, in the way the planar
+path is for display, and may still be built if this driver-carrying
+board proves fragile: a board that misbehaves leaves the machine
+unusable rather than merely less comfortable. But it is no longer the
+default answer.
+
 ### Capped
 
 **Planar renderer and blitter.** These can never be fully retired: the
@@ -254,30 +303,6 @@ where new display work happens.
 *Cost of keeping:* ~2,700 lines, including a BitBLT engine, a RAMDAC,
 and quirks like SR12's cursor-palette redirect that exist only because
 one specific driver uses them.
-
-### Not built — decided native-first
-
-**Keyboard and mouse.** Legacy input via the CIA-A serial handshake and
-`JOY0DAT` quadrature counters is roughly half-built already
-(`chipset::mouse_delta`, `mouse_button`, and a verified CIA keyboard
-encoding), and finishing it would be cheap.
-
-It is deliberately not being finished first. Input is the first device
-with **no bootstrap dependency at all** — nothing in early Kickstart
-boot needs a mouse or a keyboard, and this machine already reaches
-Workbench with neither. It is therefore the first place where
-native-first costs nothing, and choosing legacy because it is cheap and
-half-built is precisely the reasoning this ledger exists to interrupt.
-
-A native input board carries its driver in its own AUTOCONFIG ROM via
-DiagArea injection, so unlike the RTG case it needs nothing installed on
-the guest — the "needs a file on disk" objection does not apply here.
-
-Legacy input stays available as a fallback tier, in the way the planar
-path is for display, and may still be built if a driver-carrying board
-proves fragile: a board that misbehaves leaves the machine unusable
-rather than merely less comfortable. But it is no longer the default
-answer.
 
 ## Sequencing
 

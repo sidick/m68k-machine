@@ -53,6 +53,7 @@ pub mod display;
 pub mod fastram;
 pub mod graffity;
 pub mod hostblk;
+pub mod input;
 pub mod mirage;
 pub mod render;
 pub mod rom;
@@ -64,6 +65,7 @@ use chipset::Chipset;
 use cia::{Cia, CiaId, FloppyDrive, FloppyPresence};
 use graffity::Graffity;
 use hostblk::Hostblk;
+use input::NativeInput;
 use mirage::Mirage;
 
 /// Size in bytes of the chip RAM region, `$000000`-`$1FFFFF` (2 MB).
@@ -217,6 +219,19 @@ pub struct MachineBus<'a> {
     /// as [`Self::mirage_board`]/[`Self::hostblk_board`].
     fast_ram_board: Option<usize>,
 
+    /// The native input card ([`input`]), when the board layer has
+    /// attached one via [`Self::with_input`]. Absent by default -- with
+    /// no call to `with_input`, neither its AUTOCONFIG board nor this
+    /// field's routing branch exist, so a machine with no input card
+    /// attached is completely unaffected, the same guarantee
+    /// [`Self::hostblk`]/[`Self::mirage`]/[`Self::graphics`] already
+    /// give (device ledger, "Not built -- decided native-first").
+    input: Option<NativeInput>,
+    /// AUTOCONFIG chain index the input card's single board landed at,
+    /// once [`Self::with_input`] has registered it -- the same seam
+    /// shape as [`Self::mirage_board`]/[`Self::hostblk_board`].
+    input_board: Option<usize>,
+
     /// While set, the ROM is mirrored over the bottom of the address
     /// space so the CPU's reset vector fetch from `$000000`/`$000004`
     /// lands in ROM. Real hardware does this with Gary, driven by CIA-A
@@ -292,6 +307,8 @@ impl<'a> MachineBus<'a> {
             hostblk_board: None,
             fast_ram: None,
             fast_ram_board: None,
+            input: None,
+            input_board: None,
             overlay: true,
         }
     }
@@ -389,6 +406,20 @@ impl<'a> MachineBus<'a> {
             .autoconfig
             .add_board(fastram::autoconfig_board_spec(mem.len() as u32));
         self.fast_ram = Some(mem);
+        self
+    }
+
+    /// Attach the native input card ([`input`]). Idempotent -- a second
+    /// call is a no-op, the same shape [`Self::with_hostblk`] uses for
+    /// its own "register the board the first time" check, though this
+    /// card never needs a second call for anything (no units, no
+    /// backing storage to attach) the way `with_hostblk`/`with_mirage`
+    /// do.
+    pub fn with_input(mut self) -> Self {
+        if self.input.is_none() {
+            self.input_board = self.autoconfig.add_board(NativeInput::board_spec());
+            self.input = Some(NativeInput::new());
+        }
         self
     }
 
@@ -490,6 +521,28 @@ impl<'a> MachineBus<'a> {
         self.autoconfig
             .placement(self.hostblk_board?)
             .map(|p| p.base)
+    }
+
+    /// Borrow the attached native input card, if [`Self::with_input`] was
+    /// called.
+    pub fn input(&self) -> Option<&NativeInput> {
+        self.input.as_ref()
+    }
+
+    /// Mutable access to the attached input card, see [`Self::input`] --
+    /// what a host-side event source (`machine-hosted`'s `--input-script`)
+    /// uses to call [`input::NativeInput::push_key`]/`push_button`/
+    /// `push_pointer_motion`.
+    pub fn input_mut(&mut self) -> Option<&mut NativeInput> {
+        self.input.as_mut()
+    }
+
+    /// Where AUTOCONFIG placed the input card's single Zorro III board,
+    /// once `expansion.library` has configured it -- `None` before
+    /// [`Self::with_input`] was called or before the guest has configured
+    /// it. See [`Self::hostblk_board_base`], the same shape.
+    pub fn input_board_base(&self) -> Option<u32> {
+        self.autoconfig.placement(self.input_board?).map(|p| p.base)
     }
 
     /// Advance time by `cpu_clocks`, ticking the frame clock and both
@@ -680,9 +733,47 @@ impl<'a> MachineBus<'a> {
                 // consistency, not because this arm needs it.
                 None => OPEN_BUS_BYTE,
             }
+        } else if let Some(offset) = self.input_target(address) {
+            match &self.input {
+                Some(dev) => {
+                    let value = dev.read(offset);
+                    // No register read here currently mutates state
+                    // (module docs: `EVENT_TYPE`/`EVENT_CODE`/etc. are
+                    // pure head-of-queue queries, and the queue only
+                    // ever drains via `EVENT_ADVANCE`, a write) -- but
+                    // checked anyway, mirroring `hostblk`'s own read
+                    // arm, which makes the identical choice for the
+                    // identical reason: a device whose interrupt could
+                    // ever change state on a read (the now-retired
+                    // Gayle IDE interface's per-sector refill) that
+                    // *doesn't* check here is how an interrupt goes
+                    // silently missing and a multi-request pipeline
+                    // stalls until an unrelated interrupt rescues it.
+                    if dev.irq_pending() {
+                        self.chipset.raise_int(chipset::intbit::PORTS);
+                    }
+                    value
+                }
+                None => OPEN_BUS_BYTE,
+            }
         } else {
             OPEN_BUS_BYTE
         }
+    }
+
+    /// Whether `address` falls inside the input card's configured
+    /// AUTOCONFIG window, and if so, the board-relative offset -- the
+    /// input to [`input::NativeInput::read`]/[`input::NativeInput::write`].
+    /// `None` whenever no card is attached ([`Self::input_board`] is
+    /// `None` until [`Self::with_input`] runs) or the address belongs to
+    /// some other board. See [`Self::hostblk_target`], the same shape.
+    fn input_target(&self, address: u32) -> Option<u32> {
+        let idx = self.input_board?;
+        if self.autoconfig.board_at(address) != Some(idx) {
+            return None;
+        }
+        let base = self.autoconfig.placement(idx)?.base;
+        Some(address - base)
     }
 
     /// Whether `address` falls inside `hostblk`'s configured AUTOCONFIG
@@ -904,6 +995,19 @@ impl<'a> MachineBus<'a> {
                 // path) raising synchronously must not require
                 // remembering to add this check back in.
                 if h.irq_pending() {
+                    self.chipset.raise_int(chipset::intbit::PORTS);
+                }
+            }
+        } else if let Some(offset) = self.input_target(address) {
+            if let Some(dev) = &mut self.input {
+                dev.write(offset, value);
+                // `EVENT_ADVANCE`/`INT_STATUS`/`INT_ENABLE` are exactly
+                // the registers that can change `irq_pending()`'s
+                // answer, so this check is load-bearing here (unlike
+                // `hostblk`'s doorbell arm above, kept only for future-
+                // proofing) -- see `input` module docs, "Interrupt
+                // model".
+                if dev.irq_pending() {
                     self.chipset.raise_int(chipset::intbit::PORTS);
                 }
             }
@@ -1945,5 +2049,120 @@ mod tests {
         // A span crossing from fast RAM into whatever (if anything)
         // follows it must not be silently accepted as a short read.
         assert_eq!(GuestMemory::ram_slice(&bus, base - 2, 4), None);
+    }
+
+    // ---- input card wiring: brief item 4 ("a machine with no input card
+    // attached must be completely unaffected") ---------------------------
+
+    #[test]
+    fn no_input_card_leaves_the_chain_empty_and_everything_else_unaffected() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let bus = new_bus(&mut ram, &rom);
+
+        assert_eq!(bus.input_board, None);
+        assert!(bus.input().is_none());
+        assert_eq!(bus.autoconfig.board_at(0x4000_0000), None);
+    }
+
+    #[test]
+    fn with_input_registers_one_zorro_iii_board_alongside_hostblk() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut disk = MirageDisk::new(64);
+        let mut bus = new_bus(&mut ram, &rom)
+            .with_hostblk(0, &mut disk, false)
+            .with_input();
+
+        assert!(bus.hostblk().is_some());
+        assert!(bus.input().is_some());
+        assert_eq!(bus.hostblk_board, Some(0));
+        assert_eq!(bus.input_board, Some(1));
+        assert_eq!(
+            bus.autoconfig.read(autoconfig::AUTOCONFIG_BASE + 4) >> 4,
+            !input::PRODUCT >> 4,
+            "input's own product number, not hostblk's, answers at chain index 1"
+        );
+    }
+
+    /// Configure a Zorro III board at `base` at whichever chain index is
+    /// currently answering -- same two-byte `EC_Z3_BASEADDRESS` sequence
+    /// `configure_hostblk_z3` uses, generalised to a name that doesn't
+    /// imply it's hostblk-specific.
+    fn configure_zorro_iii(bus: &mut MachineBus, base: u32) {
+        configure_hostblk_z3(bus, base);
+    }
+
+    #[test]
+    fn configured_input_card_routes_its_window_and_reports_capacity_and_version() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom).with_input();
+        let base = 0x4000_0000u32;
+        configure_zorro_iii(&mut bus, base);
+        assert_eq!(bus.autoconfig.placement(0).map(|p| p.base), Some(base));
+
+        let read_u32 = |bus: &mut MachineBus, off: u32| {
+            u32::from_be_bytes([
+                bus.read_byte(base + off),
+                bus.read_byte(base + off + 1),
+                bus.read_byte(base + off + 2),
+                bus.read_byte(base + off + 3),
+            ])
+        };
+        assert_eq!(
+            read_u32(&mut bus, input::reg::CAPACITY),
+            input::QUEUE_CAPACITY as u32
+        );
+        assert_eq!(
+            read_u32(&mut bus, input::reg::VERSION),
+            input::PROTOCOL_VERSION
+        );
+    }
+
+    /// INT2 must be checked on both the write path (pushing a host event
+    /// or acking) and the read path (a driver that reads a register right
+    /// after a host event landed, with no intervening write of its own),
+    /// the same lesson `hostblk`'s and MIRAGE's own wiring tests encode --
+    /// this module's docs cite the retired Gayle IDE interface as where
+    /// missing the read-path case once turned a file read into a DOS
+    /// "object not found".
+    #[test]
+    fn configured_input_card_raises_int2_seen_on_the_read_path_and_clears_via_ack() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom).with_input();
+        let base = 0x4000_0000u32;
+        configure_zorro_iii(&mut bus, base);
+
+        bus.write_byte(base + input::reg::INT_ENABLE + 3, 1);
+        let ports = 1u16 << chipset::intbit::PORTS;
+        assert_eq!(
+            bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
+            0
+        );
+
+        // The host pushes an event directly (no bus access at all) --
+        // exactly the shape `--input-script` uses.
+        assert!(bus.input_mut().unwrap().push_key(0x01, true, 0));
+
+        // Nothing has written to the card's registers since the push, so
+        // only a *read* can observe the interrupt becoming pending. If
+        // the read arm didn't check `irq_pending()`, INTREQR would still
+        // report nothing here.
+        let _ = bus.read_byte(base + input::reg::EVENT_TYPE + 3);
+        assert_ne!(
+            bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
+            0,
+            "INT2 must be visible via the read path"
+        );
+
+        // Draining and acking (both writes) must clear it.
+        bus.write_byte(base + input::reg::EVENT_ADVANCE + 3, 0);
+        bus.write_byte(base + input::reg::INT_STATUS + 3, 1);
+        assert_eq!(
+            bus.read_byte(base + input::reg::EVENT_TYPE + 3),
+            input::ev::NONE
+        );
     }
 }

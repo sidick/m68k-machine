@@ -69,6 +69,20 @@ pub struct Args {
     #[arg(long)]
     pub serial_script: Option<PathBuf>,
 
+    /// Path to an `input_script`-language file of host→guest input-card
+    /// events to drive during the run (`KEYDOWN`/`KEYUP`/`MOVE`/
+    /// `BUTTONDOWN`/`BUTTONUP`/`SLEEP` directives -- see
+    /// `crate::input_script`'s doc comment). Attaches the native input
+    /// card (`machine_core::input`) the same way `--hostblk` attaches
+    /// `hostblk`: omit this flag and neither the card's AUTOCONFIG board
+    /// nor its bus routing exist at all. There is no m68k driver for this
+    /// card yet (`docs/hostblk-protocol.md`-style increment split, see
+    /// `docs/input-protocol.md`), so this flag alone cannot demonstrate a
+    /// keypress reaching Intuition -- it exercises the card's host-side
+    /// half only, the same honest limitation `--hostblk` started with.
+    #[arg(long)]
+    pub input_script: Option<PathBuf>,
+
     /// Force a genuine 68k illegal-instruction exception into the guest
     /// this many chipset frames after the ROM overlay first clears
     /// (`MachineBus::overlay`), by calling `CpuCore::take_illegal_exception`

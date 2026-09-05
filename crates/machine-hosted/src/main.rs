@@ -10,6 +10,7 @@ mod bus;
 mod cli;
 mod console;
 mod hd_image;
+mod input_script;
 mod introspect;
 mod rom_image;
 mod run;
