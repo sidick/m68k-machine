@@ -301,5 +301,14 @@ that overloading on the wire (§2), but the driver still has to *accept*
 it from an `IORequest` and translate — so the convention has to be
 handled at the boundary rather than designed away.
 
-devsoak needs bebbo's amiga-gcc, which this project already uses to
-build the boot ROM.
+**Getting it.** A built binary is on Aminet at
+`dev/misc/devsoak`, so running it needs no 68k toolchain — only building
+it from source does, and that wants bebbo's amiga-gcc, which this
+project already uses for the boot ROM. It is BSD 2-Clause, so unlike the
+Kickstart ROM and the Workbench image it can simply be installed into
+the test HDF (`tools/amibake/m68k-machine.toml`) rather than kept in
+`nondistribution/`.
+
+That makes the acceptance run self-contained: boot this machine with
+`--hostblk` attached and run devsoak against the driver in-guest, with
+no host-side orchestration and nothing to fetch at test time.
