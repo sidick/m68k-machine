@@ -120,7 +120,7 @@ disjoint borrows of `self`'s fields, not a conflict, but only once
 | Floppy "no drive attached" | permanent | — | never; models absence, not a drive |
 | Planar renderer | capped | RTG | never fully; stops growing (below) |
 | Blitter | capped | RTG | never fully; stops growing (below) |
-| Gayle IDE | **bring-up** | `hostblk` (ADR 0003) | `hostblk` boots the same image unaided |
+| Gayle IDE | **bring-up, criterion met** | `hostblk` (ADR 0003) | *met 2026-09-05* — retire after a devsoak run (§13) |
 | `hostblk` doorbell card | permanent | — | never; the machine's own storage |
 | MIRAGE block plane | permanent, off the boot path | — | never; kept as MIRAGE's reference implementation |
 | Cirrus CL-GD542x | **bring-up** | generic virtual board (ADR 0002) | demoted to compatibility tier, not removed |
@@ -242,6 +242,17 @@ card with a host-side data path, our own m68k driver, and an
 RDB-mounting boot ROM. This was MIRAGE until ADR 0003 moved the boot
 path off PIO.
 *Retires when:* `hostblk` boots the same image with no Gayle attached.
+**This is now true** (2026-09-05): `--hostblk` alone reaches a full
+Workbench desktop, byte-identical to the Gayle boot, with `SYS`, the
+system assigns and RAM Disk all served through `hostblk.device`.
+
+Gayle is nonetheless **not yet removed**, per this file's own retirement
+procedure: step 2 asks for both paths to run side by side long enough to
+trust the new one. `hostblk`'s driver has booted, but has not been
+soaked — `docs/hostblk-protocol.md` §13's devsoak run is the evidence
+that step wants, and its concurrent load is precisely what would expose
+the submission-ring handling that a single boot never stresses. Retire
+Gayle after that, not before.
 *Cost of keeping:* ~1,000 lines, plus an IDE task-file model and its
 interrupt semantics that must stay correct forever. The per-sector
 INTRQ-on-read bug that cost a debugging cycle is the kind of thing this

@@ -348,7 +348,11 @@ fn walk_task_list(bus: &mut MachineBus, list_addr: u32) -> Vec<TaskEntry> {
             break;
         }
         let node_type = bus.read_byte(node_addr + node::LN_TYPE);
-        if node_type == NT_TASK {
+        // NT_TASK (1) or NT_PROCESS (13, exec/nodes.h): a DOS process is
+        // an exec task whose node is typed NT_PROCESS, and the original
+        // NT_TASK-only filter silently hid every DOS process (handlers,
+        // the boot process, Workbench) from this report.
+        if node_type == NT_TASK || node_type == 13 {
             let (name, priority) = read_node_name(bus, node_addr);
             let state = bus.read_byte(node_addr + task::TC_STATE);
             let sig_wait = bus.read_long(node_addr + task::TC_SIG_WAIT);
@@ -1054,6 +1058,16 @@ pub fn format_hostblk_state(bus: &mut MachineBus, exec_base: Option<u32>) -> Str
                     "  DiagArea RAM copy kept at {:#010x} (DiagEntry returned success)\n",
                     cd.diag_copy_addr
                 ));
+                // Diagnostic cell #2, right after DiagMarker: BootEntry
+                // (da_BootPoint) counts its invocations there -- guest
+                // evidence for whether this Kickstart's strap ever calls
+                // da_BootPoint (m68k/hostblk-rom/hostblk-diagrom.s,
+                // BootMarker; machine_core::hostblk::BOOT_MARKER_OFFSET).
+                let boot_marker =
+                    bus.read_long(cd.diag_copy_addr + machine_core::hostblk::BOOT_MARKER_OFFSET);
+                out.push_str(&format!(
+                    "  BootMarker (da_BootPoint call count) {boot_marker}\n"
+                ));
                 out.push_str(&format!(
                     "  DiagMarker {marker:#010x}{}\n",
                     if marker == machine_core::hostblk::PROTOCOL_VERSION {
@@ -1080,29 +1094,76 @@ pub fn format_hostblk_state(bus: &mut MachineBus, exec_base: Option<u32>) -> Str
                 boot_nodes.len()
             ));
             for (addr, dev_node) in &boot_nodes {
-                // dos/filehandler.h's struct DeviceNode: dn_Name is the
-                // 11th field (four longwords each: dn_Next, dn_Type,
-                // dn_Task, dn_Lock, dn_Handler, dn_StackSize, dn_Priority,
-                // dn_Startup, dn_SegList, dn_GlobalVec, then dn_Name) --
-                // offset 40 -- and it is itself a BPTR (BCPL pointer, i.e.
-                // a real address / 4) to a BSTR (length byte then chars,
-                // not NUL-terminated). Decoded here only to tell which
-                // device a boot node actually names, for diagnosis.
-                let dn_name_bptr = bus.read_long(dev_node + 40);
-                let name_addr = dn_name_bptr.wrapping_mul(4);
-                let len = bus.read_byte(name_addr) as usize;
-                let mut name = String::new();
-                for i in 0..len.min(32) {
-                    name.push(bus.read_byte(name_addr + 1 + i as u32) as char);
-                }
-                out.push_str(&format!(
-                    "    BootNode {addr:#010x}  bn_DeviceNode {dev_node:#010x}  dn_Name {name:?}\n"
-                ));
+                out.push_str(&format_boot_node(bus, *addr, *dev_node));
             }
         }
         None => out.push_str(
             "  ExpansionBase not found (expansion.library not linked into ExecBase->LibList yet)\n",
         ),
+    }
+
+    // The DosList (dos/dosextens.h): DosLibrary->dl_Root (offset 34, APTR)
+    // -> RootNode.rn_Info (offset 24: rn_TaskArray(4) +
+    // rn_ConsoleSegment(4) + rn_Time(12) + rn_RestartSeg(4), BPTR) ->
+    // DosInfo.di_DevInfo (offset 4, BPTR) -> chain of DosList entries
+    // (dol_Next BPTR at 0, dol_Type at 4, dol_Task at 8, dol_Name BSTR
+    // at 40). A DLT_VOLUME (2) entry proves a filesystem read and
+    // accepted a root block; its dol_Task ties it back to the handler.
+    if let Some(eb) = exec_base {
+        if let Some(dos_base) = find_library_base(bus, eb + execbase::LIB_LIST, "dos.library") {
+            let root = bus.read_long(dos_base + 34);
+            let info = bus.read_long(root + 24).wrapping_mul(4);
+            // rn_BootProc (dos/dosextens.h RootNode, offset 44:
+            // rn_TaskArray(4) + rn_ConsoleSegment(4) + rn_Time(12) +
+            // rn_RestartSeg(4) + rn_Info(4) + rn_FileHandlerSegment(4) +
+            // rn_CliList(12)): DOS's private pointer to the boot
+            // filesystem's MsgPort -- what ":" resolves through. Zero here
+            // after a mount means the boot handoff never completed.
+            let boot_proc = bus.read_long(root + 44);
+            out.push_str(&format!(
+                "  RootNode {root:#010x}  rn_BootProc {boot_proc:#010x}\n"
+            ));
+            let mut dol = bus.read_long(info + 4);
+            out.push_str("  DosList:\n");
+            for _ in 0..MAX_WALK_ENTRIES {
+                if dol == 0 {
+                    break;
+                }
+                let addr = dol.wrapping_mul(4);
+                let dol_type = bus.read_long(addr + 4) as i32;
+                let dol_task = bus.read_long(addr + 8);
+                let name_bptr = bus.read_long(addr + 40);
+                let (name, _) = read_bstr_via_bptr(bus, name_bptr);
+                let kind = match dol_type {
+                    0 => "DEVICE",
+                    1 => "DIRECTORY",
+                    2 => "VOLUME",
+                    _ => "?",
+                };
+                out.push_str(&format!(
+                    "    {addr:#010x}  type {dol_type} ({kind})  dol_Task {dol_task:#010x}  name {name:?}\n"
+                ));
+                dol = bus.read_long(addr);
+            }
+        } else {
+            out.push_str("  dos.library not in LibList -- DOS never initialised\n");
+        }
+    }
+
+    // Ad-hoc guest-memory peek for debugging sessions: INSPECT_PEEK is a
+    // comma-separated list of hex addresses; each is dumped as 16
+    // longwords. Costs nothing when unset.
+    if let Ok(peek) = std::env::var("INSPECT_PEEK") {
+        for addr in peek
+            .split(',')
+            .filter_map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+        {
+            out.push_str(&format!("  peek {addr:#010x}:"));
+            for i in 0..16 {
+                out.push_str(&format!(" {:08x}", bus.read_long(addr + i * 4)));
+            }
+            out.push('\n');
+        }
     }
 
     // Driver-increment diagnostics: read the live registers directly (no
@@ -1125,8 +1186,16 @@ pub fn format_hostblk_state(bus: &mut MachineBus, exec_base: Option<u32>) -> Str
             // m68k/hostblk-rom/hostblk-diagrom.s's own DEV_* equ block --
             // duplicated here only for this diagnostic dump, not a shared
             // contract with the ROM source.
+            // lib_OpenCnt (exec/libraries.h, offset 32): dev_open bumps it
+            // on every *successful* OpenDevice, so nonzero here proves DOS
+            // (or something) opened hostblk.device and still holds it.
+            let open_cnt = bus.read_word(dev + 32);
+            // DEV_OPENCALLS (hostblk-diagrom.s): every dev_open attempt,
+            // successful or not -- 34 (LIB_SIZE) + 4*6 private longwords +
+            // 14 (pending List) + 22 (Interrupt) = 98.
+            let open_calls = bus.read_long(dev + 98);
             out.push_str(&format!(
-                "  hostblk.device found at {dev:#010x}: sysbase {:#010x}  boardbase {:#010x}  \
+                "  hostblk.device found at {dev:#010x}: lib_OpenCnt {open_cnt}  open attempts {open_calls}  sysbase {:#010x}  boardbase {:#010x}  \
                  expbase {:#010x}  configdev {:#010x}  capacity {}  outstanding {}  slotbase {:#010x}\n",
                 bus.read_long(dev + 34),
                 bus.read_long(dev + 38),
@@ -1136,10 +1205,168 @@ pub fn format_hostblk_state(bus: &mut MachineBus, exec_base: Option<u32>) -> Str
                 bus.read_long(dev + 54),
                 bus.read_long(dev + 58),
             ));
+            // Dump each submission slot's descriptor (the ROM's SLOT_SIZE
+            // = 24: a 20-byte protocol descriptor + 4-byte owner). The
+            // descriptor bytes persist after completion (only the owner
+            // longword is cleared), so this shows the *last* request each
+            // slot carried -- commands, LBAs and buffers of recent I/O,
+            // straight from guest memory.
+            let capacity = bus.read_long(dev + 50).min(16);
+            let slotbase = bus.read_long(dev + 58);
+            for i in 0..capacity {
+                let s = slotbase + i * 24;
+                let cmd = bus.read_byte(s);
+                let unit = bus.read_byte(s + 1);
+                let len = bus.read_long(s + 4);
+                let off_hi = bus.read_long(s + 8);
+                let off_lo = bus.read_long(s + 12);
+                let buf = bus.read_long(s + 16);
+                let owner = bus.read_long(s + 20);
+                if cmd == 0 && len == 0 {
+                    continue; // never used
+                }
+                out.push_str(&format!(
+                    "    slot {i}: cmd {cmd} unit {unit} len {len} offset {:#x} (lba {}) buffer {buf:#010x} owner {owner:#010x}\n",
+                    (u64::from(off_hi) << 32) | u64::from(off_lo),
+                    ((u64::from(off_hi) << 32) | u64::from(off_lo)) / 512,
+                ));
+            }
         }
         None => out.push_str("  hostblk.device not found in ExecBase->DeviceList\n"),
     }
 
+    out
+}
+
+/// Decode a BSTR reached through a BPTR (BCPL pointer: real address / 4;
+/// BSTR: length byte then that many chars, `dos/dosextens.h` conventions).
+/// Returns the string plus the real byte address it was read from, so a
+/// report can show both.
+fn read_bstr_via_bptr(bus: &mut MachineBus, bptr: u32) -> (String, u32) {
+    let addr = bptr.wrapping_mul(4);
+    let len = bus.read_byte(addr) as usize;
+    let mut s = String::new();
+    for i in 0..len.min(64) {
+        s.push(bus.read_byte(addr + 1 + i as u32) as char);
+    }
+    (s, addr)
+}
+
+/// Dump one `MountList` entry in full: the `BootNode` header
+/// (`libraries/expansionbase.h`: `struct Node bn_Node`(14) + `UWORD
+/// bn_Flags` + `struct DeviceNode *bn_DeviceNode`), the complete `struct
+/// DeviceNode` it points at, and -- through `dn_Startup` -- the `struct
+/// FileSysStartupMsg` and `struct DosEnvec` behind it (all three structs:
+/// `dos/filehandler.h`, layouts quoted field-for-field in the code below).
+/// This exists to let a working controller's node (Gayle's) be compared
+/// field-by-field against hostblk's own, entirely from guest state.
+fn format_boot_node(bus: &mut MachineBus, addr: u32, dev_node: u32) -> String {
+    // bn_Node.ln_Type / ln_Pri (exec/nodes.h): AddBootNode stores the boot
+    // priority in ln_Pri and the ConfigDev pointer in ln_Name
+    // (Autodocs/expansion.doc "AddBootNode").
+    let ln_type = bus.read_byte(addr + node::LN_TYPE);
+    let ln_pri = bus.read_byte(addr + node::LN_TYPE + 1) as i8;
+    let ln_name = bus.read_long(addr + 10);
+    let bn_flags = bus.read_word(addr + node::SIZE);
+
+    // dos/filehandler.h struct DeviceNode, longword offsets 0..40:
+    // dn_Next(0) dn_Type(4) dn_Task(8) dn_Lock(12) dn_Handler(16)
+    // dn_StackSize(20) dn_Priority(24) dn_Startup(28) dn_SegList(32)
+    // dn_GlobalVec(36) dn_Name(40).
+    let dn_type = bus.read_long(dev_node + 4);
+    let dn_task = bus.read_long(dev_node + 8);
+    let dn_handler_bptr = bus.read_long(dev_node + 16);
+    let dn_stack = bus.read_long(dev_node + 20);
+    let dn_pri = bus.read_long(dev_node + 24);
+    let dn_startup_bptr = bus.read_long(dev_node + 28);
+    let dn_seglist = bus.read_long(dev_node + 32);
+    let dn_globalvec = bus.read_long(dev_node + 36);
+    let dn_name_bptr = bus.read_long(dev_node + 40);
+    let (dn_name, _) = read_bstr_via_bptr(bus, dn_name_bptr);
+    let (dn_handler, _) = read_bstr_via_bptr(bus, dn_handler_bptr);
+
+    let mut out = format!(
+        "    BootNode {addr:#010x}  ln_Type {ln_type}  ln_Pri {ln_pri}  \
+         ln_Name(ConfigDev) {ln_name:#010x}  bn_Flags {bn_flags:#06x}\n      \
+         DeviceNode {dev_node:#010x}  dn_Name {dn_name:?}  dn_Type {dn_type}  \
+         dn_Task {dn_task:#010x}  dn_Handler (bptr {dn_handler_bptr:#010x}) \
+         {dn_handler:?}\n      dn_StackSize {dn_stack}  dn_Priority {dn_pri}  \
+         dn_SegList {dn_seglist:#010x}  dn_GlobalVec {dn_globalvec:#010x}\n"
+    );
+
+    // dn_Task is a MsgPort* (dos/filehandler.h: "standard dos 'task'
+    // field"); mp_SigTask (exec/ports.h: Node(14) + mp_Flags(1) +
+    // mp_SigBit(1) = offset 16) names the exec task behind it. Decoded so
+    // a report can say whether the handler process still exists and what
+    // state it is in.
+    if dn_task != 0 {
+        let sig_task = bus.read_long(dn_task + 16);
+        if sig_task != 0 {
+            let state = bus.read_byte(sig_task + 15); // tc_State: tc_Node(14)+tc_Flags(1)
+            let name_ptr = bus.read_long(sig_task + 10);
+            let mut tname = String::new();
+            for i in 0..32 {
+                let b = bus.read_byte(name_ptr + i);
+                if b == 0 {
+                    break;
+                }
+                tname.push(b as char);
+            }
+            out.push_str(&format!(
+                "      dn_Task->mp_SigTask {sig_task:#010x}  tc_State {state}  name {tname:?}\n"
+            ));
+        } else {
+            out.push_str("      dn_Task->mp_SigTask 0 -- port has no owning task\n");
+        }
+    }
+
+    // dos/filehandler.h struct FileSysStartupMsg: fssm_Unit(0)
+    // fssm_Device(4, BSTR) fssm_Environ(8, BPTR to DosEnvec)
+    // fssm_Flags(12).
+    let fssm = dn_startup_bptr.wrapping_mul(4);
+    if dn_startup_bptr != 0 {
+        let fssm_unit = bus.read_long(fssm);
+        let fssm_device_bptr = bus.read_long(fssm + 4);
+        let (fssm_device, dev_name_addr) = read_bstr_via_bptr(bus, fssm_device_bptr);
+        let environ_bptr = bus.read_long(fssm + 8);
+        let fssm_flags = bus.read_long(fssm + 12);
+        out.push_str(&format!(
+            "      FSSM {fssm:#010x}  fssm_Unit {fssm_unit}  fssm_Device \
+             (bstr at {dev_name_addr:#010x}) {fssm_device:?}  fssm_Flags {fssm_flags:#010x}\n"
+        ));
+        let env = environ_bptr.wrapping_mul(4);
+        if environ_bptr != 0 {
+            // dos/filehandler.h struct DosEnvec longword indices, named in
+            // the header's own DE_* list.
+            let e = |bus: &mut MachineBus, i: u32| bus.read_long(env + i * 4);
+            let table_size = e(bus, 0);
+            out.push_str(&format!(
+                "      DosEnvec {env:#010x}  TableSize {table_size}  SizeBlock {}  \
+                 Surfaces {}  SectorPerBlock {}  BlocksPerTrack {}  Reserved {}  PreAlloc {}\n      \
+                 Interleave {}  LowCyl {}  HighCyl {}  NumBuffers {}  BufMemType {}  \
+                 MaxTransfer {:#010x}  Mask {:#010x}  BootPri {}  DosType {:#010x}\n",
+                e(bus, 1),
+                e(bus, 3),
+                e(bus, 4),
+                e(bus, 5),
+                e(bus, 6),
+                e(bus, 7),
+                e(bus, 8),
+                e(bus, 9),
+                e(bus, 10),
+                e(bus, 11),
+                e(bus, 12),
+                e(bus, 13),
+                e(bus, 14),
+                e(bus, 15) as i32,
+                e(bus, 16),
+            ));
+        } else {
+            out.push_str("      DosEnvec: fssm_Environ is 0 -- no environment at all\n");
+        }
+    } else {
+        out.push_str("      dn_Startup 0 -- no FileSysStartupMsg\n");
+    }
     out
 }
 

@@ -356,6 +356,17 @@ pub const ROM_BASE: u32 = 0x1000;
 /// `diag_rom_header_matches_the_documented_diagarea_layout` test.
 pub const DIAG_MARKER_OFFSET: u32 = 14;
 
+/// Byte offset, from the start of the DiagArea's RAM copy, of the second
+/// diagnostic scratch cell (`hostblk-diagrom.s`'s `BootMarker`, directly
+/// after `DiagMarker`): `BootEntry` (`da_BootPoint`) counts its own
+/// invocations there. It exists because whether a given Kickstart's
+/// strap calls `da_BootPoint` at all was folklore in both directions --
+/// this cell answered it with guest evidence (Kickstart 3.2.2's strap
+/// calls it exactly once per boot attempt for a DIAGVALID + DAC_CONFIGTIME
+/// board, disassembly at strap 47.2 `$FC746E`), and `--inspect` keeps
+/// reporting it as a permanent diagnostic.
+pub const BOOT_MARKER_OFFSET: u32 = DIAG_MARKER_OFFSET + 4;
+
 /// Units this card can address. Matches `mirage::UNIT_COUNT`; there is
 /// no protocol reason the two must agree, they simply both picked "one
 /// byte's worth, comfortably more than this machine will ever attach"
@@ -1684,16 +1695,23 @@ mod tests {
         assert!((da_boot_point as usize) < da_size as usize);
 
         // DIAG_MARKER_OFFSET must land exactly where DiagEntry's own
-        // scratch cell sits: right after the 14-byte DiagArea header, and
-        // immediately before DiagEntry's own code (da_DiagPoint).
+        // scratch cell sits: right after the 14-byte DiagArea header.
+        // BOOT_MARKER_OFFSET (BootEntry's call counter) follows it, and
+        // DiagEntry's code starts immediately after the two 4-byte cells
+        // (da_DiagPoint).
         assert_eq!(
             DIAG_MARKER_OFFSET, 14,
             "struct DiagArea's documented 14-byte size"
         );
         assert_eq!(
-            da_diag_point as u32,
+            BOOT_MARKER_OFFSET,
             DIAG_MARKER_OFFSET + 4,
-            "DiagEntry's code must start right after the 4-byte marker cell"
+            "BootMarker sits directly after DiagMarker"
+        );
+        assert_eq!(
+            da_diag_point as u32,
+            BOOT_MARKER_OFFSET + 4,
+            "DiagEntry's code must start right after the two 4-byte marker cells"
         );
     }
 }

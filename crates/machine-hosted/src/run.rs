@@ -488,6 +488,23 @@ fn run_guest(
                 let opcode = bus.0.read_word(pc);
                 let (mnemonic, _) = m68k::dasm::disassemble(pc, opcode, cpu_type);
                 console.diag(&format!("{pc:#010x}: {opcode:#06x}  {mnemonic}"));
+                // Targeted register watch for guest debugging: TRACE_WATCH_PCS
+                // is a comma-separated list of hex PCs; when the traced PC
+                // matches, dump D0-D2/A0-A2/A6 so packet/signal plumbing can
+                // be followed without a full register trace.
+                if let Ok(watch) = std::env::var("TRACE_WATCH_PCS") {
+                    if watch
+                        .split(',')
+                        .filter_map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                        .any(|w| w == pc)
+                    {
+                        console.diag(&format!(
+                            "  WATCH {pc:#010x}: D0={:#010x} D1={:#010x} D2={:#010x} A0={:#010x} A1={:#010x} A2={:#010x} A6={:#010x} SP={:#010x}",
+                            cpu.dar[0], cpu.dar[1], cpu.dar[2],
+                            cpu.dar[8], cpu.dar[9], cpu.dar[10], cpu.dar[14], cpu.dar[15],
+                        ));
+                    }
+                }
             }
 
             if pc == last_pc {

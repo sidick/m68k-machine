@@ -346,12 +346,22 @@ IDNAME_RIGIDDISK         equ     $5244534b       ; 'RDSK'
 RDB_LOCATION_LIMIT       equ     16
 
 * devices/hardblocks.h: struct PartitionBlock.
+* Offsets by hand-summing the header's fields: pb_ID(0) pb_SummedLongs(4)
+* pb_ChkSum(8) pb_HostID(12) pb_Next(16) pb_Flags(20) pb_Reserved1[2](24)
+* pb_DevFlags(32) pb_DriveName[32](36) pb_Reserved2[15](68)
+* pb_Environment[20](128).
 PB_ID           equ     0
 PB_NEXT         equ     16
 PB_FLAGS        equ     20
-PB_DRIVENAME    equ     32
+PB_DRIVENAME    equ     36      ; NOT 32 -- 32 is pb_DevFlags ("preferred
+                                 ; flags for OpenDevice", a ULONG whose
+                                 ; high byte is 0), which an earlier
+                                 ; increment misread as the name's BSTR
+                                 ; length byte, silently synthesizing
+                                 ; "HB0" for every partition
 PB_ENVIRONMENT  equ     128
 IDNAME_PARTITION equ    $50415254       ; 'PART'
+PBFB_BOOTABLE   equ     0
 PBFF_NOMOUNT    equ     2
 
 * dos/filehandler.h: struct DosEnvec index numbers (longwords, matching
@@ -395,7 +405,13 @@ DEV_INT         equ     DEV_PENDING+LIST_SIZE   ; struct Interrupt (22),
                                                  ; long as the device does,
                                                  ; which this struct already
                                                  ; does by construction
-DEV_SIZE        equ     DEV_INT+INTERRUPT_SIZE
+DEV_OPENCALLS   equ     DEV_INT+INTERRUPT_SIZE  ; ULONG, diagnostic: every
+                                                 ; dev_open *attempt* (before
+                                                 ; any validation), so
+                                                 ; --inspect can distinguish
+                                                 ; "OpenDevice never called"
+                                                 ; from "called and rejected"
+DEV_SIZE        equ     DEV_OPENCALLS+4
 
 * One submission slot: a 20-byte descriptor plus the 4-byte pointer to
 * the IORequest that owns it (0 = slot free). The descriptor's own
@@ -428,6 +444,8 @@ _LVOGetCurrentBinding equ -138
 _LVOMakeDosNode equ     -144
 
 _LVOMakeLibrary equ     -84
+_LVOFindResident equ    -96
+_LVOInitResident equ    -102
 _LVOOpenLibrary equ     -552
 
 * ---- libraries/configregs.h: struct DiagArea's da_Config bit layout ------
@@ -467,6 +485,14 @@ DiagStart:
 DiagMarker:
         dc.l    0
 
+* Diagnostic scratch cell #2 (offset 18 in the RAM copy): BootEntry
+* counts its own invocations here, so a host-side inspector can answer
+* "does this Kickstart's strap actually call da_BootPoint?" with guest
+* evidence instead of folklore (copperhf's entry.s asserts V36+ never
+* calls it; nothing in this project had ever tested that).
+BootMarker:
+        dc.l    0
+
 *-----------------------------------------------------------------------------
 * DiagEntry -- da_DiagPoint. Calling convention (configregs.h; previous
 * increment's header quotes it in full): A0=board base, A2=RAM copy base.
@@ -497,18 +523,57 @@ DiagEntry:
         rts
 
 *-----------------------------------------------------------------------------
-* BootEntry -- da_BootPoint. Still a placeholder: this project's target
-* Kickstart (3.2.2, V47) never calls da_BootPoint at all -- V36+ boots
-* through AddBootNode's own strap integration (Autodocs/expansion.doc),
-* which the RDB mounter below drives from rt_Init, well before strap
-* ever runs. A V34 da_BootPoint fallback (copperhf's entry.s has one,
-* for exactly the Kickstart it targets) is out of scope: this project has
-* no V34 Kickstart image and the device ledger's retirement criterion is
-* this project's own Kickstart 3.2.2. Its offset must still be non-zero
-* (DAC_CONFIGTIME's precondition; previous increment's header), which is
-* why this stays a bare RTS rather than being deleted.
+* BootEntry -- da_BootPoint. NOT a placeholder: this Kickstart's (3.2.2,
+* V47) strap really does call it, and it is the node's *entire* boot
+* attempt. An earlier increment left this a bare RTS on the belief that
+* "V36+ never calls da_BootPoint at all -- AddBootNode suffices"
+* (copperhf's entry.s asserts the same); BootMarker below disproved that
+* with guest evidence (--inspect read it back as 1 after a boot), and
+* disassembly of this ROM's own strap module (strap 47.2, code at
+* $FC746E/$FC769C) shows the exact gate: for every non-floppy BootNode
+* whose bn_Node.ln_Name ConfigDev has ERTF_DIAGVALID set, a non-zero
+* diag-copy address in er_Reserved0c, and DAC_CONFIGTIME in the copied
+* da_Config, strap (1) moves that BootNode to MountList's head, (2)
+* pushes the ConfigDev on the stack C-style and calls da_BootPoint with
+* A6=ExecBase (A5=ExpansionBase live too -- strap sets EBB_SILENTSTART
+* on it first), then (3) if it *returns*, re-Enqueues the node and moves
+* on. A bare RTS therefore made every hostblk boot fail silently, with
+* the device never opened -- exactly the "DOS never reads a single
+* block" symptom.
+*
+* The implementation is the RKRM 3rd ed. autoboot convention (Appendix,
+* A2091-style boot ROMs; "Expansion Library" chapter): find dos.library's
+* Resident and call its rt_Init -- DOS then takes over the machine and
+* boots from MountList's head node, which strap just made ours. On
+* success that call never returns; if it does (or dos.library is
+* missing), fall through to RTS and let strap try the next node.
 *-----------------------------------------------------------------------------
 BootEntry:
+        move.l  a0,-(sp)
+        lea     BootMarker(pc),a0        ; both labels live in the RAM copy,
+        addq.l  #1,(a0)                   ; so the pc-relative displacement
+        move.l  (sp)+,a0                  ; survives the copy unchanged --
+                                           ; kept as a permanent diagnostic:
+                                           ; --inspect reports this cell as
+                                           ; "da_BootPoint call count"
+        lea     DosResName(pc),a1
+        jsr     _LVOFindResident(a6)     ; A1=name (exec.doc FindResident)
+        tst.l   d0
+        beq.s   .no_dos
+        move.l  d0,a1
+        moveq   #0,d1                    ; segList = NULL: ROM module.
+        jsr     _LVOInitResident(a6)     ; NOT a raw jsr into rt_Init: exec's
+                                          ; InitResident supplies the
+                                          ; documented entry conditions
+                                          ; (exec.doc: D0=0, A0=segList,
+                                          ; A6=ExecBase) -- a first draft
+                                          ; jumped rt_Init directly with a
+                                          ; stale D0/A0, and DOS came up just
+                                          ; far enough to mount the boot
+                                          ; volume and then stalled without
+                                          ; ever running Startup-Sequence.
+                                          ; On success this never returns.
+.no_dos:
         rts
 
 *-----------------------------------------------------------------------------
@@ -548,6 +613,11 @@ RtInitField:
 
 DeviceNameString:
         dc.b    "hostblk.device",0
+        even
+* Inside the copy region deliberately: BootEntry runs in the RAM copy and
+* reaches this PC-relative, so the string must be copied along with it.
+DosResName:
+        dc.b    "dos.library",0
         even
 IdString:
         dc.b    "hostblk.device 1.0 (2026)",0
@@ -626,6 +696,7 @@ RtInit:
         clr.b   LH_TAILPRED+4(a0)        ; lh_Type -- unused (NT_UNKNOWN)
 
         clr.l   DEV_OUTSTANDING(a3)
+        clr.l   DEV_OPENCALLS(a3)
 
         move.l  (HB_SUBMIT_CAPACITY)(a5),d0   ; never hardcode this (protocol
         move.l  d0,DEV_CAPACITY(a3)           ; section 8) -- it sizes the
@@ -743,14 +814,22 @@ RtInit:
 * there is no cross-object-file `.short symA-symB` hazard to route
 * around with trampolines the way copperhf's gcc-linked entry.s must).
 *-----------------------------------------------------------------------------
+* NO SPACES inside these expressions: vasm's Motorola syntax ends an
+* operand at the first blank and silently treats the rest of the line as
+* a comment, so `dc.w dev_open - FuncTable` assembles as `dc.w dev_open`
+* -- the label's bare section offset -- and MakeLibrary then builds every
+* vector pointing FuncTable's own offset *past* the real routine.
+* Confirmed by minimal repro against vasm 2.0b, and it was this file's
+* actual shipped bug: OpenDevice jumped into the middle of unrelated code
+* and hostblk.device could never be opened.
 FuncTable:
         dc.w    -1
-        dc.w    dev_open    - FuncTable
-        dc.w    dev_close   - FuncTable
-        dc.w    dev_expunge - FuncTable
-        dc.w    dev_extfunc - FuncTable
-        dc.w    dev_beginio - FuncTable
-        dc.w    dev_abortio - FuncTable
+        dc.w    dev_open-FuncTable
+        dc.w    dev_close-FuncTable
+        dc.w    dev_expunge-FuncTable
+        dc.w    dev_extfunc-FuncTable
+        dc.w    dev_beginio-FuncTable
+        dc.w    dev_abortio-FuncTable
         dc.w    -1
 
 *-----------------------------------------------------------------------------
@@ -761,6 +840,7 @@ FuncTable:
 *-----------------------------------------------------------------------------
 dev_open:
         movem.l d2-d7/a2-a5,-(sp)
+        addq.l  #1,DEV_OPENCALLS(a6)     ; diagnostic (DEV_OPENCALLS above)
         cmp.l   #UNIT_COUNT,d0
         bhs     .fail
 
@@ -836,6 +916,16 @@ dev_extfunc:
 *     int_handler frees one (this is this driver's whole answer to
 *     protocol section 8's self-limiting requirement: it structurally
 *     cannot over-submit, so it needs no devsoak `maxinflight` quirk).
+*     Clearing IOF_QUICK on a DoIO() caller is fine: exec's DoIO then
+*     waits for the ReplyMsg int_handler posts (exec 47.13's wait loop at
+*     $F809D4 polls the request's ln_Type for NT_REPLYMSG). This was
+*     re-verified deliberately after a debugging detour: a find_free_slot
+*     register clobber (see its header) once made int_handler "reply"
+*     garbage instead of the real IORequest, which mimicked a
+*     DoIO-needs-IOF_QUICK problem convincingly enough that a synchronous
+*     quick-completion path was drafted -- with the clobber fixed, the
+*     always-asynchronous form boots Kickstart's ROM FFS to Workbench
+*     unmodified, so that extra path was dropped again.
 *   - anything else: IOERR_NOCMD.
 *-----------------------------------------------------------------------------
 dev_beginio:
@@ -1045,22 +1135,30 @@ classify_async:
 * by SUBMIT_CAPACITY (typically single digits), so an O(capacity) scan
 * on every submit is not a real cost next to a host file I/O round trip.
 *-----------------------------------------------------------------------------
+* Scans with a0 only. It MUST NOT touch a1: every caller's a1 is the
+* IORequest being submitted, and an earlier version of this routine
+* walked the pool through a1 -- so by the time the caller read
+* IO_UNIT(a1)/IO_LENGTH(a1)/... and stored SLOT_OWNER, a1 pointed at the
+* just-found *slot*, not the request. The descriptor got garbage, the
+* completion's "owner" was the slot's own address, and int_handler then
+* faithfully completed and ReplyMsg'd a block of pool memory while the
+* real IORequest -- and the FFS process waiting on it -- hung forever.
+* That single clobber was the driver's deepest boot-blocking bug, found
+* by instruction-tracing FFS's first SendIO'd read.
 find_free_slot:
-        move.l  DEV_SLOTBASE(a3),a1
+        move.l  DEV_SLOTBASE(a3),a0
         move.l  DEV_CAPACITY(a3),d0
         tst.l   d0
         beq.s   .none
 .scan:
-        tst.l   SLOT_OWNER(a1)
+        tst.l   SLOT_OWNER(a0)
         beq.s   .found
-        add.l   #SLOT_SIZE,a1
+        add.l   #SLOT_SIZE,a0
         subq.l  #1,d0
         bne.s   .scan
 .none:
         suba.l  a0,a0
-        rts
 .found:
-        move.l  a1,a0
         rts
 
 *-----------------------------------------------------------------------------
@@ -1076,11 +1174,15 @@ find_free_slot:
 *-----------------------------------------------------------------------------
 submit_or_queue:
         bsr     classify_async            ; -> d1=desc command, d2=hi offset
+                                           ; (before Disable and before
+                                           ; find_free_slot, while a1 is
+                                           ; untouched)
         jsr     _LVODisable(a6)
 
-        bsr     find_free_slot
-        cmpa.l  #0,a0                     ; TST An is 68020+; this ROM stays
-        beq.s   .no_slot                  ; 68000-safe (build script's own
+        bsr     find_free_slot            ; returns a0; preserves a1 (its
+        cmpa.l  #0,a0                     ; header explains why that matters)
+        beq.s   .no_slot                  ; TST An is 68020+; this ROM stays
+                                           ; 68000-safe (build script's own
                                            ; -m68000 choice)
 
         move.b  d1,DESC_COMMAND(a0)
@@ -1433,15 +1535,35 @@ mount_partition:
         beq.s   .out                      ; MakeDosNode OOM -- skip this
                                            ; partition, keep walking the chain
 
+        move.l  a6,-(sp)
+        move.l  DEV_EXPBASE(a3),a6
+        ; Flags and ConfigDev depend on the partition's own PBFF_BOOTABLE
+        ; (hardblocks.h pb_Flags bit 0), exactly as expansion.doc's
+        ; AddBootNode INPUTS describe and copperhf's mounter.c (M6 comment)
+        ; independently arrived at: a *bootable* partition needs
+        ; ADNF_STARTPROC -- strap's boot-time device scan only starts (and
+        ; therefore only boots from) handlers it was told to start; without
+        ; it the node just sits unreferenced and the strap falls through to
+        ; the insert-disk screen (this was the bug: hostblk's node was
+        ; complete and correct but added with flags=0, so DOS never opened
+        ; hostblk.device at all) -- while a non-bootable one should get
+        ; neither the flag nor a ConfigDev ("Pass a NULL ConfigDev pointer
+        ; to create a non-bootable node").
+        move.l  PB_FLAGS(a2),d0
+        btst    #PBFB_BOOTABLE,d0
+        beq.s   .not_bootable
+        moveq   #1,d1                     ; ADNF_STARTPROC (expansion.h)
+        move.l  DEV_CONFIGDEV(a3),a1
+        bra.s   .add
+.not_bootable:
+        moveq   #0,d1
+        suba.l  a1,a1                     ; NULL ConfigDev: non-bootable
+.add:
         move.b  PB_ENVIRONMENT+(DE_BOOTPRI*4)+3(a2),d0
         ext.w   d0
         ext.l   d0                        ; sign-extend the BYTE bootPri
                                            ; AddBootNode's D0 input wants
-        move.l  a6,-(sp)
-        move.l  DEV_EXPBASE(a3),a6
-        moveq   #0,d1                     ; flags: not ADNF_STARTPROC
         move.l  d6,a0                     ; deviceNode
-        move.l  DEV_CONFIGDEV(a3),a1
         jsr     _LVOAddBootNode(a6)
         move.l  (sp)+,a6
 .out:
