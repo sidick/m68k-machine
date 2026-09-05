@@ -226,6 +226,15 @@ impl<'a> Cirrus542x<'a> {
         self.vram.len()
     }
 
+    /// Borrow the whole VRAM backing store, for a caller that wants to
+    /// walk a frame's worth of pixels in bulk (an RTG present path) rather
+    /// than one byte at a time through [`Cirrus542x::vram_read`]. Bounds
+    /// safety is whatever slice indexing already gives a caller — nothing
+    /// here does any address translation of its own.
+    pub fn vram(&self) -> &[u8] {
+        self.vram
+    }
+
     /// Read a byte of VRAM through the linear aperture.
     pub fn vram_read(&self, offset: usize) -> u8 {
         self.vram

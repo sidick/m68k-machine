@@ -252,6 +252,17 @@ impl<'a> MachineBus<'a> {
         self.overlay
     }
 
+    /// Borrow the attached Graffity card, if [`Self::with_graphics`] was
+    /// called. A caller driving a present path checks
+    /// `graphics().and_then(|c| c.decoded_mode())` each frame to decide
+    /// whether the card has anything ready to show; `None` here (no card
+    /// attached) is indistinguishable from "attached but not yet
+    /// programmed" as far as that caller is concerned, both meaning
+    /// nothing to present.
+    pub fn graphics(&self) -> Option<&Graffity<'a>> {
+        self.graphics.as_ref()
+    }
+
     /// Advance time by `cpu_clocks`, ticking the frame clock and both
     /// CIAs. Call this from the CPU's `sync` hook so device time and
     /// guest time stay in step.

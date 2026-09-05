@@ -594,6 +594,55 @@ pub fn format_disk_state(bus: &MachineBus) -> String {
     )
 }
 
+/// Summarise the attached Graffity card's state (`--graphics`), for
+/// diagnosing exactly how far an RTG boot got: whether a driver ever
+/// programmed a presentable mode at all (`decoded_mode`), and, when it
+/// did, the geometry/depth it chose plus a couple of palette entries —
+/// distinguishing "the driver opened the screen but painted nothing"
+/// (VRAM's first bytes and the palette both still at their power-on
+/// zero) from "painted, but the wrong colours" (palette entry 0 or 1 set
+/// to something unexpected) without needing a screenshot at all. `None`
+/// when no card is attached.
+pub fn format_graphics_state(bus: &MachineBus) -> String {
+    let Some(card) = bus.graphics() else {
+        return "graphics state: no card attached".to_string();
+    };
+    // Graffity registers its two boards (VRAM, then registers) before
+    // anything else this machine's board layers attach, so chain indices
+    // 0/1 are its own whenever a card is present at all -- see
+    // `graffity`'s module doc comment on the two-board shape.
+    let fmt_base = |base: Option<u32>| match base {
+        Some(b) => format!("{b:#010x}"),
+        None => "none".to_string(),
+    };
+    let vram_base = fmt_base(bus.autoconfig.placement(0).map(|p| p.base));
+    let regs_base = fmt_base(bus.autoconfig.placement(1).map(|p| p.base));
+    match card.decoded_mode() {
+        Some(mode) => {
+            let first_bytes: std::vec::Vec<u8> = (0..8)
+                .map(|i| card.vram_read(mode.start_offset + i))
+                .collect();
+            format!(
+                "graphics state: VRAM base {vram_base}  regs base {regs_base}  \
+                 decoded_mode {}x{} {:?}  stride {}  start_offset {:#x}  \
+                 first VRAM bytes at start_offset {:02x?}  palette[0] {:#010x}  palette[1] {:#010x}",
+                mode.width,
+                mode.height,
+                mode.depth,
+                mode.stride_bytes,
+                mode.start_offset,
+                first_bytes,
+                card.palette_argb(0),
+                card.palette_argb(1),
+            )
+        }
+        None => format!(
+            "graphics state: VRAM base {vram_base}  regs base {regs_base}  \
+             decoded_mode is None (driver has not programmed a presentable mode yet)"
+        ),
+    }
+}
+
 fn task_line(task: Option<&TaskEntry>) -> String {
     match task {
         None => "(none)".to_string(),

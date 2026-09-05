@@ -46,6 +46,7 @@
 //! §12).
 
 use crate::chipset::{reg, Chipset};
+use crate::cirrus::{DecodedMode, PixelDepth};
 use crate::display::{argb_from_amiga, Framebuffer};
 
 /// Instruction budget for one copper list walk. Real lists run to a few
@@ -1160,6 +1161,109 @@ fn draw_sprite0(state: &CopperState, ram: &[u8], bands: &Bands, fb: &mut Framebu
             let x = x0 + bit * step;
             let argb = argb_from_amiga(bstate.color[16 + value as usize]);
             fb.put(x as usize, y as usize, argb);
+        }
+    }
+}
+
+/// Present a Graffity/Cirrus RTG framebuffer: proposal §8.2's production
+/// display path, in its first-light form (module doc comment of the
+/// caller that wires this up, `machine-hosted`'s `screenshot.rs`).
+///
+/// This is a *board present*, not a copper-driven scanout like
+/// [`Renderer::render`] above — there is no copper list, no `WAIT`
+/// banding, no bitplanes. [`crate::cirrus::Cirrus542x::decoded_mode`] has
+/// already done all the register decoding (geometry, stride, panning
+/// start offset, pixel depth) and validated that the described scanout
+/// fits inside `vram`; this function's only job is to walk that already-
+/// validated rectangle and convert each pixel to `0xAARRGGBB`.
+///
+/// **`palette` is a closure, not a borrowed `&Cirrus542x`/`&Graffity`**,
+/// so this stays generic over whichever board owns the chip rather than
+/// coupling `render.rs` to `graffity.rs`'s or `cirrus.rs`'s types beyond
+/// what it already imports ([`DecodedMode`]/[`PixelDepth`]) — the same
+/// reason [`Renderer::render`] takes `&Chipset` rather than a whole
+/// `MachineBus`.
+///
+/// **Bpp8** (what the oracle's `FakeNativeModes` chunky mode actually
+/// programs, and the only depth reachable before P96Mode negotiates
+/// something richer): each VRAM byte is a palette index, looked up
+/// through `palette` — the whole conversion.
+///
+/// **Bpp15/16/24: implemented, but unverified against a real driver.**
+/// No P96 driver in this project's test corpus has yet been observed to
+/// program anything but Bpp8 (see this function's caller's own doc
+/// comment), so these three branches are this renderer's best-effort
+/// guess at the standard VGA/Cirrus little-endian layouts —
+/// **XRGB1555** for 15bpp, **RGB565** for 16bpp (5/6/5 guns, the
+/// conventional split when the extra bit goes to green), and packed
+/// **BGR888** for 24bpp (byte order low-to-high B,G,R, matching how a
+/// VGA-lineage RAMDAC's 24bpp mode is conventionally wired) — never
+/// cross-checked against a register capture the way [`Cirrus542x`]'s own
+/// decode was. Treat a picture through one of these three paths as
+/// plausible, not confirmed.
+///
+/// Every VRAM access goes through bounds-checked slice indexing
+/// (`vram.get`, defaulting to `0` past the end) even though
+/// `decoded_mode`'s own contract already guarantees the described
+/// rectangle fits — the same defence-in-depth [`read_byte`]/[`read_word`]
+/// apply to copper-sourced pointers above, cheap insurance against this
+/// function ever being called with a `mode` that didn't actually come
+/// from the same VRAM's own `decoded_mode()`.
+pub fn render_rtg(
+    mode: &DecodedMode,
+    vram: &[u8],
+    palette: impl Fn(u8) -> u32,
+    fb: &mut Framebuffer,
+) {
+    let width = (mode.width as usize).min(fb.width);
+    let height = (mode.height as usize).min(fb.height);
+
+    let expand5 = |c: u16| -> u32 {
+        let c = c as u32;
+        (c << 3) | (c >> 2)
+    };
+    let expand6 = |c: u16| -> u32 {
+        let c = c as u32;
+        (c << 2) | (c >> 4)
+    };
+
+    for y in 0..height {
+        let row_start = mode.start_offset as usize + y * mode.stride_bytes as usize;
+        for x in 0..width {
+            let argb = match mode.depth {
+                PixelDepth::Bpp8 => {
+                    let index = vram.get(row_start + x).copied().unwrap_or(0);
+                    palette(index)
+                }
+                PixelDepth::Bpp15 => {
+                    let off = row_start + x * 2;
+                    let lo = vram.get(off).copied().unwrap_or(0) as u16;
+                    let hi = vram.get(off + 1).copied().unwrap_or(0) as u16;
+                    let v = lo | (hi << 8);
+                    let r = (v >> 10) & 0x1F;
+                    let g = (v >> 5) & 0x1F;
+                    let b = v & 0x1F;
+                    0xFF00_0000 | (expand5(r) << 16) | (expand5(g) << 8) | expand5(b)
+                }
+                PixelDepth::Bpp16 => {
+                    let off = row_start + x * 2;
+                    let lo = vram.get(off).copied().unwrap_or(0) as u16;
+                    let hi = vram.get(off + 1).copied().unwrap_or(0) as u16;
+                    let v = lo | (hi << 8);
+                    let r = (v >> 11) & 0x1F;
+                    let g = (v >> 5) & 0x3F;
+                    let b = v & 0x1F;
+                    0xFF00_0000 | (expand5(r) << 16) | (expand6(g) << 8) | expand5(b)
+                }
+                PixelDepth::Bpp24 => {
+                    let off = row_start + x * 3;
+                    let b = vram.get(off).copied().unwrap_or(0) as u32;
+                    let g = vram.get(off + 1).copied().unwrap_or(0) as u32;
+                    let r = vram.get(off + 2).copied().unwrap_or(0) as u32;
+                    0xFF00_0000 | (r << 16) | (g << 8) | b
+                }
+            };
+            fb.put(x, y, argb);
         }
     }
 }
@@ -2582,5 +2686,92 @@ mod tests {
             lit,
             "row 2 lit, as written"
         );
+    }
+
+    // ---- render_rtg ----------------------------------------------------
+
+    #[test]
+    fn render_rtg_bpp8_looks_up_the_palette_per_byte() {
+        let mode = DecodedMode {
+            width: 4,
+            height: 2,
+            depth: PixelDepth::Bpp8,
+            stride_bytes: 4,
+            start_offset: 0,
+        };
+        let vram: std::vec::Vec<u8> = std::vec![0, 1, 2, 3, 3, 2, 1, 0];
+        let mut pixels = [0u32; 4 * 2];
+        let mut fb = Framebuffer::new(&mut pixels, 4, 2).unwrap();
+
+        let palette = |index: u8| 0xFF00_0000 | ((index as u32) << 16);
+        render_rtg(&mode, &vram, palette, &mut fb);
+
+        assert_eq!(fb.pixels[0], 0xFF00_0000);
+        assert_eq!(fb.pixels[1], 0xFF01_0000);
+        assert_eq!(fb.pixels[2], 0xFF02_0000);
+        assert_eq!(fb.pixels[3], 0xFF03_0000);
+        // Second row starts at stride_bytes, not width*bpp coincidentally
+        // equal to it here -- both are 4, so this also exercises that the
+        // row-start math actually uses stride rather than width.
+        assert_eq!(fb.pixels[4], 0xFF03_0000);
+        assert_eq!(fb.pixels[7], 0xFF00_0000);
+    }
+
+    #[test]
+    fn render_rtg_honours_a_nonzero_panning_start_offset() {
+        let mode = DecodedMode {
+            width: 2,
+            height: 1,
+            depth: PixelDepth::Bpp8,
+            stride_bytes: 2,
+            start_offset: 10,
+        };
+        let vram: std::vec::Vec<u8> = std::vec![0xAA; 10]
+            .into_iter()
+            .chain(std::vec![5u8, 6u8])
+            .collect();
+        let mut pixels = [0u32; 2];
+        let mut fb = Framebuffer::new(&mut pixels, 2, 1).unwrap();
+
+        render_rtg(&mode, &vram, |index| 0xFF00_0000 | index as u32, &mut fb);
+        assert_eq!(fb.pixels[0], 0xFF00_0005);
+        assert_eq!(fb.pixels[1], 0xFF00_0006);
+    }
+
+    #[test]
+    fn render_rtg_bpp16_decodes_rgb565_little_endian() {
+        let mode = DecodedMode {
+            width: 1,
+            height: 1,
+            depth: PixelDepth::Bpp16,
+            stride_bytes: 2,
+            start_offset: 0,
+        };
+        // 0xF800 = pure red at 5/6/5 (R=0x1F, G=0, B=0), little-endian in
+        // VRAM: low byte 0x00, high byte 0xF8.
+        let vram: std::vec::Vec<u8> = std::vec![0x00, 0xF8];
+        let mut pixels = [0u32; 1];
+        let mut fb = Framebuffer::new(&mut pixels, 1, 1).unwrap();
+
+        render_rtg(&mode, &vram, |_| 0, &mut fb);
+        assert_eq!(fb.pixels[0], 0xFFFF_0000, "full-intensity red");
+    }
+
+    #[test]
+    fn render_rtg_does_not_panic_when_geometry_runs_past_a_short_vram() {
+        // decoded_mode's own contract already rules this out in practice,
+        // but render_rtg must not assume it -- a mismatched mode/vram pair
+        // must degrade to reading zero, never panic.
+        let mode = DecodedMode {
+            width: 4,
+            height: 4,
+            depth: PixelDepth::Bpp24,
+            stride_bytes: 12,
+            start_offset: 0,
+        };
+        let vram: std::vec::Vec<u8> = std::vec![0x11; 4];
+        let mut pixels = [0u32; 16];
+        let mut fb = Framebuffer::new(&mut pixels, 4, 4).unwrap();
+        render_rtg(&mode, &vram, |_| 0, &mut fb); // must not panic
     }
 }

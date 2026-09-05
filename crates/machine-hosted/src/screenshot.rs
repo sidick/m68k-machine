@@ -46,9 +46,8 @@
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
-use machine_core::chipset::Chipset;
 use machine_core::display::{DisplaySurface, Framebuffer, MAX_HEIGHT, MAX_WIDTH};
-use machine_core::render::Renderer;
+use machine_core::render::{render_rtg, Renderer};
 use machine_core::{MachineBus, CHIP_RAM_BASE, CHIP_RAM_SIZE};
 
 use crate::console::Console;
@@ -158,9 +157,44 @@ fn frame_stats(pixels: &[u32]) -> FrameStats {
     }
 }
 
-/// Render one frame from `chipset`/`chip_ram` and hand it to `surface`,
-/// returning stats over what came out.
-fn capture(chipset: &Chipset, chip_ram: &[u8], surface: &mut PngSurface) -> FrameStats {
+/// Render one frame from `bus` and hand it to `surface`, returning stats
+/// over what came out.
+///
+/// **Present-path selection** is `SetSwitch` in effect (task doc comment):
+/// when the attached Graffity card (if any, `--graphics`) has a driver-
+/// programmed mode (`decoded_mode()` returns `Some`), that RTG framebuffer
+/// is what gets captured, walked straight out of VRAM via
+/// [`render_rtg`] -- no `chip_ram` snapshot needed at all, since RTG pixel
+/// data never touches chip RAM. Otherwise (no card attached, or attached
+/// but not yet programmed) this falls back to the stop-gap planar
+/// renderer exactly as before `--graphics` existed, so a run with no card
+/// attached is byte-for-byte unaffected by this function's RTG branch
+/// ever having been added.
+fn capture(bus: &mut MachineBus, surface: &mut PngSurface) -> FrameStats {
+    if let Some(mode) = bus.graphics().and_then(|card| card.decoded_mode()) {
+        let width = mode.width as usize;
+        let height = mode.height as usize;
+        let mut pixels = vec![0u32; width * height];
+        {
+            // Bounded by `Framebuffer::new`'s own sizing (matches
+            // `width`/`height` exactly), so this cannot fail.
+            let mut fb = Framebuffer::new(&mut pixels, width, height)
+                .expect("scratch buffer sized exactly to the decoded mode's own geometry");
+            let card = bus
+                .graphics()
+                .expect("just matched Some(mode) from this same card above");
+            render_rtg(
+                &mode,
+                card.vram(),
+                |index| card.palette_argb(index),
+                &mut fb,
+            );
+        }
+        let stats = frame_stats(&pixels);
+        surface.present(&pixels, width, height);
+        return stats;
+    }
+
     let (width, height) = surface.dimensions();
     let mut pixels = vec![0u32; width * height];
     // `width`/`height` are `MAX_WIDTH`/`MAX_HEIGHT` from `surface`'s own
@@ -168,7 +202,8 @@ fn capture(chipset: &Chipset, chip_ram: &[u8], surface: &mut PngSurface) -> Fram
     // so `Framebuffer::new` cannot actually return `None` here.
     let mut fb = Framebuffer::new(&mut pixels, width, height)
         .expect("scratch buffer sized exactly to surface dimensions");
-    Renderer::new().render(chipset, chip_ram, &mut fb);
+    let chip_ram = snapshot_chip_ram(bus);
+    Renderer::new().render(&bus.chipset, &chip_ram, &mut fb);
     let stats = frame_stats(&pixels);
     surface.present(&pixels, width, height);
     stats
@@ -259,14 +294,28 @@ impl ScreenshotJob {
         };
         self.surface.set_target(target.clone());
 
-        let chip_ram = snapshot_chip_ram(bus);
-        let stats = capture(&bus.chipset, &chip_ram, &mut self.surface);
+        let is_rtg = bus
+            .graphics()
+            .and_then(|card| card.decoded_mode())
+            .is_some();
+        let stats = capture(bus, &mut self.surface);
+        let (width, height) = if is_rtg {
+            // Whatever the driver actually programmed, not the planar
+            // renderer's fixed worst-case canvas -- see `capture`'s doc
+            // comment on present-path selection.
+            bus.graphics()
+                .and_then(|card| card.decoded_mode())
+                .map(|m| (m.width as usize, m.height as usize))
+                .unwrap_or((MAX_WIDTH, MAX_HEIGHT))
+        } else {
+            (MAX_WIDTH, MAX_HEIGHT)
+        };
         console.diag(&format!(
             "screenshot: frame {} -> {} ({}x{}, {} distinct colour{}, {}/{} pixels differ from background)",
             self.next_frame,
             target.display(),
-            MAX_WIDTH,
-            MAX_HEIGHT,
+            width,
+            height,
             stats.distinct_colours,
             if stats.distinct_colours == 1 { "" } else { "s" },
             stats.non_background_pixels,

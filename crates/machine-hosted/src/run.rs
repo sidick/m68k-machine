@@ -218,6 +218,18 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         None => None,
     };
 
+    // Heap-allocated, and opened (allocated) outside the `Option` match
+    // below for the same lifetime reason `hd_device` is: `with_graphics`
+    // borrows it `&'a mut`, so it must outlive `machine_bus`. Only
+    // allocated at all when `--graphics` is passed -- a plain boot run
+    // pays nothing for it, matching `with_graphics`'s own "absent unless
+    // attached" contract.
+    let mut graphics_vram: Vec<u8> = if args.graphics {
+        vec![0u8; (args.graphics_vram_mb as usize) * 1024 * 1024]
+    } else {
+        Vec::new()
+    };
+
     let machine_bus = MachineBus::new(&mut chip_ram, &rom_bytes);
     let machine_bus = match &ext_rom_bytes {
         Some(ext) => machine_bus.with_ext_rom(ext),
@@ -228,6 +240,15 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     let machine_bus = match &mut hd_device {
         Some(dev) => machine_bus.with_hd(dev),
         None => machine_bus,
+    };
+    let machine_bus = if args.graphics {
+        console.diag(&format!(
+            "graphics: Graffity attached, {} MB VRAM",
+            args.graphics_vram_mb
+        ));
+        machine_bus.with_graphics(&mut graphics_vram)
+    } else {
+        machine_bus
     };
     let mut bus = Bus(machine_bus);
 
@@ -279,6 +300,9 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         }
         console.diag(&crate::introspect::format_display_state(&bus.0.chipset));
         console.diag(&crate::introspect::format_disk_state(&bus.0));
+        if args.graphics {
+            console.diag(&crate::introspect::format_graphics_state(&bus.0));
+        }
     }
 
     report

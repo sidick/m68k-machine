@@ -128,6 +128,24 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub hd_writable: bool,
 
+    /// Attach the Graffity graphics card (`machine_core::graffity`) over
+    /// heap-allocated VRAM and register its two AUTOCONFIG boards on the
+    /// chain. Without this flag nothing about the boot path changes --
+    /// the chain and every address the card would occupy stay exactly as
+    /// they are today (`MachineBus::with_graphics`'s own doc comment).
+    /// With it, `--screenshot`'s capture path prefers the card's own
+    /// `decoded_mode()` framebuffer over the stop-gap planar renderer
+    /// once a driver has programmed one (`crate::screenshot`'s RTG
+    /// present path).
+    #[arg(long, default_value_t = false)]
+    pub graphics: bool,
+
+    /// VRAM size, in megabytes, for `--graphics`'s card. 2 MB matches the
+    /// Copperline oracle's `graffityz2` configuration this project checks
+    /// against. Ignored without `--graphics`.
+    #[arg(long, default_value_t = 2)]
+    pub graphics_vram_mb: u32,
+
     /// Floppy drive configuration this machine presents on CIA-A PRA /
     /// CIA-B PRB (proposal §7.2; see `machine_core::cia::FloppyDrive`).
     /// `none` (the default) is this machine's honest hardware story --

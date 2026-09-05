@@ -154,6 +154,13 @@ impl<'a> Graffity<'a> {
         self.chip.vram_write(offset as usize, value);
     }
 
+    /// Borrow the whole VRAM backing store, for a bulk RTG present path
+    /// (see [`Cirrus542x::vram`]) rather than walking a frame one byte at
+    /// a time through [`Graffity::vram_read`].
+    pub fn vram(&self) -> &[u8] {
+        self.chip.vram()
+    }
+
     /// Read a VGA register. `offset` is the register window offset from
     /// its configured base, which *is* the VGA port number: Graffity's
     /// register window addresses VGA ports directly, unlike the Picasso
