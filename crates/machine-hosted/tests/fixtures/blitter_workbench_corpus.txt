@@ -1,0 +1,64 @@
+# Blitter register trace corpus -- proposal §12's "recorded Workbench
+# traces" half of the blitter differential (docs/blitter-differential.md).
+# One line per distinct register signature, already deduplicated by
+# `crate::blitter_trace::BlitterTrace` at capture time.
+#
+# Provenance: `machine-hosted --rom nondistribution/A1200.47.115.rom --hd
+# nondistribution/m68k-machine.hdf --blitter-trace <this file> --screenshot
+# ... --screenshot-frame 4000 --max-frames 4500` -- the same planar
+# Workbench boot this project's baselines are pinned against (752x576, 6
+# distinct colours, 13507/433152 non-background pixels at frame 4000,
+# unchanged by tracing). Neither the ROM nor the HDF is redistributable
+# (nondistribution/README.md), so this file -- derived data, not the
+# image itself -- is what's checked in; regenerate by rerunning the above
+# with those local, unredistributed inputs.
+#
+# Over that boot: 110 area-mode `BLTSIZE` arms observed, deduplicating to
+# the 30 lines below; 1368 line-mode arms were seen and skipped (line mode
+# is out of scope for this recorder -- see blitter_trace.rs's module doc
+# comment for why). Every one of the 30 shares one shape: `USED` only
+# (`BLTCON0` bits 8-11 = 0001, i.e. no memory-backed source channel) with
+# minterm `LF=0xF0` (`D = A`, so a disabled A channel's constant `BLTADAT`
+# becomes the fill value) -- graphics.library's plain rectangle-fill
+# idiom, used repeatedly for window/icon background clears. They vary
+# only in `BLTAMOD`/`BLTCMOD`/`BLTDMOD`, `BLTADAT`/`BLTBDAT`, and
+# width/height. Nothing here uses a shifted barrel, a non-identity
+# minterm, `BLTCON1`'s fill mode, or more than one active channel --
+# narrower than the randomised half's coverage (256 minterms, all 16
+# channel-enable combinations, full 0-15 shifts), which is itself a real
+# finding: see docs/blitter-differential.md.
+#
+# columns: bltcon0 bltcon1 bltafwm bltalwm amod bmod cmod dmod adat bdat cdat width height c_eq_d
+# (all decimal; amod/bmod/cmod/dmod signed, width/height are BLTSIZE's raw
+# fields with 0 meaning 64/1024, c_eq_d is 0 or 1 -- see
+# crates/machine-hosted/src/blitter_trace.rs and docs/blitter-differential.md)
+0 0 0 0 0 0 0 0 0 0 0 1 1 1
+496 0 65535 65535 0 0 0 0 65535 0 0 1 8 0
+496 0 65535 65535 0 0 0 0 0 0 0 1 8 0
+496 0 65535 65535 0 0 0 0 65535 65535 0 1 8 0
+496 0 65535 65535 0 0 0 0 0 65535 0 1 8 0
+496 0 65535 65535 0 0 0 0 65535 65535 0 2 8 0
+496 0 65535 65535 0 0 0 0 0 65535 0 2 8 0
+496 0 65535 65535 0 2 0 0 0 65535 0 2 6 0
+496 0 65535 65535 0 0 2 0 65535 65535 0 1 8 0
+496 0 65535 65535 0 0 2 0 0 65535 0 1 8 0
+496 0 65535 65535 0 2 0 0 0 65535 0 1 6 0
+496 0 65535 65535 0 0 0 0 0 65535 0 1 5 0
+496 0 65535 65535 0 0 0 0 0 65535 0 1 6 0
+496 0 65535 65535 0 0 0 0 65535 65535 0 1 6 0
+496 0 65535 65535 0 0 0 0 0 65535 0 1 4 0
+496 0 65535 65535 0 0 2 0 0 65535 0 2 8 0
+496 0 65535 65535 0 0 2 0 65535 65535 0 2 8 0
+496 0 65535 65535 0 0 2 0 0 65535 0 2 11 0
+496 0 65535 65535 -18 0 4 0 0 65535 0 2 11 0
+496 0 65535 65535 -18 -8 -84 0 65535 65535 0 2 10 0
+496 0 65535 65535 -18 -8 -84 0 0 65535 0 1 6 0
+496 0 65535 65535 -16 0 4 0 0 65535 0 2 10 0
+496 0 65535 65535 -16 0 4 0 65535 65535 0 2 11 0
+496 0 65535 65535 -16 0 4 0 0 65535 0 2 11 0
+496 0 65535 65535 2 -34 158 0 0 43690 0 1 5 0
+496 0 65535 65535 -16 0 2 0 0 65535 0 1 5 0
+496 0 65535 65535 -18 0 4 0 0 65535 0 1 5 0
+496 0 65535 65535 0 0 2 0 0 65535 0 1 5 0
+496 0 65535 65535 -16 0 0 0 0 65535 0 51 1 0
+496 0 65535 65535 0 0 0 0 0 65535 0 51 1 0

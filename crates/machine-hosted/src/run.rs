@@ -254,7 +254,22 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     } else {
         machine_bus
     };
-    let mut bus = Bus(machine_bus);
+    let blitter_trace = match &args.blitter_trace {
+        Some(path) => match crate::blitter_trace::BlitterTrace::open(path) {
+            Ok(t) => {
+                console.diag(&format!("blitter-trace: recording to {}", path.display()));
+                Some(t)
+            }
+            Err(e) => {
+                return setup_error(
+                    console,
+                    format!("opening --blitter-trace {}: {e}", path.display()),
+                )
+            }
+        },
+        None => None,
+    };
+    let mut bus = Bus(machine_bus, blitter_trace);
 
     let mut serial_script = match &args.serial_script {
         Some(path) => match SerialScript::load(path) {
@@ -307,6 +322,10 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         if args.graphics {
             console.diag(&crate::introspect::format_graphics_state(&bus.0));
         }
+    }
+
+    if let Some(trace) = bus.1.take() {
+        console.diag(&trace.finish());
     }
 
     report

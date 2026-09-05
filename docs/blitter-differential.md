@@ -7,13 +7,18 @@ including all 256 minterms checked against an independently written truth
 table). This document covers the differential half, implemented in
 `crates/machine-hosted/tests/blitter_differential.rs`.
 
-**Bottom line: the differential does not pass as of this writing.** It
-found two real, reproducible divergences between `machine-core`'s
-`Blitter` and Copperline 0.18.0 (the designated oracle), both in
-`crates/machine-core/src/blitter.rs`. Per this task's ownership rules
-that file is out of scope for this change — **these are reported here for
-review, not fixed.** Everything else the differential checks agrees
-exactly.
+**Bottom line: the differential passes, both halves.** 454 cases --
+424 randomised (minterms, channel-enable combinations, shifts, masks,
+fill modes, modulos/sizes, and line-mode octants) plus 30 distinct
+register signatures recorded from a real, booted planar Workbench
+desktop -- all agree exactly with Copperline 0.18.0 (the designated
+oracle). Two real divergences were found and reported here during
+development of the randomised half (Findings 1 and 2 below); both have
+since been fixed in `crates/machine-core/src/blitter.rs` by other work on
+this project, which is why the differential passes now. The findings stay
+in this document as the record of what was found and how, per this
+project's convention that a fixed bug's writeup does not get deleted, just
+marked resolved.
 
 ## Running it
 
@@ -29,9 +34,10 @@ tests. It is `#[ignore]`d, so it never runs under a bare `cargo test`.
 Two tests live in the file:
 
 - `blitter_differential_against_copperline` — the actual differential.
-  424 cases, ~1.7s wall clock (measured; dominated by process spawn and
-  ~2,000 CCP round trips over loopback TCP, not emulation — Copperline's
-  headless mode is unthrottled).
+  454 cases (424 randomised + 30 recorded, see below), ~1.7s wall clock
+  (measured; dominated by process spawn and CCP round trips over
+  loopback TCP, not emulation — Copperline's headless mode is
+  unthrottled).
 - `dmacon_gate_is_a_known_divergence_from_hardware` — a small, separate,
   *passing* test that pins the DMACON gap (below) as an intentional,
   understood finding rather than something silently assumed.
@@ -92,22 +98,134 @@ a documented reason).
 
 ### The boot-ROM overlay gotcha
 
-At reset, the low end of chip RAM (empirically, at least the first
-1&nbsp;MiB — Copperline logged "1MiB ROM detected" for the AROS ROM it
-boots headless sessions with) is overlaid with the boot ROM (`OVL`).
-`mem.write` there silently writes zero bytes (its `written` count is
-less than the request), and a hijacked `PC` pointed into it runs stray
-AROS boot code instead of the test's program — which is exactly what
-happened during development: the first attempt placed its program at
-`$001000` and instead of running it, Copperline booted into the real
-AROS ROM sequence, and the `run_until` call blocked until this was
-noticed and killed (`copperline`'s own log showed `ROMInfo:`/`zorro:`
-boot messages, the tell). The harness's `ARENA_BASE` (`$00110000`) stays
-comfortably clear of this.
+At reset, the low end of chip RAM — exactly the first 1&nbsp;MiB, checked
+directly with `mem.write` probes at and below `$00100000` while widening
+this arena for the Workbench corpus (`$000FFF00` writes zero bytes,
+`$00100000` writes cleanly) — is overlaid with the boot ROM (`OVL`).
+Copperline also logged "1MiB ROM detected" for the AROS ROM it boots
+headless sessions with, consistent with the same boundary. `mem.write`
+under the overlay silently writes zero bytes (its `written` count is less
+than the request), and a hijacked `PC` pointed into it runs stray AROS
+boot code instead of the test's program — which is exactly what happened
+during development: the first attempt placed its program at `$001000`
+and instead of running it, Copperline booted into the real AROS ROM
+sequence, and the `run_until` call blocked until this was noticed and
+killed (`copperline`'s own log showed `ROMInfo:`/`zorro:` boot messages,
+the tell). The harness's `ARENA_BASE` (`$00100200`, a 512-byte margin
+below the confirmed edge) stays clear of this.
+
+## Recorded Workbench traces
+
+The randomised half above covers a bounded parameter space chosen by
+hand; it cannot know what a real OS actually exercises. This half
+answers that directly: boot a real planar Workbench desktop, record
+every distinct blitter register combination it arms, and replay each one
+through the same differential machinery with randomised memory.
+
+**Mechanism: record register combinations, not pixel data.** Capturing
+and replaying a blit's actual source pixels would mean snapshotting chip
+RAM per operation — far more machinery than the value justifies, and
+this differential already remaps every case's pointers into its own
+scratch arena regardless of where the real OS put them, randomised or
+recorded. So `machine-hosted`'s `--blitter-trace FILE` flag
+(`crates/machine-hosted/src/blitter_trace.rs`) instead watches every
+write that reaches a blitter register from `crate::bus::Bus`'s
+`AddressBus` impl (the one seam in this hosted-only crate that sees every
+guest write before it reaches `machine_core::MachineBus`, without
+touching `machine-core` itself), and each time a `BLTSIZE` write arms a
+blit — the same write `MachineBus::write_custom_word` reacts to by
+calling `Blitter::execute` — records `BLTCON0`/`BLTCON1` (channel enables
+live in `BLTCON0`'s own bits, so no separate field is needed), the masks,
+the four modulos, the three constant-channel data registers, the size,
+and whether `BLTCPT`/`BLTDPT` happened to be equal (graphics.library's
+read-modify-write idiom, `D = A | C` onto existing content). Absolute
+pointers are dropped. A `HashSet` of the recorded signature deduplicates
+on the fly, so a multi-thousand-blit boot yields a small corpus rather
+than a firehose. The flag is `None` on a plain run, so an unmodified boot
+pays one `if let Some` check per register write and nothing else — the
+baselines below are unmoved by this flag's mere existence.
+
+Line-mode arms (`BLTCON1`'s `LINE` bit set) are recorded as seen but never
+added to the corpus: in line mode, `BLTAPTL`/`BLTAPTH` hold the Bresenham
+error accumulator, not a memory address, so replaying a captured
+line-mode signature through this file's `AreaCase` shape (which treats
+every channel's pointer as an address to remap into the arena) would
+silently corrupt the geometry rather than exercise it — worse than not
+capturing it at all. The randomised half already exercises line mode
+thoroughly (`line_cases`, every Bresenham octant, `SING`, B-texture), so
+this is a deliberate scope line, not a gap this differential is quietly
+leaving uncovered.
+
+**Running it.**
+
+```sh
+cargo build -p machine-hosted --release
+./target/release/machine-hosted --rom nondistribution/A1200.47.115.rom \
+  --hd nondistribution/m68k-machine.hdf --screenshot /tmp/planar.png \
+  --screenshot-frame 4000 --max-frames 4500 --max-instructions 300000000 \
+  --blitter-trace /tmp/blitter_trace.txt
+```
+
+reaches the same 752×576, 6-distinct-colour, 13507/433152-non-background-
+pixel planar Workbench desktop this project's baselines are already
+pinned against, unchanged by tracing. Neither the ROM nor the HDF is
+redistributable (`nondistribution/README.md`), so the *output* of that
+run — deduplicated, pointer-free register signatures, not guest memory or
+ROM/disk content — is what's checked in:
+`crates/machine-hosted/tests/fixtures/blitter_workbench_corpus.txt`. The
+differential test parses it with `include_str!` and folds it into the
+same `area_cases` list the randomised generators build, via the same
+`AreaCase`/`run_area_case`/`build_program` path — not a second mechanism.
+That is why `cargo test` here needs neither the ROM nor the HDF: the
+corpus is data, checked in once, replayed with fresh randomised memory on
+every run, exactly like every other case in this file.
+
+**What the corpus actually holds — a sharp negative result.** Over that
+boot: 110 area-mode `BLTSIZE` arms were observed, deduplicating to
+**30** distinct signatures (1,368 line-mode arms were also seen and
+skipped per the scoping above — real Workbench draws far more lines than
+filled rectangles on this desktop, evidently). All 30 share one shape:
+`USED` alone (no memory-backed source channel active) with
+minterm `LF=0xF0` (`D = A`, so a *disabled* A channel's constant
+`BLTADAT` register becomes the fill value) — graphics.library's plain
+rectangle-fill idiom, used repeatedly for window and icon background
+clears. They vary only in the modulos, the constant data values, and
+width/height. **Not one of the 30 uses a shifted barrel, a non-identity
+minterm, `BLTCON1`'s fill mode, more than one active channel, or line
+mode with a mid-drawing texture.** That is narrower than the randomised
+half's coverage (256 minterms, all 16 channel-enable combinations, the
+full 0–15 shift range) by a wide margin — this project's Workbench
+desktop, on this boot, simply never asks the blitter to do most of what
+it can do. Whether `BltTemplate` text rendering, gadget rendering, or a
+deeper desktop interaction (opening a window, dragging an icon) would
+reach shift/mask/multi-channel combinations this captured moment did not
+is an open question this differential cannot answer from one screenshot's
+worth of boot; the honest reading of this specific corpus is that a
+static, just-booted planar Workbench desktop's blitter usage is
+*extremely* repetitive, not that the blitter's other modes are unused by
+real software in general (the unit tests and the randomised half already
+establish those modes work; this is a statement about what one real boot
+happened to exercise, not about `machine-core`'s coverage).
+
+**Result: no divergence.** All 30 recorded signatures match Copperline
+bit-for-bit, same as the randomised cases (see "Everything else agrees
+exactly" below) — unsurprising given how narrow the corpus turned out to
+be (it never reaches either of the two conditions Findings 1 and 2 below
+depended on: `machine-core`'s fixed barrel-shift bug required a nonzero
+shift, and none of these 30 shift at all), but a genuine, exercised
+result rather than an assumption: every one of the 30 was run through the
+real hand-assembled-68k-program-on-real-Copperline-CPU path, not skipped.
 
 ## Findings
 
-### 1. Barrel-shift carry does not persist across rows (likely a `machine-core` bug)
+### 1. Barrel-shift carry does not persist across rows (fixed)
+
+**Status: fixed in `crates/machine-core/src/blitter.rs` since this was
+first written.** The differential re-confirms this: `shift_cases`
+(0–15 shift × ascending/descending × multi-row) is part of the 424
+randomised cases above and all of them now agree with Copperline. Kept
+below as the original finding record, per this project's convention of
+not deleting a fixed bug's writeup.
 
 **Divergence.** For any A- or B-channel barrel shift with a non-zero
 shift amount, on a blit of 2 or more rows, `machine-core`'s output
@@ -162,9 +280,16 @@ multi-row shifted blits are common (e.g. any shifted rectangle copy),
 so this plausibly affects real, non-degenerate blits, not just
 adversarial ones.
 
-### 2. Odd `BLTxMOD` values are not masked to even (likely a `machine-core` bug)
+### 2. Odd `BLTxMOD` values are not masked to even (fixed)
 
-**Divergence.** Whenever `BLTAMOD` or `BLTDMOD` (this file didn't
+**Status: fixed in `crates/machine-core/src/blitter.rs` since this was
+first written.** `modulo_and_size_cases` (which includes odd `amod`/
+`dmod` values by construction) is part of the 424 randomised cases above
+and all of them now agree with Copperline. Kept below as the original
+finding record, per this project's convention of not deleting a fixed
+bug's writeup.
+
+**Divergence (as originally found).** Whenever `BLTAMOD` or `BLTDMOD` (this file didn't
 separately exercise `BLTBMOD`/`BLTCMOD`, but the same code path handles
 all four identically) is an odd value, `machine-core`'s resulting channel
 pointer ends up exactly 1 further from the start than Copperline's — as
@@ -221,18 +346,23 @@ reproducible divergence, worth a second opinion before deciding whether
 it needs a fix, a mask, or just a code comment. 10 of the 424 cases hit
 this (every `modulo_and_size_cases` case with an odd `amod` or `dmod`).
 
-### Everything else agrees exactly
+### Everything agrees exactly
 
 All 256 minterms (`minterm_sweep_cases`), all 16 channel-enable
-combinations × ascending/descending (`channel_enable_cases`), first/last
-word masks including the one-word-row case (`mask_cases`), inclusive and
-exclusive fill with and without carry-in (`fill_cases`), the
+combinations × ascending/descending (`channel_enable_cases`), the full
+0–15 A/B barrel shift range × ascending/descending × multi-row
+(`shift_cases`, Finding 1's former repro shape), first/last word masks
+including the one-word-row case (`mask_cases`), inclusive and exclusive
+fill with and without carry-in (`fill_cases`), signed modulos including
+odd values (`modulo_and_size_cases`, Finding 2's former repro shape) and
+one explicit `C == D` read-modify-write case, the
 `BLTSIZE`-zero-fields-mean-maximum cases at width 64, height 1024, and
 both at once (`bltsize_zero_field_cases`, up to a genuine 1024×64-word
-blit), and every line-mode case across octants, `SING`, and the B-channel
-texture (`line_cases`, 12 endpoints × `SING` × B-texture = 96 cases) —
-these all match Copperline bit-for-bit: written memory, `BZERO`, and
-every final channel pointer.
+blit), every line-mode case across octants, `SING`, and the B-channel
+texture (`line_cases`, 12 endpoints × `SING` × B-texture = 96 cases), and
+the 30 recorded-Workbench-trace signatures above — every one of these 454
+cases matches Copperline bit-for-bit: written memory, `BZERO`, and every
+final channel pointer.
 
 ## Copperline oracle limitations found while building this
 
@@ -305,11 +435,6 @@ ownership rules, this is reported, not fixed, here.
 
 ## Scope: what this differential does not do, deliberately
 
-- **No recorded Workbench traces.** Proposal §12 also asks for a
-  differential against "recorded Workbench traces." That needs a booted
-  Workbench, which needs Phase 3 storage (a boot device) — out of scope
-  for Phase 2 and not attempted here. The randomised-ops half of §12 is
-  what this file covers.
 - **Line mode: only `BLTCPT == BLTDPT`.** `execute_line`'s doc comment in
   `blitter.rs` already documents the simplification this differential
   is scoped around: `machine-core` collapses line mode's C-read/D-write
@@ -318,25 +443,47 @@ ownership rules, this is reported, not fixed, here.
   `LineCase` in this file sets `BLTCPT = BLTDPT`. The unequal-pointer
   case is a legitimate gap in this differential's coverage, left for a
   future pass, not silently assumed correct.
-- **ECS split-size (`BLTSIZV`/`BLTSIZH`) path not separately exercised.**
-  Every test case here triggers via the classic `BLTSIZE` register
-  (already covering the zero-fields-mean-maximum decode this shares with
-  the split path). `bltsizv_alone_does_not_start_a_blit`, a `blitter.rs`
-  unit test, already covers the ECS path's register-arming semantics in
-  isolation.
+- **Recorded traces never include line mode.** Same underlying reason,
+  from the recording side: `BLTAPTL`/`BLTAPTH` mean something entirely
+  different in line mode (a Bresenham error accumulator, not an address),
+  so `crate::blitter_trace::BlitterTrace` observes line-mode `BLTSIZE`
+  arms (1,368 of them on the boot this project's corpus was captured
+  from) but deliberately never adds them to the corpus — see "Recorded
+  Workbench traces" above.
+- **ECS split-size (`BLTSIZV`/`BLTSIZH`) path not separately exercised**,
+  in either half. Every randomised test case here triggers via the
+  classic `BLTSIZE` register (already covering the zero-fields-mean-
+  maximum decode this shares with the split path); the trace recorder
+  also only watches `BLTSIZE`. `bltsizv_alone_does_not_start_a_blit`, a
+  `blitter.rs` unit test, already covers the ECS path's register-arming
+  semantics in isolation.
 - **Bounded random parameter ranges**, not the full hardware envelope
   (except for the three dedicated `bltsize_zero_field_cases`, which do
   run genuine large — up to 1024×64-word — blits). Widths/heights are
   bounded (roughly 1–6 words/rows for the modulo/size sweep, 1–4 for the
   shift and channel-enable sweeps) and moduli to roughly ±16 bytes,
-  chosen so a few hundred cases' scratch-arena footprints fit inside the
-  ~950&nbsp;KiB of chip RAM available above the boot-ROM overlay and
-  below Copperline's 2&nbsp;MiB `--chip` ceiling. This is wide enough to
-  have found both real findings above; it is not exhaustive.
-- **Fixed seed (`0xB7171E5D1FF7D1FF`)**, printed in every divergence
-  report and in the test's own summary line, so any future divergence
-  (or a genuine "still passes" run once the two findings above are
-  resolved) is reproducible byte-for-byte without rerunning blind.
+  chosen so the scratch-arena footprint of a few hundred cases (plus the
+  30-signature Workbench corpus) fits inside the ~980&nbsp;KiB of chip RAM
+  available above the boot-ROM overlay (measured at exactly 1&nbsp;MiB
+  while widening this arena for the Workbench corpus — see `ARENA_BASE`'s
+  doc comment) and below `--chipset ECS`'s hard 2&nbsp;MiB `--chip`
+  ceiling (`copperline` itself refuses more). This is wide enough to have
+  found both real findings above; it is not exhaustive.
+- **One boot's worth of recorded traces, from one point in the boot
+  sequence.** The Workbench corpus is a snapshot of what this specific
+  planar desktop, at this specific screenshot frame, happened to arm —
+  not a claim that real Amiga software never uses shifts, non-identity
+  minterms, or `BLTCON1`'s fill mode (the unit tests and the randomised
+  half already establish those modes work correctly in isolation). A
+  longer session, window dragging, or text-heavy `BltTemplate` usage
+  would likely record a richer corpus; re-running
+  `--blitter-trace` at a different point (or for longer) and re-checking
+  in the result is the natural way to grow this half's coverage without
+  changing any mechanism.
+- **Fixed seed (`0xB7171E5D1FF7D1FF`)** for the randomised half, printed
+  in every divergence report and in the test's own summary line, so any
+  future divergence is reproducible byte-for-byte without rerunning
+  blind.
 
 ## Dev-dependency note
 

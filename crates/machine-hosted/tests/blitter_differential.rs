@@ -1,8 +1,15 @@
-//! Blitter differential against Copperline (proposal §12, the outstanding
-//! half of the Phase 2 exit criterion; the 21 host-side unit tests in
-//! `crates/machine-core/src/blitter.rs` are the other half). See
-//! `docs/blitter-differential.md` for the full write-up: what this covers,
-//! what it deliberately doesn't, and any divergences found.
+//! Blitter differential against Copperline (proposal §12, "differential
+//! against Copperline (randomised ops + recorded Workbench traces)"; the
+//! 21 host-side unit tests in `crates/machine-core/src/blitter.rs` are
+//! this proposal's other, non-differential half). Both halves of this
+//! file's own brief live here: the randomised case generators below, and
+//! `workbench_corpus_cases`, which replays a corpus of distinct blitter
+//! register signatures recorded from a real booted planar Workbench
+//! desktop (`crates/machine-hosted/src/blitter_trace.rs` records it,
+//! `tests/fixtures/blitter_workbench_corpus.txt` is the checked-in
+//! result). See `docs/blitter-differential.md` for the full write-up:
+//! what this covers, what it deliberately doesn't, and any divergences
+//! found.
 //!
 //! **Mechanism.** Copperline's blitter is cycle-exact and DMA-gated; ours
 //! (`machine_core::blitter::Blitter`) is synchronous and runs whenever a
@@ -481,10 +488,18 @@ impl Arena {
     }
 }
 
-/// Comfortably above the ~1 MiB boot-ROM overlay at reset (see module
-/// docs); ceiling stays inside `--chip 2M`.
-const ARENA_BASE: u32 = 0x0011_0000;
-const ARENA_CEILING: u32 = 0x001F_F000;
+/// Just above the boot-ROM overlay at reset (see module docs). Empirically
+/// re-checked while widening this arena for `workbench_corpus_cases`:
+/// `mem.write` at `0x00100000` itself already succeeds (`written` == the
+/// full request), so the overlay is exactly the first 1 MiB, not "at
+/// least" as originally measured less precisely -- `0x0100_0200` keeps a
+/// 512-byte margin below that edge rather than sitting exactly on it.
+/// This reclaimed the headroom `workbench_corpus_cases`' extra footprint
+/// needed; `ARENA_CEILING` stays comfortably below the true `--chip 2M`
+/// end (`0x0020_0000`), confirmed a hard limit (ECS's chipset maximum --
+/// `copperline` itself refuses `--chip` above 2 MiB for `--chipset ECS`).
+const ARENA_BASE: u32 = 0x0010_0200;
+const ARENA_CEILING: u32 = 0x001F_FF00;
 
 // ---------------------------------------------------------------------
 // Area-mode (non-line) test cases.
@@ -1380,6 +1395,70 @@ fn line_cases() -> Vec<LineCase> {
     out
 }
 
+/// The recorded-Workbench-traces half of proposal §12
+/// (`docs/blitter-differential.md`'s "Recorded Workbench traces" section):
+/// distinct blitter register signatures captured booting a real planar
+/// Workbench desktop with `--blitter-trace` (`crate::blitter_trace` in
+/// `machine-hosted`'s own binary), deduplicated at capture time and
+/// checked in as a fixture so this test needs neither the ROM nor the HDF
+/// to run -- matching every other real-input-dependent test's degrade
+/// story here (`tests/real_rom.rs`'s `fixture()`, this file's own
+/// `Ccp::launch` skip).
+///
+/// Replayed through exactly the same `AreaCase`/`run_area_case`/
+/// `build_program` machinery as the randomised cases, not a second
+/// mechanism: a recorded signature already has the same shape as
+/// `AreaCase` minus a name and absolute pointers (which this differential
+/// always remaps into its own scratch arena anyway, randomised or
+/// recorded). Line-mode arms were recorded and skipped at capture time,
+/// not here -- `blitter_trace.rs`'s module doc comment explains why
+/// replaying one through `AreaCase` would be actively wrong, not just
+/// out of scope.
+const WORKBENCH_CORPUS: &str = include_str!("fixtures/blitter_workbench_corpus.txt");
+
+fn workbench_corpus_cases() -> Vec<AreaCase> {
+    WORKBENCH_CORPUS
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .enumerate()
+        .map(|(i, line)| {
+            let fields: Vec<i64> = line
+                .split_whitespace()
+                .map(|f| {
+                    f.parse::<i64>()
+                        .unwrap_or_else(|e| panic!("corpus line {i}: bad field {f:?}: {e}"))
+                })
+                .collect();
+            assert_eq!(
+                fields.len(),
+                14,
+                "corpus line {i}: expected 14 fields, got {} ({line:?})",
+                fields.len()
+            );
+            AreaCase {
+                name: format!(
+                    "workbench trace #{i}: bltcon0={:#06X} bltcon1={:#06X} w={} h={}",
+                    fields[0], fields[1], fields[11], fields[12]
+                ),
+                bltcon0: fields[0] as u16,
+                bltcon1: fields[1] as u16,
+                bltafwm: fields[2] as u16,
+                bltalwm: fields[3] as u16,
+                amod: fields[4] as i16,
+                bmod: fields[5] as i16,
+                cmod: fields[6] as i16,
+                dmod: fields[7] as i16,
+                adat: fields[8] as u16,
+                bdat: fields[9] as u16,
+                cdat: fields[10] as u16,
+                width_words: fields[11] as u16,
+                height_rows: fields[12] as u16,
+                c_equals_d: fields[13] != 0,
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------
 // The differential itself.
 // ---------------------------------------------------------------------
@@ -1406,6 +1485,7 @@ fn blitter_differential_against_copperline() {
     area_cases.extend(fill_cases());
     area_cases.extend(modulo_and_size_cases(&mut rng));
     area_cases.extend(bltsize_zero_field_cases());
+    area_cases.extend(workbench_corpus_cases());
 
     for case in &area_cases {
         ran += 1;

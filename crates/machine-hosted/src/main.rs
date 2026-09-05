@@ -5,6 +5,7 @@
 //! Phase 1 runs here, as an ordinary `std` binary
 //! (`docs/adr-0001-bare-metal-vs-linux-host.md`).
 
+mod blitter_trace;
 mod bus;
 mod cli;
 mod console;

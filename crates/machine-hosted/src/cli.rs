@@ -166,6 +166,19 @@ pub struct Args {
     /// not a normal configuration for this machine.
     #[arg(long, default_value = "none")]
     pub floppy: FloppyArg,
+
+    /// Record every distinct blitter register combination the guest arms
+    /// (proposal §12's "recorded Workbench traces" half of the blitter
+    /// differential, `crate::blitter_trace`) to this file, deduplicated
+    /// on the fly. Absolute pointers are dropped; what's kept is exactly
+    /// what `crates/machine-hosted/tests/blitter_differential.rs` needs
+    /// to replay each combination against Copperline with randomised
+    /// memory. Omit for a normal run: without this flag nothing about the
+    /// boot path changes -- every write still reaches `MachineBus`
+    /// unmodified, and the one extra check per register write costs
+    /// nothing observable (`blitter_trace.rs`'s module doc comment).
+    #[arg(long)]
+    pub blitter_trace: Option<PathBuf>,
 }
 
 /// CLI surface for [`machine_core::cia::FloppyPresence`] -- kept as a
