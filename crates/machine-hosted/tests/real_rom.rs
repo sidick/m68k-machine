@@ -489,6 +489,85 @@ fn aros_68k_screenshot_shows_boot_screen_content_without_boot_media() {
 /// at all through 5500); frame 4000 is used here with `--max-frames 4500`
 /// for margin clear of the capture boundary (same reasoning as the AROS
 /// test's frame-400-of-500 margin).
+/// Input reaches Intuition end to end: a scripted double-click on the
+/// `SYS` icon opens its drawer.
+///
+/// This exercises what a pointer move alone cannot -- button events, the
+/// full-held-state `ie_Qualifier` rule, and `IEQUALIFIER_RELATIVEMOUSE`
+/// on synthetic `RAWMOUSE` events, which if omitted makes every click
+/// land at the screen's top-left corner regardless of pointer position
+/// (`docs/input-protocol.md`). A drawer opening is unambiguous and only
+/// reachable through Intuition and Workbench.
+///
+/// Coordinates are Intuition *screen* coordinates, which are not canvas
+/// pixels: this Workbench is hires, so `canvas_x = screen_x / 2 + 128`
+/// and `canvas_y = screen_y + 44`, derived by moving the pointer to two
+/// known positions and measuring where the sprite landed. The `SYS` icon
+/// sits at canvas (149, 117), hence screen (42, 73).
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
+fn scripted_double_click_on_the_sys_icon_opens_its_drawer() {
+    let rom = kickstart_a1200();
+    let hd = hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+
+    let script_path =
+        std::env::temp_dir().join(format!("machine-hosted-click-{}.input", std::process::id()));
+    std::fs::write(
+        &script_path,
+        "SLEEP 4200\nMOVE 42 73\nSLEEP 10\nBUTTONDOWN LEFT\nBUTTONUP LEFT\n\
+         SLEEP 5\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 300\n",
+    )
+    .expect("write input script");
+
+    let path = screenshot_path("sys-drawer");
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--input-script",
+        script_path.to_str().unwrap(),
+        "--screenshot",
+        path.to_str().unwrap(),
+        "--screenshot-frame",
+        "4510",
+        "--max-frames",
+        "4650",
+        "--max-instructions",
+        "600000000",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    let (width, height, rgba) = decode_png(&path);
+    assert_eq!(
+        (width, height),
+        (
+            machine_core::display::MAX_WIDTH as u32,
+            machine_core::display::MAX_HEIGHT as u32
+        )
+    );
+
+    let background = dominant_pixel(&rgba);
+    let non_background = rgba.chunks(4).filter(|px| *px != background).count();
+    // The desktop alone is 13,507 and the desktop plus a parked pointer
+    // is 13,564 (both measured). An opened drawer -- its window, title,
+    // border and six icons with labels -- measured 15,241. The floor sits
+    // well above "the pointer moved but nothing opened", which is exactly
+    // the failure this test exists to catch: a click that reaches
+    // Intuition but lands in the wrong place still moves the pointer.
+    assert!(
+        non_background > 14_500,
+        "expected the SYS drawer window opened by a scripted double-click,          got {non_background} non-background pixels -- 13,564 would mean the          pointer moved but the click opened nothing; see this test's doc comment"
+    );
+
+    let _ = std::fs::remove_file(&script_path);
+}
+
 #[test]
 #[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
 fn kickstart_3_2_2_a1200_boots_from_hd_to_the_workbench_desktop() {
