@@ -155,13 +155,22 @@ Two smaller consequences, in the same direction:
   granularity writes into it would be miserable. Keep guest VRAM in
   ordinary RAM and blit per frame.
 
-When a requested mode cannot be delivered, prefer centring or
-letterboxing into the real framebuffer over scaling: a non-integer
-scale of a chunky RTG desktop looks worse than a smaller centred image,
-and Workbench's text is what suffers. Better still, advertise only
-modes the host can actually set, so P96 never asks for an impossible
-one — letterboxing is the safety net for when that list turns out to be
-wrong.
+When a requested mode cannot be delivered, present it at the **largest
+integer scale that fits** the real framebuffer in both axes, centred,
+with the remainder letterboxed. An integer factor replicates whole
+pixels, so a chunky RTG desktop stays exactly as crisp as it started —
+it is strictly better than a smaller centred image whenever the host
+has the room. Work the factor out per axis and take the smaller of the
+two rather than assuming.
+
+What must not happen is a **fractional** scale: that resamples pixel
+edges, and Workbench's text is what suffers. Fall back to the next
+lower integer factor — 1x, centred at native size — rather than
+stretching to fill.
+
+Better still, advertise only modes the host can actually set, so P96
+never asks for an impossible one. Scaling and letterboxing are the
+safety net for when that list turns out to be wrong.
 
 ## Unverified
 
