@@ -2,12 +2,15 @@
 
 **Status:** host side implemented (`crates/machine-core/src/input.rs`),
 driven from `machine-hosted` via `--input-script`
-(`crates/machine-hosted/src/input_script.rs`). **No m68k driver and no
-DiagArea boot ROM exist yet** -- this document is written *for* that
-future driver, the same way `docs/hostblk-protocol.md` was written before
-`hostblk`'s first driver existed, on the theory (borne out there) that
-writing the contract down before any 68k code depends on it surfaces
-problems while they are still cheap to fix.
+(`crates/machine-hosted/src/input_script.rs`), **and now a real m68k
+driver and DiagArea boot ROM** (`m68k/input-rom/input-diagrom.s`,
+`scripts/build-input-rom.sh`) -- verified end-to-end against a real
+Kickstart 3.2.2 boot (`nondistribution/A1200.47.115.rom`): a
+`--input-script MOVE` reaches `IntuitionBase->MouseX`/`MouseY` and
+visibly moves the pointer sprite on a live Workbench screen. §13 below
+records what a real driver found once this contract had to be lived
+with, the same feedback loop `docs/hostblk-protocol.md` went through for
+`hostblk`'s own driver.
 
 **Context:** `docs/device-ledger.md` ("Not built -- decided
 native-first", the "Keyboard / mouse" row this device fills in);
@@ -359,20 +362,29 @@ because no driver exists to produce a guest reaction to wait for (§12).
 
 ## 11. What this increment does not include
 
-- **No m68k driver, no DiagArea boot ROM.** This card cannot demonstrate
-  a keypress reaching Intuition on its own; it exercises the card's
-  host-side half only, the same honest limitation `hostblk`'s first
-  increment stated. There is therefore no end-to-end guest test in this
-  increment -- said plainly, not implied by omission.
-- No `IEPointerPixel`/`Screen*` resolution logic (§6) -- host-side code
-  has no notion of Intuition's screen list at all, and could not build
-  one even for testing purposes without a running guest.
-- No held-modifier/held-button bookkeeping (§7) -- this card is a dumb
-  pass-through by design; that state belongs to the driver.
+The m68k driver and DiagArea boot ROM now exist (§13) and close most of
+what this section used to list as missing. What's left:
+
+- No held-state *recovery* on `EVENT_OVERFLOW` -- the driver notices an
+  overflow is possible (it maintains its own held-qualifier state
+  regardless) but does not implement the "force every key back up" repair
+  action §9 sketches as future work; nothing in this increment's testing
+  ever drove the queue hard enough to hit that path.
 - No `IND_ADDEVENT` (V47's repeat-aware sibling of `IND_WRITEEVENT`) --
   this card's queue has no notion of key-repeat timing at all; a driver
   wanting repeat would need to synthesise it itself from raw down/up
   events, same as any driver built against plain `IND_WRITEEVENT`.
+- No `IESUBCLASS_TABLET`/`NEWTABLET` support -- this card only ever
+  carries pixel coordinates (§6), so the driver only ever builds
+  `IESUBCLASS_PIXEL`.
+- Key-down/key-up and button-down/button-up were exercised as a
+  guest-stability smoke test (the driver task survives them, keeps
+  draining, and the machine keeps booting) but **not** independently
+  verified end-to-end the way pointer motion was (§13) -- there is no
+  guest fixture yet that reports back `IDCMP_RAWKEY`/
+  `IDCMP_MOUSEBUTTONS` the way §12 describes; building one is the
+  natural next increment's first task, same as §12 already said before
+  any driver existed.
 
 ## 12. Acceptance testing the driver
 
@@ -385,3 +397,91 @@ and confirm the reported code/qualifier/position match what
 `--input-script` asked for. No such guest fixture exists in this
 repository yet; building one is the natural first task for the driver
 increment, not something to invent speculatively here.
+
+## 13. Driver retrospective: what changed once real 68k code depended on this
+
+`m68k/input-rom/input-diagrom.s` is the driver this document was written
+for. This section records where the contract above held up unmodified,
+and where it didn't -- the same honesty §6 already models for a
+correction found *before* any driver existed; this one was found while
+writing it.
+
+**Confirmed exactly as designed, no surprises:**
+
+- §4-§5's register map and drain loop needed no changes at all -- the
+  driver's `IntHandler` drains it precisely as the pseudocode in §5
+  shows, into a small software ring so the interrupt server never blocks
+  (next bullet).
+- §6's `IECLASS_NEWPOINTERPOS`/`IESUBCLASS_PIXEL`/`IEPointerPixel`
+  correction was exactly right, confirmed against `devices/inputevent.h`
+  directly while writing the driver, not just cited secondhand.
+- §7's `IEQUALIFIER_RELATIVEMOUSE` and full-held-state requirements were
+  both real: the driver maintains its own running modifier/button state
+  (`ST_HELD_QUALIFIER`) and ignores this card's own `EVENT_QUALIFIER`
+  register entirely, exactly as §7 says a driver must.
+- §9's overflow/coalescing policy needed no driver-side workaround --
+  the driver's own local software ring (16 entries, matching
+  `QUEUE_CAPACITY`) never needed a different depth.
+
+**The task/interrupt split, checked rather than assumed:** the brief
+that produced this driver asked for the split to be verified, not taken
+on faith. It's real: `OpenDevice`/`DoIO` (what `IND_WRITEEVENT` requires)
+eventually call `Wait()`, which is documented unsafe from interrupt
+context (Autodocs `exec.doc`), so `IntHandler` genuinely cannot do the
+`IND_WRITEEVENT` call itself -- it can only drain the card's hardware
+queue into RAM and `Signal()` a task (one of the few calls safe from
+interrupt context), and a separate task (`TaskEntry`'s main loop) does
+the actual `DoIO`. Building that task from `rt_Init` needed
+`AddTask` directly, hand-building a `struct Task` -- `CreateTask()` is an
+`amiga.lib` helper, not an `exec.library` LVO, so it isn't available to
+ROM code with no C runtime linked in.
+
+**A gap in §7 this driver's own construction exposed:** turning a raw
+key code into "is this key itself a modifier, and if so which
+`IEQUALIFIER_*` bit" needs a raw-keycode-to-modifier table, and **no NDK
+3.2 header ships one** (`Include_H` has no `rawkeycodes.h`). The RKRM
+Devices "keyboard.device" chapter's own keyboard-matrix figure -- the
+one place this project's licensed reference material could have
+supplied it -- turned out to be unrecoverable OCR garbage (that skill's
+own provenance note: scanned rotated 180°). `modifier_bit_for_code` in
+`input-diagrom.s` uses the long-standing, widely published Amiga
+hardware assignment ($60-$67 = LSHIFT/RSHIFT/CAPSLOCK/CONTROL/LALT/RALT/
+LCOMMAND/RCOMMAND), flagged in that routine's own comment as a
+hardware-convention citation, **not** a header citation -- the one place
+in the whole driver where that distinction had to be made explicitly.
+If §7's held-qualifier bookkeeping is ever found to misfire against a
+real Amiga keyboard, this table is the first thing to re-derive from
+real hardware or a keymap dump rather than trust.
+
+**`da_BootPoint` must be non-zero for the DiagArea to be copied at
+all** -- this is not new information this document got wrong, but a fact
+`hostblk`'s own driver increment already discovered the hard way
+(`hostblk-diagrom.s`'s DiagArea comment, RKRM "Events At DIAG Time") that
+this document never had occasion to restate, since the earlier,
+driver-less increment of this card had no DiagArea at all. It matters
+here because this card is *never* a `BootNode` (no bootable media), so
+a first draft set `da_BootPoint` to 0 as "no boot routine" -- which
+would have silently disabled the RAM copy, and with it `DiagEntry`,
+the romtag, and the whole driver. `BootStub` (a bare, never-actually-
+reached `rts`) exists purely to keep that field non-zero.
+
+**Verification, both ways the brief asked for:**
+
+- **Guest state.** `machine-hosted --inspect` now reports
+  `IntuitionBase->MouseX`/`MouseY` (`crates/machine-hosted/src/
+  introspect.rs`). Against a real Kickstart 3.2.2 boot to a genuine
+  752×576 hires interlaced Workbench screen, `--input-script`'s `MOVE
+  300 200` produced `MouseX 300  MouseY 400` -- `MouseY` reads back at
+  *exactly* double the requested pixel Y, confirming this document's own
+  note above about hires screens without needing to guess at the factor.
+  Against a Picasso96 RTG screen whose actual open `Screen` turned out to
+  be only 256 lines tall despite the board being configured for 640×480,
+  a `MOVE 400 300` came back as `MouseX 400  MouseY 255` -- Intuition
+  clamping Y to the real screen's height, not a driver bug (RKM's own
+  `IEPointerPixel` doc: "Intuition will try to oblige, but there will be
+  restrictions to positioning the pointer over offscreen pixels").
+- **Visible effect.** The 752×576 hires screenshot at the `MouseY 400`
+  data point above shows the real pointer sprite rendered at
+  approximately the requested position on a live Workbench desktop, not
+  stuck at the top-left corner or absent -- something that could only
+  happen by the event actually reaching Intuition's input chain.

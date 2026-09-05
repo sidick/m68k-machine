@@ -416,6 +416,9 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
                 exec_report.exec_base,
             ));
         }
+        if args.input_script.is_some() {
+            console.diag(&crate::introspect::format_input_state(&mut bus.0));
+        }
     }
 
     if let Some(trace) = bus.1.take() {

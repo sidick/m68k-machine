@@ -75,11 +75,12 @@ pub struct Args {
     /// `crate::input_script`'s doc comment). Attaches the native input
     /// card (`machine_core::input`) the same way `--hostblk` attaches
     /// `hostblk`: omit this flag and neither the card's AUTOCONFIG board
-    /// nor its bus routing exist at all. There is no m68k driver for this
-    /// card yet (`docs/hostblk-protocol.md`-style increment split, see
-    /// `docs/input-protocol.md`), so this flag alone cannot demonstrate a
-    /// keypress reaching Intuition -- it exercises the card's host-side
-    /// half only, the same honest limitation `--hostblk` started with.
+    /// nor its bus routing exist at all. The card carries a DiagArea boot
+    /// ROM (`m68k/input-rom/`) whose driver turns queued events into real
+    /// `IND_WRITEEVENT` calls, so events reach Intuition: a scripted
+    /// `MOVE` moves the pointer, confirmed both by `--inspect`'s
+    /// `IntuitionBase` `MouseX`/`MouseY` report and by the pointer sprite
+    /// appearing in a screenshot. See `docs/input-protocol.md`.
     #[arg(long)]
     pub input_script: Option<PathBuf>,
 

@@ -27,6 +27,22 @@
 use machine_core::chipset::Chipset;
 use machine_core::MachineBus;
 
+/// Byte offsets into `struct IntuitionBase` (`intuition/intuitionbase.h`),
+/// derived the same way [`execbase`] is (this module's own doc comment):
+/// `struct Library LibNode`(34) + `struct View ViewLord`(18: `ViewPort
+/// *`(4) + `cprlist *LOFCprList`(4) + `cprlist *SHFCprList`(4) + `WORD
+/// DyOffset`(2) + `WORD DxOffset`(2) + `UWORD Modes`(2) --
+/// `graphics/view.h`) + `Window *ActiveWindow`(4) puts `ActiveScreen` at
+/// 56; `Screen *FirstScreen`(4) and `ULONG Flags`(4) then put `MouseY`/
+/// `MouseX` at 68/70 -- note the header's own "backwards" field order
+/// (`WORD MouseY, MouseX;`), so `MOUSEX` is the *second* WORD, not the
+/// first.
+mod intuitionbase {
+    pub const ACTIVE_SCREEN: u32 = 56;
+    pub const MOUSEY: u32 = 68;
+    pub const MOUSEX: u32 = 70;
+}
+
 /// Byte offsets into `struct ExecBase` (`exec/execbase.h`), derived by
 /// summing the preceding fields' sizes -- see this module's doc comment.
 mod execbase {
@@ -293,6 +309,23 @@ pub struct Report {
     pub task_wait: Vec<TaskEntry>,
     pub this_task: Option<TaskEntry>,
     pub mem_list: Vec<MemListEntry>,
+    /// `intuition.library`'s own base, if `find_library_base` locates it
+    /// on `ExecBase->LibList` -- `None` before Intuition has opened
+    /// (early boot, or a guest with no graphics stack at all).
+    pub intuition_base: Option<u32>,
+    /// `IntuitionBase->MouseX`/`MouseY`, read directly whenever
+    /// [`Report::intuition_base`] is known. On a hires screen `MouseY`
+    /// reads back in **double-resolution units** -- exactly twice the
+    /// requested pixel Y -- which is documented Amiga behaviour (hires
+    /// screens are half-height in "lines" relative to their pixel Y
+    /// coordinate space), not a driver bug, so a caller comparing this
+    /// against a `--input-script MOVE`'s Y argument on such a screen
+    /// should expect `2*y`, not `y`.
+    pub mouse_x: Option<i16>,
+    pub mouse_y: Option<i16>,
+    /// `IntuitionBase->ActiveScreen`, whenever [`Report::intuition_base`]
+    /// is known -- `0` means Intuition is up but no screen is open yet.
+    pub active_screen: Option<u32>,
 }
 
 /// Cap every walk (resident array, task lists) well above anything a real
@@ -534,6 +567,10 @@ pub fn inspect(bus: &mut MachineBus) -> Report {
             task_wait: Vec::new(),
             this_task: None,
             mem_list: Vec::new(),
+            intuition_base: None,
+            mouse_x: None,
+            mouse_y: None,
+            active_screen: None,
         };
     };
 
@@ -552,6 +589,16 @@ pub fn inspect(bus: &mut MachineBus) -> Report {
     ];
     let this_task_ptr = bus.read_long(base + execbase::THIS_TASK);
 
+    let intuition_base = find_library_base(bus, base + execbase::LIB_LIST, "intuition.library");
+    let (mouse_x, mouse_y, active_screen) = match intuition_base {
+        Some(ib) => (
+            Some(bus.read_word(ib + intuitionbase::MOUSEX) as i16),
+            Some(bus.read_word(ib + intuitionbase::MOUSEY) as i16),
+            Some(bus.read_long(ib + intuitionbase::ACTIVE_SCREEN)),
+        ),
+        None => (None, None, None),
+    };
+
     Report {
         exec_base: Some(base),
         lib_version: bus.read_word(base + execbase::LIB_VERSION),
@@ -567,6 +614,10 @@ pub fn inspect(bus: &mut MachineBus) -> Report {
         task_wait: walk_task_list(bus, base + execbase::TASK_WAIT),
         this_task: read_task(bus, this_task_ptr),
         mem_list: walk_mem_list(bus, base + execbase::MEM_LIST),
+        intuition_base,
+        mouse_x,
+        mouse_y,
+        active_screen,
     }
 }
 
@@ -691,6 +742,20 @@ pub fn format_report(report: &Report) -> String {
     out.push_str(&format!("  TaskWait ({}):\n", report.task_wait.len()));
     for t in &report.task_wait {
         out.push_str(&format!("    {}\n", task_line(Some(t))));
+    }
+
+    match report.intuition_base {
+        Some(ib) => out.push_str(&format!(
+            "  IntuitionBase at {ib:#010x}: MouseX {}  MouseY {}  ActiveScreen {:#010x} \
+             (hires screens report MouseY in double-resolution units -- 2x the requested \
+             pixel Y -- this is documented Amiga behaviour, not a bug)\n",
+            report.mouse_x.unwrap_or_default(),
+            report.mouse_y.unwrap_or_default(),
+            report.active_screen.unwrap_or(0),
+        )),
+        None => out.push_str(
+            "  IntuitionBase: not found on ExecBase->LibList (intuition.library not open yet)\n",
+        ),
     }
 
     out
@@ -981,6 +1046,130 @@ fn find_hostblk_config_dev(bus: &mut MachineBus, expected_base: u32) -> Option<H
 /// (`hostblk::DIAG_MARKER_OFFSET`) -- nonzero there is conclusive
 /// (DiagEntry's first instruction is the register read that feeds it),
 /// independent of both mechanisms above.
+/// One `input` card `ConfigDev` located in guest memory -- see
+/// [`find_input_config_dev`], the `input`-card twin of
+/// [`find_hostblk_config_dev`] (identical reasoning, different
+/// manufacturer/product pair).
+struct InputConfigDev {
+    address: u32,
+    er_type: u8,
+    er_init_diag_vec: u16,
+    board_addr: u32,
+    board_size: u32,
+    diag_copy_addr: u32,
+}
+
+/// [`find_hostblk_config_dev`], adapted for the `input` card's own
+/// `MANUFACTURER`/`PRODUCT` pair. See that function's doc comment for the
+/// full reasoning (why a scan against known-good ground truth rather than
+/// a guess at `ExpansionBase`'s private list layout).
+fn find_input_config_dev(bus: &mut MachineBus, expected_base: u32) -> Option<InputConfigDev> {
+    use machine_core::input;
+    let mut addr = 0u32;
+    while (addr as usize) < machine_core::CHIP_RAM_SIZE {
+        if bus.read_long(addr + configdev::CD_BOARD_ADDR) == expected_base
+            && bus.read_word(addr + configdev::CD_ROM + expansionrom::ER_MANUFACTURER)
+                == input::MANUFACTURER
+            && bus.read_byte(addr + configdev::CD_ROM + expansionrom::ER_PRODUCT) == input::PRODUCT
+        {
+            return Some(InputConfigDev {
+                address: addr,
+                er_type: bus.read_byte(addr + configdev::CD_ROM + expansionrom::ER_TYPE),
+                er_init_diag_vec: bus
+                    .read_word(addr + configdev::CD_ROM + expansionrom::ER_INIT_DIAG_VEC),
+                board_addr: expected_base,
+                board_size: bus.read_long(addr + configdev::CD_BOARD_SIZE),
+                diag_copy_addr: bus
+                    .read_long(addr + configdev::CD_ROM + expansionrom::ER_RESERVED_0C),
+            });
+        }
+        addr += 4;
+    }
+    None
+}
+
+/// [`find_diag_rom_copy_by_signature`], adapted for `input::DIAG_ROM`.
+fn find_input_diag_rom_copy_by_signature(bus: &mut MachineBus) -> Option<(u32, u32)> {
+    let needle = &machine_core::input::DIAG_ROM[0..8];
+    let mut addr = 0u32;
+    while (addr as usize) + needle.len() <= machine_core::CHIP_RAM_SIZE {
+        if (0..needle.len() as u32).all(|i| bus.read_byte(addr + i) == needle[i as usize]) {
+            let marker = bus.read_long(addr + machine_core::input::DIAG_MARKER_OFFSET);
+            return Some((addr, marker));
+        }
+        addr += 1;
+    }
+    None
+}
+
+/// Summarise what Kickstart did with the native `input` card
+/// (`--input-script`): whether AUTOCONFIG placed it, whether
+/// `expansion.library` created a `ConfigDev` and accepted its DiagArea,
+/// and whether `DiagEntry` actually ran -- the `input`-card twin of
+/// [`format_hostblk_state`] (identical reasoning; see that function's
+/// doc comment). There is no boot-node section here: this card is never
+/// a `BootNode` (`m68k/input-rom/input-diagrom.s`'s own DiagArea comment
+/// explains why `da_BootPoint` is non-zero anyway).
+pub fn format_input_state(bus: &mut MachineBus) -> String {
+    let Some(base) = bus.input_board_base() else {
+        return "input state: no board attached, or not yet configured by AUTOCONFIG".to_string();
+    };
+    let mut out = format!("input state: AUTOCONFIG placed the board at {base:#010x}\n");
+
+    match find_input_config_dev(bus, base) {
+        Some(cd) => {
+            let diagvalid = cd.er_type & machine_core::autoconfig::ERTF_DIAGVALID != 0;
+            out.push_str(&format!(
+                "  ConfigDev at {:#010x}: er_Type {:#04x} ({}DIAGVALID)  er_InitDiagVec {:#06x}  cd_BoardAddr {:#010x}  cd_BoardSize {:#010x}\n",
+                cd.address,
+                cd.er_type,
+                if diagvalid { "" } else { "no " },
+                cd.er_init_diag_vec,
+                cd.board_addr,
+                cd.board_size,
+            ));
+            match find_input_diag_rom_copy_by_signature(bus) {
+                Some((addr, marker)) => out.push_str(&format!(
+                    "  DiagArea RAM copy found by signature scan at {addr:#010x}  \
+                     DiagMarker there: {marker:#010x}\n"
+                )),
+                None => out.push_str(
+                    "  no DiagArea RAM copy found anywhere in chip RAM by signature scan \
+                     -- expansion.library never copied it at all\n",
+                ),
+            }
+            if cd.diag_copy_addr == 0 {
+                out.push_str(
+                    "  ConfigDev.cd_Rom.er_Reserved0c..0f: 0 (DiagEntry returned failure, \
+                     was never called, or this Kickstart no longer uses this field the way \
+                     RKRM 3rd ed. describes -- see the signature-scan line above instead)\n",
+                );
+            } else {
+                let marker =
+                    bus.read_long(cd.diag_copy_addr + machine_core::input::DIAG_MARKER_OFFSET);
+                out.push_str(&format!(
+                    "  DiagArea RAM copy kept at {:#010x} (DiagEntry returned success)\n",
+                    cd.diag_copy_addr
+                ));
+                out.push_str(&format!(
+                    "  DiagMarker {marker:#010x}{}\n",
+                    if marker == machine_core::input::PROTOCOL_VERSION {
+                        " == input::PROTOCOL_VERSION -- DiagEntry read the board's own VERSION register"
+                    } else {
+                        " (unexpected -- DiagEntry may not have run, or read a stale register)"
+                    }
+                ));
+            }
+        }
+        None => out.push_str(
+            "  no ConfigDev found matching this board's manufacturer/product/address -- \
+             expansion.library either hasn't run yet or never created one\n",
+        ),
+    }
+
+    out
+}
+
 fn find_diag_rom_copy_by_signature(bus: &mut MachineBus) -> Option<(u32, u32)> {
     // First 8 bytes of the embedded ROM's own DiagArea header (da_Config,
     // da_Flags, da_Size, da_DiagPoint) -- read from `hostblk::DIAG_ROM`

@@ -322,7 +322,32 @@
 //! posture `serial_script.rs` already established, rather than this
 //! module ever being asked to interpret one.
 
-use crate::autoconfig::{BoardSpec, ERT_ZORROIII};
+use crate::autoconfig::{BoardSpec, ERTF_DIAGVALID, ERT_ZORROIII};
+
+/// This card's DiagArea boot ROM plus guest driver task
+/// (`m68k/input-rom/input-diagrom.s`), assembled to a flat binary by
+/// `scripts/build-input-rom.sh` and vendored here the same way
+/// [`crate::hostblk::DIAG_ROM`] is -- so `cargo build`/`cargo test` need
+/// no m68k toolchain.
+pub const DIAG_ROM: &[u8] = include_bytes!("../../../assets/input-rom/input-diagrom.bin");
+
+/// Where [`DIAG_ROM`] is mapped within this board's own AUTOCONFIG
+/// window, once configured -- the value [`BoardSpec::init_diag_vec`]
+/// advertises. An independent namespace from `hostblk::ROM_BASE`: each is
+/// an offset within its *own* board's window, not a shared address space
+/// (`input-diagrom.s`'s own file header makes the same point).
+///
+/// `scripts/build-input-rom.sh` greps this exact `pub const` line to
+/// cross-check its own expectation, so keep the two in sync if this ever
+/// changes.
+pub const ROM_BASE: u32 = 0x1000;
+
+/// Offset within the RAM copy of [`DIAG_ROM`] where `DiagEntry`
+/// (`input-diagrom.s`) writes this card's own `VERSION` register back --
+/// the same "proof DiagEntry actually ran" mechanism, at the same offset
+/// (right after the 14-byte DiagArea header), that
+/// `hostblk::DIAG_MARKER_OFFSET` uses for `hostblk`'s own boot ROM.
+pub const DIAG_MARKER_OFFSET: u32 = 14;
 
 /// Reuses `hostblk`'s reserved manufacturer ID rather than minting a
 /// second placeholder: both are the same NDK 3.2 `libraries/configregs.h`
@@ -570,12 +595,12 @@ impl NativeInput {
     /// explicit scope.
     pub fn board_spec() -> BoardSpec {
         BoardSpec {
-            board_type: ERT_ZORROIII, // extended-table code 0 == 16 MB
+            board_type: ERT_ZORROIII | ERTF_DIAGVALID, // extended-table code 0 == 16 MB, plus a DiagArea
             product: PRODUCT,
             flags: ERFF_ZORRO_III | ERFF_EXTENDED,
             manufacturer: MANUFACTURER,
             serial: 0,
-            init_diag_vec: 0,
+            init_diag_vec: ROM_BASE as u16, // fits: ROM_BASE (0x1000) << u16::MAX
             size_bytes: WINDOW_BYTES,
         }
     }
@@ -706,6 +731,9 @@ impl NativeInput {
             o if in_slot(o, reg::INT_ENABLE) => low_byte(o, reg::INT_ENABLE, self.int_enable),
             o if in_slot(o, reg::CAPACITY) => byte_of(QUEUE_CAPACITY as u32, o - reg::CAPACITY),
             o if in_slot(o, reg::VERSION) => byte_of(PROTOCOL_VERSION, o - reg::VERSION),
+            o if (ROM_BASE..ROM_BASE + DIAG_ROM.len() as u32).contains(&o) => {
+                DIAG_ROM[(o - ROM_BASE) as usize]
+            }
             _ => 0,
         }
     }
@@ -1080,5 +1108,84 @@ mod tests {
         assert_eq!(dev.read(0x100), 0);
         dev.write(0x100, 0xFF); // must not panic
         assert_eq!(dev.read(0x100), 0);
+    }
+
+    // ---- DiagArea boot ROM (m68k/input-rom/input-diagrom.s) ---------------
+
+    #[test]
+    fn board_spec_carries_a_diagarea_pointing_at_rom_base() {
+        let spec = NativeInput::board_spec();
+        assert_eq!(spec.manufacturer, MANUFACTURER);
+        assert_eq!(spec.size_bytes, WINDOW_BYTES);
+        assert_eq!(spec.board_type, ERT_ZORROIII | ERTF_DIAGVALID);
+        assert_eq!(spec.flags, ERFF_ZORRO_III | ERFF_EXTENDED);
+        assert_eq!(
+            spec.init_diag_vec, ROM_BASE as u16,
+            "expansion.library adds er_InitDiagVec to the configured base \
+             address to find the DiagArea -- must point at ROM_BASE"
+        );
+    }
+
+    #[test]
+    fn diag_rom_is_served_byte_for_byte_at_rom_base() {
+        let dev = NativeInput::new();
+        for (i, &expected) in DIAG_ROM.iter().enumerate() {
+            assert_eq!(
+                dev.read(ROM_BASE + i as u32),
+                expected,
+                "byte {i} of the embedded DiagArea ROM"
+            );
+        }
+    }
+
+    /// `libraries/configregs.h`'s `struct DiagArea` layout, read directly
+    /// out of [`DIAG_ROM`] the same way `expansion.library` would --
+    /// `hostblk.rs`'s identically named test, adapted. In particular this
+    /// pins down the fact `input-diagrom.s`'s own DiagArea comment records:
+    /// `da_BootPoint` must be non-zero even though this card is never a
+    /// BootNode, because a zero `da_BootPoint` means expansion.library
+    /// never copies the DiagArea into RAM *at all* (RKRM "Events At DIAG
+    /// Time") -- not merely "no boot routine".
+    #[test]
+    fn diag_rom_header_matches_the_documented_diagarea_layout() {
+        let rom = DIAG_ROM;
+        let da_config = rom[0];
+        let da_flags = rom[1];
+        let da_size = u16::from_be_bytes([rom[2], rom[3]]);
+        let da_diag_point = u16::from_be_bytes([rom[4], rom[5]]);
+        let da_boot_point = u16::from_be_bytes([rom[6], rom[7]]);
+
+        assert_eq!(da_config & 0xC0, 0x80, "DAC_WORDWIDE (configregs.h)");
+        assert_eq!(da_flags, 0, "da_Flags: configregs.h defines none");
+        assert!(
+            (da_size as usize) < rom.len(),
+            "da_Size must cover only the DiagArea/Resident copy region, \
+             leaving TaskEntry/IntHandler/etc uncopied in the board's own \
+             persistent window"
+        );
+        assert_ne!(
+            da_diag_point, 0,
+            "a zero da_DiagPoint means 'no diagnostic code'"
+        );
+        assert_ne!(
+            da_boot_point, 0,
+            "RKRM 'Events At DIAG Time': a zero da_BootPoint means \
+             expansion.library never copies this area into RAM at all -- \
+             this card needs the copy for DiagEntry even though it never \
+             actually boots anything"
+        );
+        assert!((da_diag_point as usize) < da_size as usize);
+        assert!((da_boot_point as usize) < da_size as usize);
+
+        assert_eq!(
+            DIAG_MARKER_OFFSET, 14,
+            "struct DiagArea's documented 14-byte size"
+        );
+        assert!(
+            da_diag_point as u32 >= DIAG_MARKER_OFFSET + 4,
+            "DiagEntry's code must start at or after the marker cell -- \
+             input-diagrom.s also places the never-called BootStub between \
+             the marker and DiagEntry, unlike hostblk's tighter layout"
+        );
     }
 }
