@@ -689,7 +689,14 @@ fn even(modulo: i16) -> i16 {
 }
 
 fn set_ptr_hi(ptr: &mut u32, value: u16) {
-    *ptr = (*ptr & 0x0000_FFFF) | ((value as u32) << 16);
+    // The DMA pointer registers are 21 bits wide -- chip RAM tops out at
+    // 2 MB (`crate::CHIP_RAM_SIZE`) -- so only bits 4:0 of the high word
+    // are implemented and the rest read back as zero. Found by the
+    // recorded-Workbench-trace differential: line mode reuses `BLTAPT`
+    // as a Bresenham error term, and graphics.library writes one whose
+    // high word exceeds five bits, making the truncation observable in
+    // register readback where an ordinary address never would.
+    *ptr = (*ptr & 0x0000_FFFF) | (((value & 0x001F) as u32) << 16);
 }
 
 fn set_ptr_lo(ptr: &mut u32, value: u16) {

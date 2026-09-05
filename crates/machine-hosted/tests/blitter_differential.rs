@@ -3,13 +3,16 @@
 //! 21 host-side unit tests in `crates/machine-core/src/blitter.rs` are
 //! this proposal's other, non-differential half). Both halves of this
 //! file's own brief live here: the randomised case generators below, and
-//! `workbench_corpus_cases`, which replays a corpus of distinct blitter
-//! register signatures recorded from a real booted planar Workbench
-//! desktop (`crates/machine-hosted/src/blitter_trace.rs` records it,
-//! `tests/fixtures/blitter_workbench_corpus.txt` is the checked-in
-//! result). See `docs/blitter-differential.md` for the full write-up:
-//! what this covers, what it deliberately doesn't, and any divergences
-//! found.
+//! `workbench_corpus_cases`/`workbench_line_corpus_cases`, which replay a
+//! corpus of distinct blitter register signatures recorded from a real
+//! booted planar Workbench desktop (`crates/machine-hosted/src/blitter_trace.rs`
+//! records it, `tests/fixtures/blitter_workbench_corpus.txt` is the
+//! checked-in result). Area-mode signatures reuse `AreaCase` unchanged;
+//! line-mode signatures get their own verbatim-register `LineRawCase`
+//! shape (see its section doc comment for why) but the same
+//! `build_program` harness -- not a second mechanism. See
+//! `docs/blitter-differential.md` for the full write-up: what this
+//! covers, what it deliberately doesn't, and any divergences found.
 //!
 //! **Mechanism.** Copperline's blitter is cycle-exact and DMA-gated; ours
 //! (`machine_core::blitter::Blitter`) is synchronous and runs whenever a
@@ -472,6 +475,13 @@ impl Arena {
             next: base,
             ceiling,
         }
+    }
+
+    /// Bytes left before `alloc` would panic -- lets a caller check a
+    /// footprint fits *before* committing to it, so an oversized case can
+    /// be skipped (and counted) instead of aborting the whole run.
+    fn remaining(&self) -> u32 {
+        self.ceiling.saturating_sub(self.next)
     }
 
     fn alloc(&mut self, size: u32) -> u32 {
@@ -1416,25 +1426,36 @@ fn line_cases() -> Vec<LineCase> {
 /// out of scope.
 const WORKBENCH_CORPUS: &str = include_str!("fixtures/blitter_workbench_corpus.txt");
 
+/// Split off one corpus line's leading `AREA`/`LINE` tag and parse the
+/// rest as decimal fields, shared by both parsers below.
+fn corpus_fields(i: usize, line: &str, tag: &str, expected: usize) -> Vec<i64> {
+    let rest = line
+        .strip_prefix(tag)
+        .unwrap_or_else(|| panic!("corpus line {i}: expected {tag:?} prefix ({line:?})"));
+    let fields: Vec<i64> = rest
+        .split_whitespace()
+        .map(|f| {
+            f.parse::<i64>()
+                .unwrap_or_else(|e| panic!("corpus line {i}: bad field {f:?}: {e}"))
+        })
+        .collect();
+    assert_eq!(
+        fields.len(),
+        expected,
+        "corpus line {i}: expected {expected} fields after {tag:?}, got {} ({line:?})",
+        fields.len()
+    );
+    fields
+}
+
 fn workbench_corpus_cases() -> Vec<AreaCase> {
     WORKBENCH_CORPUS
         .lines()
         .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
         .enumerate()
+        .filter(|(_, line)| line.starts_with("AREA"))
         .map(|(i, line)| {
-            let fields: Vec<i64> = line
-                .split_whitespace()
-                .map(|f| {
-                    f.parse::<i64>()
-                        .unwrap_or_else(|e| panic!("corpus line {i}: bad field {f:?}: {e}"))
-                })
-                .collect();
-            assert_eq!(
-                fields.len(),
-                14,
-                "corpus line {i}: expected 14 fields, got {} ({line:?})",
-                fields.len()
-            );
+            let fields = corpus_fields(i, line, "AREA", 14);
             AreaCase {
                 name: format!(
                     "workbench trace #{i}: bltcon0={:#06X} bltcon1={:#06X} w={} h={}",
@@ -1457,6 +1478,228 @@ fn workbench_corpus_cases() -> Vec<AreaCase> {
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------
+// Recorded Workbench line-mode traces: raw-register replay.
+//
+// Unlike `AreaCase`, this shape carries every register **verbatim** as
+// recorded -- most importantly `BLTAPTH`/`BLTAPTL`, the Bresenham error
+// term, which would be corrupted by the address-remapping every other
+// case in this file applies to its pointers. `BLTCPT`/`BLTDPT` are the
+// one pair still remapped, since `execute_line` requires them equal at
+// arm time (`blitter.rs`'s doc comment) and this differential's harness
+// always owns where its scratch memory lives regardless of where the
+// real OS put it -- so only the fact that they were equal at capture
+// time survives into `c_eq_d`, exactly like `AreaCase::c_equals_d`.
+// ---------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct LineRawCase {
+    name: String,
+    bltcon0: u16,
+    bltcon1: u16,
+    bltafwm: u16,
+    bltalwm: u16,
+    /// The Bresenham error term, replayed exactly as captured -- see the
+    /// section doc comment above and `blitter_trace.rs`'s `LineSignature`.
+    blt_apt_h: u16,
+    blt_apt_l: u16,
+    amod: i16,
+    bmod: i16,
+    cmod: i16,
+    dmod: i16,
+    adat: u16,
+    bdat: u16,
+    cdat: u16,
+    width: u16,
+    height: u16,
+    c_eq_d: bool,
+}
+
+fn workbench_line_corpus_cases() -> Vec<LineRawCase> {
+    WORKBENCH_CORPUS
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("LINE"))
+        .map(|(i, line)| {
+            let fields = corpus_fields(i, line, "LINE", 16);
+            LineRawCase {
+                name: format!(
+                    "workbench line trace #{i}: bltcon0={:#06X} bltcon1={:#06X} npixels={}",
+                    fields[0], fields[1], fields[14]
+                ),
+                bltcon0: fields[0] as u16,
+                bltcon1: fields[1] as u16,
+                bltafwm: fields[2] as u16,
+                bltalwm: fields[3] as u16,
+                blt_apt_h: fields[4] as u16,
+                blt_apt_l: fields[5] as u16,
+                amod: fields[6] as i16,
+                bmod: fields[7] as i16,
+                cmod: fields[8] as i16,
+                dmod: fields[9] as i16,
+                adat: fields[10] as u16,
+                bdat: fields[11] as u16,
+                cdat: fields[12] as u16,
+                width: fields[13] as u16,
+                height: fields[14] as u16,
+                c_eq_d: fields[15] != 0,
+            }
+        })
+        .collect()
+}
+
+impl LineRawCase {
+    fn effective_npixels(&self) -> u32 {
+        if self.height == 0 {
+            1024
+        } else {
+            self.height as u32
+        }
+    }
+
+    /// Conservative byte span the blit's `BLTCPT`/`BLTDPT` pointer can
+    /// reach from its start, in *either* direction (lines run up and
+    /// left as well as down and right -- octant is a runtime register
+    /// value here, not something this file inverted from endpoints, so
+    /// it must not assume a direction). Every one of the `npixels` steps
+    /// is charged the worst case: a full row-modulo move (`BLTCMOD`, the
+    /// only modulo `execute_line` actually uses for the row stride --
+    /// `BLTDMOD` is captured for replay fidelity but unread by it) *and*
+    /// a word-crossing x-shift step (2 bytes), even though a real
+    /// Bresenham line only takes the row step on a minority of pixels.
+    /// Deliberately loose, per the task's bounds instruction -- this
+    /// exists to decide what safely fits the arena, not to reconstruct
+    /// the real geometry.
+    fn span(&self) -> u32 {
+        let stride = self.cmod.unsigned_abs().max(self.dmod.unsigned_abs()) as u32;
+        self.effective_npixels().saturating_mul(stride + 2) + 64
+    }
+}
+
+fn run_line_raw_case(ccp: &mut Ccp, arena: &mut Arena, c: &LineRawCase) -> Option<String> {
+    let span = c.span();
+    let window = alloc_window(arena, span);
+    let cd_pt = window.start;
+
+    let writes: RegWrites = vec![
+        (reg::BLTCON0, c.bltcon0),
+        (reg::BLTCON1, c.bltcon1),
+        (reg::BLTAFWM, c.bltafwm),
+        (reg::BLTALWM, c.bltalwm),
+        (reg::BLTAPTH, c.blt_apt_h),
+        (reg::BLTAPTL, c.blt_apt_l),
+        // BLTBPT: every recorded line signature has USEB clear (verified
+        // against the actual corpus -- see docs/blitter-differential.md),
+        // so B is never dereferenced as an address in line mode here;
+        // left at 0 rather than allocated. A future re-recording that
+        // captures a USEB-set line would need this arm extended -- the
+        // differential's own case-selection loop skips (and counts) any
+        // such case rather than silently mis-replaying it, see below.
+        (reg::BLTBPTH, 0),
+        (reg::BLTBPTL, 0),
+        (reg::BLTCPTH, (cd_pt >> 16) as u16),
+        (reg::BLTCPTL, cd_pt as u16),
+        (reg::BLTDPTH, (cd_pt >> 16) as u16),
+        (reg::BLTDPTL, cd_pt as u16),
+        (reg::BLTAMOD, c.amod as u16),
+        (reg::BLTBMOD, c.bmod as u16),
+        (reg::BLTCMOD, c.cmod as u16),
+        (reg::BLTDMOD, c.dmod as u16),
+        (reg::BLTADAT, c.adat),
+        (reg::BLTBDAT, c.bdat),
+        (reg::BLTCDAT, c.cdat),
+        (
+            reg::BLTSIZE,
+            ((c.height & 0x03FF) << 6) | (c.width & 0x003F),
+        ),
+    ];
+
+    // ---- host ----
+    let mut ram = Ram::zeroed().clone_boxed();
+    let mut hb = Blitter::new();
+    for &(off, val) in &writes {
+        hb.write(off, val);
+    }
+    assert!(
+        hb.execute(&mut ram),
+        "{}: host line blit did not run",
+        c.name
+    );
+    let host_window = ram[window.base as usize..(window.base + window.size) as usize].to_vec();
+    let host = Outcome {
+        d_window: host_window,
+        zero: hb.zero,
+        bltddat: hb.bltddat,
+        pt: hb.pt,
+    };
+
+    // ---- Copperline ----
+    let code_addr = arena.alloc(512);
+    let scratch = arena.alloc(2);
+    let (prog, halt_addr) = build_program(code_addr, &writes, scratch);
+    ccp.write_mem(code_addr, &prog);
+    ccp.write_mem(window.base, &vec![0u8; window.size as usize]);
+    ccp.run_program(code_addr, halt_addr);
+
+    let cop_window = ccp.read_mem(window.base, window.size as usize);
+    let bltddat_bytes = ccp.read_mem(scratch, 2);
+    let bltddat = u16::from_be_bytes([bltddat_bytes[0], bltddat_bytes[1]]);
+    let dump = ccp.custom_dump();
+    let zero = (dump["DMACONR"].as_u64().unwrap_or(0) & (blitter::DMACONR_BZERO as u64)) != 0;
+    let cop = Outcome {
+        d_window: cop_window,
+        zero,
+        bltddat,
+        pt: [
+            ptr_from_dump(&dump, "BLTAPTH", "BLTAPTL"),
+            ptr_from_dump(&dump, "BLTBPTH", "BLTBPTL"),
+            ptr_from_dump(&dump, "BLTCPTH", "BLTCPTL"),
+            ptr_from_dump(&dump, "BLTDPTH", "BLTDPTL"),
+        ],
+    };
+
+    if !host.matches(&cop) {
+        Some(format!(
+            "LINE-RAW CASE DIVERGED: {} (seed={SEED:#X})\n  \
+             bltcon0={:#06X} bltcon1={:#06X} afwm={:#06X} alwm={:#06X}\n  \
+             blt_apt_h={:#06X} blt_apt_l={:#06X} amod={} bmod={} cmod={} dmod={}\n  \
+             adat={:#06X} bdat={:#06X} cdat={:#06X} width={} height={}\n  \
+             cd_pt={:#010X}\n  \
+             host:       zero={} bltddat={:#06X} pt={:X?}\n  \
+             copperline: zero={} bltddat={:#06X} pt={:X?}\n  \
+             window matches: {} ({})",
+            c.name,
+            c.bltcon0,
+            c.bltcon1,
+            c.bltafwm,
+            c.bltalwm,
+            c.blt_apt_h,
+            c.blt_apt_l,
+            c.amod,
+            c.bmod,
+            c.cmod,
+            c.dmod,
+            c.adat,
+            c.bdat,
+            c.cdat,
+            c.width,
+            c.height,
+            cd_pt,
+            host.zero,
+            host.bltddat,
+            host.pt,
+            cop.zero,
+            cop.bltddat,
+            cop.pt,
+            host.d_window == cop.d_window,
+            first_diff(&host.d_window, &cop.d_window),
+        ))
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1501,6 +1744,54 @@ fn blitter_differential_against_copperline() {
             failures.push(msg);
         }
     }
+
+    // Recorded Workbench line-mode traces: a fresh arena, not the one
+    // above. Every earlier case has already been read back and compared
+    // by this point, so nothing is lost by reusing the same address
+    // range -- and this corpus's own footprint (worst case ~0.5 MiB
+    // across 791 signatures, dominated by real bitmap row strides up to
+    // 90 bytes and lines up to 43 pixels long) needs room the randomised
+    // half's cases have already spent out of a single ~1 MiB arena.
+    let line_corpus = workbench_line_corpus_cases();
+    let mut line_arena = Arena::new(ARENA_BASE, ARENA_CEILING);
+    let mut line_skipped_arena = 0usize;
+    let mut line_skipped_useb = 0usize;
+    let mut line_skipped_c_ne_d = 0usize;
+    let mut line_ran = 0usize;
+    for case in &line_corpus {
+        if !case.c_eq_d {
+            // Out of this differential's scope -- see LineRawCase's
+            // section doc comment and docs/blitter-differential.md's
+            // existing "only BLTCPT == BLTDPT" scope note, which already
+            // applies to the randomised line cases and applies here too.
+            line_skipped_c_ne_d += 1;
+            continue;
+        }
+        if case.bltcon0 & blitter::BLTCON0_USEB != 0 {
+            // See run_line_raw_case's BLTBPT comment -- not reachable
+            // with the current corpus (verified: 0 of 791 set USEB), kept
+            // as a real, counted skip rather than a silent assumption in
+            // case a future re-recording captures one.
+            line_skipped_useb += 1;
+            continue;
+        }
+        let needed = (case.span() as u64) * 2 + 512 + 2 + 16; // window*2 + code + scratch + rounding slack
+        if needed > line_arena.remaining() as u64 {
+            line_skipped_arena += 1;
+            continue;
+        }
+        ran += 1;
+        line_ran += 1;
+        if let Some(msg) = run_line_raw_case(&mut ccp, &mut line_arena, case) {
+            failures.push(msg);
+        }
+    }
+    eprintln!(
+        "recorded line-mode traces: {} distinct signatures, {line_ran} replayed, \
+         {line_skipped_arena} skipped (arena bounds), {line_skipped_useb} skipped (USEB set), \
+         {line_skipped_c_ne_d} skipped (BLTCPT != BLTDPT at arm time)",
+        line_corpus.len()
+    );
 
     eprintln!(
         "blitter differential: {ran} cases run against Copperline, {} divergence(s), seed={SEED:#X}",

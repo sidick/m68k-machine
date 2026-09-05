@@ -26,16 +26,26 @@
 //! combination, so a multi-thousand-blit boot yields a small corpus
 //! rather than a firehose.
 //!
-//! **Line mode is out of scope for this recorder.** Deliberately, not an
-//! oversight: `BLTAPTL`/`BLTAPTH` in line mode hold the Bresenham error
-//! accumulator, not a memory address, and `BLTCPT`/`BLTDPT` behave
-//! differently too (`blitter.rs`'s `execute_line` doc comment). Replaying
-//! a captured line-mode signature through this file's `AreaCase` shape
-//! would poke the recorded error term into an arena-remapped "pointer"
-//! and silently corrupt the geometry -- worse than not capturing it at
-//! all. The randomised half of the differential already exercises line
-//! mode thoroughly (`line_cases`, every octant), so nothing here is
-//! trying to make up for a gap.
+//! **Line mode is recorded too, but as a distinct, raw shape.**
+//! `BLTAPTL`/`BLTAPTH` in line mode hold the Bresenham error accumulator,
+//! not a memory address, and `execute_line`'s doc comment in
+//! `blitter.rs` records that `BLTCPT`/`BLTDPT` are assumed equal at arm
+//! time and `BLTDPT` is simply overwritten from `BLTCPT` every pixel
+//! rather than independently stepped. Replaying a captured line-mode
+//! signature through this file's `AreaCase` shape -- which treats every
+//! channel's pointer as an address to remap -- would poke the recorded
+//! error term into an arena-remapped "pointer" and silently corrupt the
+//! geometry. So line arms get their own `LineSignature`: every register
+//! this task's replay needs is kept *verbatim* (`BLTAPT` most of all --
+//! remapping it would corrupt the Bresenham state rather than test it),
+//! with only `BLTCPT`/`BLTDPT` reduced to the same `c_eq_d` structural
+//! flag `AreaCase` already uses for its own pointer channels, since the
+//! replay harness remaps real addresses into its own scratch arena
+//! regardless of where the real OS put them. The randomised half of the
+//! differential already exercises line mode's octant/`SING`/texture
+//! space by construction (`line_cases`); this half's value is real
+//! register combinations a generator might under-sample, not novel
+//! geometry coverage.
 //!
 //! **Gating.** Every hook in this file is behind `Option<BlitterTrace>`
 //! being `None` when `--blitter-trace` is not passed, so a plain run
@@ -50,11 +60,11 @@ use std::path::Path;
 use machine_core::blitter::{reg, BLTCON1_LINE};
 use machine_core::CUSTOM_BASE;
 
-/// A blit's replay-relevant register state, with absolute pointers
-/// already dropped -- see the module doc comment. Field order here is
-/// exactly the corpus file's column order (see `write_line`/the parser
-/// in `tests/blitter_differential.rs`); keep them in sync if either
-/// changes.
+/// An area-mode blit's replay-relevant register state, with absolute
+/// pointers already dropped -- see the module doc comment. Field order
+/// here is exactly the corpus file's `AREA` column order (see
+/// `write_area_line`/the parser in `tests/blitter_differential.rs`); keep
+/// them in sync if either changes.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct Signature {
     bltcon0: u16,
@@ -76,6 +86,50 @@ struct Signature {
     height: u16,
     /// Whether `BLTCPT`/`BLTDPT` were equal at the moment `BLTSIZE`
     /// armed this blit -- graphics.library's read-modify-write idiom.
+    c_eq_d: bool,
+}
+
+/// A line-mode blit's replay-relevant register state, kept **verbatim**
+/// rather than address-remapped like `Signature` above -- see the module
+/// doc comment for why `BLTAPT` in particular must never be touched.
+/// Field order is the corpus file's `LINE` column order; keep in sync
+/// with the parser in `tests/blitter_differential.rs`.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct LineSignature {
+    bltcon0: u16,
+    bltcon1: u16,
+    bltafwm: u16,
+    bltalwm: u16,
+    /// `BLTAPTH`/`BLTAPTL` -- the Bresenham error accumulator, not an
+    /// address. Replayed verbatim, split high/low exactly as observed
+    /// (rather than combined into a single value) so nothing is lost if
+    /// the high word ever carries anything beyond sign extension.
+    blt_apt_h: u16,
+    blt_apt_l: u16,
+    /// Bresenham corrective increments (`execute_line`'s `amod_step`/
+    /// `bmod_step`), not row strides -- see `blitter.rs`'s doc comment.
+    amod: i16,
+    bmod: i16,
+    /// The bitplane's bytes-per-row. `execute_line` only ever reads
+    /// `BLTCMOD` for this (`BLTDMOD` is unused in line mode -- captured
+    /// anyway for replay fidelity, per the task's instruction to record
+    /// registers verbatim rather than pre-judge which ones matter).
+    cmod: i16,
+    dmod: i16,
+    adat: u16,
+    bdat: u16,
+    cdat: u16,
+    /// `BLTSIZE`'s raw fields -- width is conventionally 2 (unread by
+    /// `execute_line`) and height is the line's pixel count.
+    width: u16,
+    height: u16,
+    /// Whether `BLTCPT`/`BLTDPT` were equal at arm time. `execute_line`
+    /// only ever advances `BLTCPT` and then copies it onto `BLTDPT` every
+    /// pixel (`blitter.rs`'s doc comment), so a signature with this false
+    /// is outside the convention this differential replays -- recorded
+    /// anyway (never silently dropped) so the replay side can count and
+    /// report exactly how many, rather than this recorder deciding for
+    /// it.
     c_eq_d: bool,
 }
 
@@ -102,16 +156,27 @@ struct Shadow {
     cptl: u16,
     dpth: u16,
     dptl: u16,
+    /// `BLTAPTH`/`BLTAPTL` -- only meaningful (and only tracked here) for
+    /// line-mode arms, where it's the Bresenham error term rather than an
+    /// address; area mode drops A's pointer entirely (see `Signature`).
+    apth: u16,
+    aptl: u16,
 }
 
 pub struct BlitterTrace {
     file: BufWriter<File>,
     shadow: Shadow,
     seen: HashSet<Signature>,
-    /// Every `BLTSIZE` write that armed an area-mode blit (line-mode
-    /// arms are counted separately and never reach the corpus).
+    seen_lines: HashSet<LineSignature>,
+    /// Every `BLTSIZE` write that armed an area-mode blit.
     total_area_blits: u64,
+    /// Every `BLTSIZE` write that armed a line-mode blit.
     total_line_blits: u64,
+    /// Of `total_line_blits`, how many had `BLTCPT != BLTDPT` at arm time
+    /// -- outside the convention this differential's replay assumes (see
+    /// `LineSignature::c_eq_d`'s doc comment). Recorded for the summary
+    /// line so a non-zero count is visible, not silently folded in.
+    line_blits_with_c_ne_d: u64,
 }
 
 impl BlitterTrace {
@@ -125,17 +190,25 @@ impl BlitterTrace {
         writeln!(
             writer,
             "# blitter register trace corpus -- one line per distinct signature\n\
-             # columns: bltcon0 bltcon1 bltafwm bltalwm amod bmod cmod dmod adat bdat cdat width height c_eq_d\n\
+             #\n\
+             # AREA lines -- columns:\n\
+             #   AREA bltcon0 bltcon1 bltafwm bltalwm amod bmod cmod dmod adat bdat cdat width height c_eq_d\n\
              # (all decimal; amod/bmod/cmod/dmod signed, width/height are BLTSIZE's raw\n\
              # fields with 0 meaning 64/1024, c_eq_d is 0 or 1 -- see\n\
-             # crates/machine-hosted/src/blitter_trace.rs and docs/blitter-differential.md)"
+             # crates/machine-hosted/src/blitter_trace.rs and docs/blitter-differential.md)\n\
+             #\n\
+             # LINE lines -- columns (registers kept verbatim, not remapped -- BLTAPT is\n\
+             # the Bresenham error term here, not an address; see LineSignature):\n\
+             #   LINE bltcon0 bltcon1 bltafwm bltalwm blt_apt_h blt_apt_l amod bmod cmod dmod adat bdat cdat width height c_eq_d"
         )?;
         Ok(BlitterTrace {
             file: writer,
             shadow: Shadow::default(),
             seen: HashSet::new(),
+            seen_lines: HashSet::new(),
             total_area_blits: 0,
             total_line_blits: 0,
+            line_blits_with_c_ne_d: 0,
         })
     }
 
@@ -163,6 +236,8 @@ impl BlitterTrace {
             reg::BLTCPTL => self.shadow.cptl = value,
             reg::BLTDPTH => self.shadow.dpth = value,
             reg::BLTDPTL => self.shadow.dptl = value,
+            reg::BLTAPTH => self.shadow.apth = value,
+            reg::BLTAPTL => self.shadow.aptl = value,
             reg::BLTCMOD => self.shadow.cmod = value,
             reg::BLTBMOD => self.shadow.bmod = value,
             reg::BLTAMOD => self.shadow.amod = value,
@@ -182,9 +257,56 @@ impl BlitterTrace {
     /// here, matching the differential's own documented scope note that
     /// every case there triggers via classic `BLTSIZE` too.
     fn on_size_write(&mut self, value: u16) {
+        let c_eq_d = (self.shadow.cpth, self.shadow.cptl) == (self.shadow.dpth, self.shadow.dptl);
         if self.shadow.bltcon1 & BLTCON1_LINE != 0 {
             self.total_line_blits += 1;
-            return; // see module doc comment: line mode is out of scope here
+            if !c_eq_d {
+                self.line_blits_with_c_ne_d += 1;
+            }
+
+            let sig = LineSignature {
+                bltcon0: self.shadow.bltcon0,
+                bltcon1: self.shadow.bltcon1,
+                bltafwm: self.shadow.bltafwm,
+                bltalwm: self.shadow.bltalwm,
+                blt_apt_h: self.shadow.apth,
+                blt_apt_l: self.shadow.aptl,
+                amod: self.shadow.amod as i16,
+                bmod: self.shadow.bmod as i16,
+                cmod: self.shadow.cmod as i16,
+                dmod: self.shadow.dmod as i16,
+                adat: self.shadow.adat,
+                bdat: self.shadow.bdat,
+                cdat: self.shadow.cdat,
+                width: value & 0x003F,
+                height: (value >> 6) & 0x03FF,
+                c_eq_d,
+            };
+            if self.seen_lines.insert(sig.clone()) {
+                // Best-effort: see the area-mode branch below for why a
+                // write failure here doesn't abort the boot.
+                let _ = writeln!(
+                    self.file,
+                    "LINE {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    sig.bltcon0,
+                    sig.bltcon1,
+                    sig.bltafwm,
+                    sig.bltalwm,
+                    sig.blt_apt_h,
+                    sig.blt_apt_l,
+                    sig.amod,
+                    sig.bmod,
+                    sig.cmod,
+                    sig.dmod,
+                    sig.adat,
+                    sig.bdat,
+                    sig.cdat,
+                    sig.width,
+                    sig.height,
+                    sig.c_eq_d as u8,
+                );
+            }
+            return;
         }
         self.total_area_blits += 1;
 
@@ -202,7 +324,7 @@ impl BlitterTrace {
             cdat: self.shadow.cdat,
             width: value & 0x003F,
             height: (value >> 6) & 0x03FF,
-            c_eq_d: (self.shadow.cpth, self.shadow.cptl) == (self.shadow.dpth, self.shadow.dptl),
+            c_eq_d,
         };
 
         if self.seen.insert(sig.clone()) {
@@ -211,7 +333,7 @@ impl BlitterTrace {
             // here (disk full, etc.) is not worth aborting the boot over.
             let _ = writeln!(
                 self.file,
-                "{} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                "AREA {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                 sig.bltcon0,
                 sig.bltcon1,
                 sig.bltafwm,
@@ -235,11 +357,14 @@ impl BlitterTrace {
     pub fn finish(mut self) -> String {
         let _ = self.file.flush();
         format!(
-            "blitter-trace: {} area-mode blit(s) observed, {} distinct signature(s) recorded \
-             ({} line-mode blit(s) seen and skipped -- see blitter_trace.rs)",
+            "blitter-trace: {} area-mode blit(s) observed, {} distinct signature(s) recorded; \
+             {} line-mode blit(s) observed, {} distinct signature(s) recorded \
+             ({} of those with BLTCPT != BLTDPT at arm time -- see blitter_trace.rs)",
             self.total_area_blits,
             self.seen.len(),
             self.total_line_blits,
+            self.seen_lines.len(),
+            self.line_blits_with_c_ne_d,
         )
     }
 }
