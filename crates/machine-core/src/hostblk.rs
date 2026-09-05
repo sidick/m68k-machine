@@ -621,7 +621,7 @@ impl<'a> Hostblk<'a> {
     /// request against `ram`, direct to/from the guest's own memory
     /// (module docs, "The transfer engine"). Called once per
     /// [`crate::MachineBus::tick`], mirroring `mirage::Mirage::tick`.
-    pub fn tick(&mut self, ram: &mut [u8]) {
+    pub fn tick(&mut self, mem: &mut dyn crate::GuestMemory) {
         // Back-pressure, not data loss (module docs, "The completion
         // queue"): don't even dequeue a submission unless there is
         // guaranteed room for the completion it will produce.
@@ -631,7 +631,7 @@ impl<'a> Hostblk<'a> {
         let Some(ptr) = self.submit_queue.pop() else {
             return;
         };
-        let (error, actual) = self.execute(ptr, ram);
+        let (error, actual) = self.execute(ptr, mem);
         // Room was checked above and nothing has re-entered since, so
         // this cannot fail -- `debug_assert!`, not a silent drop, if
         // that invariant is ever broken by a future edit.
@@ -641,16 +641,16 @@ impl<'a> Hostblk<'a> {
         debug_assert!(pushed, "completion room was checked before executing");
     }
 
-    fn execute(&mut self, ptr: u32, ram: &mut [u8]) -> (u8, u32) {
-        let Some(desc) = Self::read_descriptor(ptr, ram) else {
+    fn execute(&mut self, ptr: u32, mem: &mut dyn crate::GuestMemory) -> (u8, u32) {
+        let Some(desc) = Self::read_descriptor(ptr, mem) else {
             return (err::BAD_ADDRESS, 0);
         };
         let Some(unit) = self.unit_index(desc.unit) else {
             return (err::BAD_UNIT, 0);
         };
         match desc.command {
-            cmd::READ => self.transfer(unit, &desc, ram, false),
-            cmd::WRITE => self.transfer(unit, &desc, ram, true),
+            cmd::READ => self.transfer(unit, &desc, mem, false),
+            cmd::WRITE => self.transfer(unit, &desc, mem, true),
             cmd::FLUSH => (err::OK, 0), // module docs: no durability primitive yet
             _ => (err::INVALID_COMMAND, 0),
         }
@@ -675,21 +675,22 @@ impl<'a> Hostblk<'a> {
     /// unconditionally, since any bit pattern in `command`/`unit` is
     /// still a well-defined (if possibly-rejected) value, unlike the
     /// pointer itself which can be flatly unreachable.
-    fn read_descriptor(ptr: u32, ram: &[u8]) -> Option<Descriptor> {
+    fn read_descriptor(ptr: u32, mem: &dyn crate::GuestMemory) -> Option<Descriptor> {
         if !ptr.is_multiple_of(4) {
             return None;
         }
-        let end = ptr.checked_add(DESC_LEN)?;
-        if (end as usize) > ram.len() {
-            return None;
-        }
-        let base = ptr as usize;
-        let command = ram[base];
-        let unit = ram[base + 1];
-        // ram[base + 2..base + 4]: reserved, ignored.
-        let length = u32::from_be_bytes(ram[base + 4..base + 8].try_into().unwrap());
-        let offset = u64::from_be_bytes(ram[base + 8..base + 16].try_into().unwrap());
-        let buffer = u32::from_be_bytes(ram[base + 16..base + 20].try_into().unwrap());
+        // Reachability is the bus's question, not this card's: it asks
+        // for a validated view rather than comparing against a range of
+        // its own. Until fast RAM existed this compared against
+        // `CHIP_RAM_SIZE`, which was true only while chip RAM was the
+        // only RAM -- see `device-ledger.md`, "The rule for addresses".
+        let d = mem.ram_slice(ptr, DESC_LEN)?;
+        let command = d[0];
+        let unit = d[1];
+        // d[2..4]: reserved, ignored.
+        let length = u32::from_be_bytes(d[4..8].try_into().unwrap());
+        let offset = u64::from_be_bytes(d[8..16].try_into().unwrap());
+        let buffer = u32::from_be_bytes(d[16..20].try_into().unwrap());
         Some(Descriptor {
             command,
             unit,
@@ -706,7 +707,7 @@ impl<'a> Hostblk<'a> {
         &mut self,
         unit: usize,
         desc: &Descriptor,
-        ram: &mut [u8],
+        mem: &mut dyn crate::GuestMemory,
         is_write: bool,
     ) -> (u8, u32) {
         // Safe to index/unwrap: `unit` came from `unit_index`, which
@@ -729,21 +730,22 @@ impl<'a> Hostblk<'a> {
         if end_lba > total_sectors {
             return (err::OUT_OF_RANGE, 0);
         }
-        let Some(buf_end) = desc.buffer.checked_add(desc.length) else {
+        // One validated view of the whole buffer, taken up front: the
+        // bus decides reachability (chip RAM, fast RAM, or whatever a
+        // future board adds), and a span straddling two regions is
+        // refused rather than silently stitched together.
+        let Some(buf) = mem.ram_slice_mut(desc.buffer, desc.length) else {
             return (err::BAD_ADDRESS, 0);
         };
-        if (buf_end as usize) > ram.len() {
-            return (err::BAD_ADDRESS, 0);
-        }
 
         let mut sector_buf = [0u8; SECTOR_BYTES];
         let mut actual = 0u32;
         for i in 0..sector_count {
             let lba = start_lba + u64::from(i);
-            let ram_off = desc.buffer as usize + i as usize * SECTOR_BYTES;
+            let off = i as usize * SECTOR_BYTES;
             let dev = &mut *self.units[unit].as_mut().unwrap().device;
             if is_write {
-                sector_buf.copy_from_slice(&ram[ram_off..ram_off + SECTOR_BYTES]);
+                sector_buf.copy_from_slice(&buf[off..off + SECTOR_BYTES]);
                 if !dev.write_sector(lba, &sector_buf) {
                     return (err::IO_ERROR, actual);
                 }
@@ -751,7 +753,7 @@ impl<'a> Hostblk<'a> {
                 if !dev.read_sector(lba, &mut sector_buf) {
                     return (err::IO_ERROR, actual);
                 }
-                ram[ram_off..ram_off + SECTOR_BYTES].copy_from_slice(&sector_buf);
+                buf[off..off + SECTOR_BYTES].copy_from_slice(&sector_buf);
             }
             actual += SECTOR_BYTES as u32;
         }
@@ -966,6 +968,33 @@ mod tests {
     }
 
     const RAM_SIZE: usize = 64 * 1024;
+
+    /// Flat guest RAM based at 0, so these unit tests can drive the card
+    /// without standing a whole `MachineBus` up. It enforces the same
+    /// refusals the real implementation does -- an overflowing span, or
+    /// one running past the end of the region -- so the `BAD_ADDRESS`
+    /// tests below still fail for the reason they claim to. What it
+    /// deliberately does *not* model is more than one region; that the
+    /// card reaches both chip RAM and fast RAM, and refuses a span
+    /// straddling them, is covered by the bus-level tests in `lib.rs`
+    /// against the real memory map.
+    impl crate::GuestMemory for std::vec::Vec<u8> {
+        fn ram_slice(&self, addr: u32, len: u32) -> Option<&[u8]> {
+            let end = addr.checked_add(len)?;
+            if end as usize > self.len() {
+                return None;
+            }
+            Some(&self[addr as usize..end as usize])
+        }
+
+        fn ram_slice_mut(&mut self, addr: u32, len: u32) -> Option<&mut [u8]> {
+            let end = addr.checked_add(len)?;
+            if end as usize > self.len() {
+                return None;
+            }
+            Some(&mut self[addr as usize..end as usize])
+        }
+    }
 
     fn ram() -> std::vec::Vec<u8> {
         std::vec![0u8; RAM_SIZE]

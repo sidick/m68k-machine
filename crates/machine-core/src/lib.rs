@@ -543,12 +543,21 @@ impl<'a> MachineBus<'a> {
         // not scaled to `cpu_clocks` -- see `hostblk`'s module docs on
         // why "at most one request per tick" is the right grain here,
         // and why this may run entirely independently of MIRAGE and
-        // Gayle (all three coexist). `self.chip_ram` is a disjoint field
-        // from `self.hostblk`, the same borrow shape `run_blitter`
-        // already relies on for the blitter's own guest-RAM access.
-        if let Some(h) = &mut self.hostblk {
-            h.tick(self.chip_ram);
-            if h.irq_pending() {
+        // Gayle (all three coexist).
+        //
+        // The card is lifted out of its `Option` for the call because it
+        // needs a `&mut dyn GuestMemory` view of the whole bus -- it
+        // asks which addresses are RAM rather than assuming a range, so
+        // it can reach fast RAM as well as chip RAM. `self` cannot be
+        // borrowed mutably while `self.hostblk` is, so the card stops
+        // occupying one of those borrows for the duration and is put
+        // straight back. Nothing observes the gap: `tick` is not
+        // re-entrant and no bus access happens inside it.
+        if let Some(mut h) = self.hostblk.take() {
+            h.tick(self);
+            let pending = h.irq_pending();
+            self.hostblk = Some(h);
+            if pending {
                 self.chipset.raise_int(chipset::intbit::PORTS);
             }
         }
@@ -1737,6 +1746,90 @@ mod tests {
             autoconfig::AUTOCONFIG_BASE + autoconfig::ec::Z3_BASEADDRESS + 1,
             (base >> 16) as u8,
         );
+    }
+
+    /// The point of routing `hostblk` through [`GuestMemory`] rather than
+    /// a chip-RAM range: a buffer in fast RAM must work. `hostblk`'s own
+    /// unit tests use a flat RAM based at 0, so they cannot show this --
+    /// only the real memory map can, which is why this lives here.
+    ///
+    /// Fast RAM's base is whatever AUTOCONFIG assigned, read back rather
+    /// than assumed (`device-ledger.md`, "The rule for addresses").
+    #[test]
+    fn hostblk_transfers_into_a_fast_ram_buffer_not_just_chip_ram() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut fast = std::vec![0u8; fastram::MIN_SIZE_BYTES as usize];
+        let mut disk = MirageDisk::new(64);
+        let mut bus = new_bus(&mut ram, &rom)
+            .with_hostblk(0, &mut disk, false)
+            .with_fast_ram(&mut fast);
+
+        // AUTOCONFIG places one board at a time, so each gets its own
+        // base write: hostblk registered first and is configured first,
+        // fast RAM second. Where each landed is then read back rather
+        // than assumed (`device-ledger.md`, "The rule for addresses") --
+        // the test cares that fast RAM is reachable, not where it sits.
+        let hb_base = 0x4000_0000u32;
+        configure_hostblk_z3(&mut bus, hb_base);
+        configure_hostblk_z3(&mut bus, 0x5000_0000);
+        let fast_base = bus
+            .autoconfig
+            .placement(1)
+            .map(|p| p.base)
+            .expect("fast RAM configured");
+        assert!(
+            fast_base >= CHIP_RAM_SIZE as u32,
+            "fast RAM must sit outside chip RAM for this test to mean anything"
+        );
+
+        // Seed a sector on the device, then read it into a buffer that
+        // lives in fast RAM. Before this change the descriptor and the
+        // buffer both had to be under CHIP_RAM_SIZE, so this failed with
+        // BAD_ADDRESS.
+        // Write a sector *out of* fast RAM, then read it back *into* a
+        // different fast-RAM address, so both directions are proven
+        // without needing access to the device behind the card.
+        let pattern: std::vec::Vec<u8> =
+            (0..gayle::SECTOR_BYTES).map(|i| (i as u8) ^ 0x5A).collect();
+        let desc_addr = fast_base + 0x100;
+        let src_addr = fast_base + 0x1000;
+        let dst_addr = fast_base + 0x2000;
+        for (i, &b) in pattern.iter().enumerate() {
+            bus.write_byte(src_addr + i as u32, b);
+        }
+
+        let submit = |bus: &mut MachineBus, cmd: u8, buf: u32| {
+            bus.write_byte(desc_addr, cmd);
+            bus.write_byte(desc_addr + 1, 0);
+            bus.write_long(desc_addr + 4, gayle::SECTOR_BYTES as u32);
+            bus.write_long(desc_addr + 8, 0);
+            bus.write_long(desc_addr + 12, 0);
+            bus.write_long(desc_addr + 16, buf);
+            bus.write_long(hb_base + hostblk::reg::DOORBELL, desc_addr);
+            bus.tick(1);
+            let err = bus.read_byte(hb_base + hostblk::reg::COMPLETION_ERROR + 3);
+            bus.write_byte(hb_base + hostblk::reg::COMPLETION_ADVANCE + 3, 0);
+            err
+        };
+
+        assert_eq!(
+            submit(&mut bus, hostblk::cmd::WRITE, src_addr),
+            hostblk::err::OK,
+            "a descriptor and source buffer in fast RAM must be reachable"
+        );
+        assert_eq!(
+            submit(&mut bus, hostblk::cmd::READ, dst_addr),
+            hostblk::err::OK,
+            "a destination buffer in fast RAM must be reachable"
+        );
+        for (i, &b) in pattern.iter().enumerate() {
+            assert_eq!(
+                bus.read_byte(dst_addr + i as u32),
+                b,
+                "sector byte {i} round-tripped through fast RAM"
+            );
+        }
     }
 
     #[test]
