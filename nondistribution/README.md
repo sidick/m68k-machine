@@ -16,7 +16,7 @@ skipped forever while still reporting success.
 
 | File | What it is | Where it comes from |
 |---|---|---|
-| `m68k-machine.hdf` | Bootable AmigaOS 3.2.2 image: RDB, one `DH0` FFS partition, Picasso96 installed against the Graffity card | `tools/amibake/m68k-machine.toml`, built with [amibake](https://github.com/simond/amibake) from licensed floppies — see `docs/storage.md` |
+| `m68k-machine.hdf` | Bootable AmigaOS 3.2.2 image: RDB, one `DH0` FFS partition, Picasso96 installed against the Graffity card | `tools/amibake/m68k-machine.toml`, built with [amibake](https://github.com/sidick/amibake) from licensed floppies — see `docs/storage.md` |
 | `A1200.47.115.rom` | Kickstart 3.2.2 for the A1200 | Cloanto Amiga Forever, or an image dumped from hardware you own |
 
 Both are also overridable by environment variable — `M68K_TEST_HDF` and
