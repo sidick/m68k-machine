@@ -136,7 +136,135 @@ mod idx {
     /// silicon. Read-only.
     pub const CRTC_ID: u8 = 0x27;
     pub const CRTC_LAST_STANDARD: u8 = 0x18;
+
+    // ---- graphics controller: the CL-GD542x BitBLT engine -------------
+    //
+    // Offsets and bit layouts below come from the Cirrus Logic
+    // CL-GD5426/5428 Technical Reference Manual's BitBLT chapter (the
+    // task's designated authority), cross-checked for behaviour — never
+    // for register numbers or code text — against the Copperline and
+    // Amiberry oracles (module docs' usual policy, and doubly important
+    // here since both those oracles are GPL).
+    /// Blit width, in bytes, minus one, low 8 bits; the next register
+    /// (`+1`) holds bits 8-10 (mask `0x07`) — see `Cirrus542x::blit_width`.
+    pub const GR_BLIT_WIDTH_LO: u8 = 0x20;
+    /// Blit height, in rows, minus one, low 8 bits; the next register
+    /// holds bits 8-9 (mask `0x03`) — see `Cirrus542x::blit_height`.
+    pub const GR_BLIT_HEIGHT_LO: u8 = 0x22;
+    /// Destination pitch, low 8 bits; the next register holds bits 8-12
+    /// (mask `0x1F`) — see `Cirrus542x::blit_pitch`.
+    pub const GR_BLIT_DST_PITCH_LO: u8 = 0x24;
+    /// Source pitch, same LO/HI shape as the destination pitch.
+    pub const GR_BLIT_SRC_PITCH_LO: u8 = 0x26;
+    /// Destination address, 21 bits across three consecutive registers
+    /// (LO, `+1`, `+2` masked to `0x1F`) — see `Cirrus542x::blit_addr`.
+    pub const GR_BLIT_DST_ADDR_LO: u8 = 0x28;
+    /// Source address, same 21-bit three-register shape as the
+    /// destination.
+    pub const GR_BLIT_SRC_ADDR_LO: u8 = 0x2C;
+    /// Blit mode: see `blit_mode` for the bit layout.
+    pub const GR_BLIT_MODE: u8 = 0x30;
+    /// Start trigger / busy status: see `blit_status`.
+    pub const GR_BLIT_START_STATUS: u8 = 0x31;
+    /// Raster operation code (`apply_rop`'s `rop` argument).
+    pub const GR_BLIT_ROP: u8 = 0x32;
+    /// Extended mode bits: see `blit_modeext`.
+    pub const GR_BLIT_MODE_EXT: u8 = 0x33;
+    /// Transparency compare colour, one byte per pixel component
+    /// (`GR34..=GR37`).
+    pub const GR_BLIT_TRANSPARENT_COMPARE: u8 = 0x34;
+    /// Transparency compare mask, one byte per pixel component
+    /// (`GR38..=GR3B`); a set mask bit means "don't care" for that bit
+    /// of the comparison.
+    pub const GR_BLIT_TRANSPARENT_MASK: u8 = 0x38;
+    /// Foreground/background colour, one register pair per pixel
+    /// component (byte lane), used by solid fill and colour expansion.
+    /// The same registers VGA write-mode 0/2's Set/Reset and Colour
+    /// Compare paths use for an 8bpp plane — the chip multiplexes them,
+    /// same as real silicon; nothing here is blit-specific storage.
+    pub const GR_BG0: u8 = 0x00;
+    pub const GR_FG0: u8 = 0x01;
+    pub const GR_BG1: u8 = 0x10;
+    pub const GR_FG1: u8 = 0x11;
+    pub const GR_BG2: u8 = 0x12;
+    pub const GR_FG2: u8 = 0x13;
+    pub const GR_BG3: u8 = 0x14;
+    pub const GR_FG3: u8 = 0x15;
 }
+
+/// `idx::GR_BLIT_MODE` (GR30) bit flags.
+mod blit_mode {
+    /// Descending (decrementing) addresses instead of ascending.
+    pub const BACKWARDS: u8 = 0x01;
+    /// Source comes from the host CPU pushing bytes through the VRAM
+    /// aperture rather than from VRAM itself.
+    pub const SYSTEM_SOURCE: u8 = 0x04;
+    /// Source pixels matching the transparency-compare colour are
+    /// skipped (destination left unwritten) instead of blended by the
+    /// ROP.
+    pub const TRANSPARENT: u8 = 0x08;
+    /// Mask for the pixel-width field: `0x00`/`0x10`/`0x20`/`0x30` for
+    /// 1/2/3/4 bytes per pixel.
+    pub const PIXEL_WIDTH_MASK: u8 = 0x30;
+    /// Source is an 8x8 tile read once and repeated, rather than a
+    /// linear scan.
+    pub const PATTERN: u8 = 0x40;
+    /// Source is a monochrome bit stream: each bit selects the
+    /// foreground or background colour for one pixel.
+    pub const COLOR_EXPAND: u8 = 0x80;
+}
+
+/// `idx::GR_BLIT_MODE_EXT` (GR33) bit flags.
+mod blit_modeext {
+    /// Colour-expand source bits are grouped into 32-bit words rather
+    /// than 8-bit bytes (changes the row-padding granularity).
+    pub const DWORD_GRANULARITY: u8 = 0x01;
+    /// Invert which polarity of an expanded bit is "transparent" under
+    /// `blit_mode::TRANSPARENT`.
+    pub const COLOR_EXPAND_INVERT: u8 = 0x02;
+    /// Colour-expand every source bit as foreground (a solid fill:
+    /// `PATTERN | COLOR_EXPAND` with this set paints the whole rectangle
+    /// the foreground colour, ignoring the pattern tile entirely).
+    pub const SOLID_FILL: u8 = 0x04;
+}
+
+/// `idx::GR_BLIT_START_STATUS` (GR31) bit flags.
+mod blit_status {
+    /// Write 1 to arm and, for anything but a system-source blit, run
+    /// the transfer immediately (this engine is synchronous, the same
+    /// house style as [`crate::blitter`] — module docs there explain
+    /// why: no DMA/timing model, so the guest never observes a
+    /// partially-run blit).
+    pub const START: u8 = 0x02;
+    /// Write 1 to abandon a pending (system-source) transfer.
+    pub const RESET: u8 = 0x04;
+    /// The bits a status read shows set while a system-source transfer
+    /// is still waiting on host data. Matches how Picasso96's Cirrus
+    /// driver polls this register (Copperline's oracle, cross-checked,
+    /// reports the identical mask).
+    pub const BUSY_MASK: u8 = 0x09;
+}
+
+/// Upper bound on a system-source (host-fed) blit transfer this model
+/// will buffer before running it: `#![no_std]` with no allocator rules
+/// out sizing the buffer to the transfer, like the oracles do. Chosen
+/// generously against what P96's Cirrus driver actually pushes through
+/// this path — glyph and icon colour-expansion, a handful of KB at
+/// most — not against the register field's own much larger theoretical
+/// range. A transfer that requests more than this is still safe: bytes
+/// past the cap are counted towards completion (so the driver's
+/// handshake still finishes) but dropped rather than written, and the
+/// blit that follows runs against whatever fits — never a panic or an
+/// out-of-bounds write.
+const SYSTEM_BLIT_CAPACITY: usize = 8192;
+
+/// A guest-programmed blit address is a 21-bit counter on real silicon
+/// (three GR registers, the top one masked to 5 bits): a value that
+/// overflows or underflows wraps within that field instead of escaping
+/// it. This bounds the *register representation*; the actual VRAM access
+/// is separately bounds-checked against the real (possibly smaller)
+/// backing store via `slice::get`, never indexed raw.
+const BLIT_ADDR_MASK: usize = 0x1F_FFFF;
 
 /// The Cirrus CL-GD5426/5428 register model on its own: the VGA port
 /// map (sequencer, CRTC, graphics controller, attribute controller),
@@ -192,6 +320,25 @@ pub struct Cirrus542x<'a> {
     /// on; auto-increments the read or write index after the third.
     dac_component: u8,
     dac_read_mode: bool,
+
+    /// A system-source blit that has been started but is still waiting
+    /// for the driver to push its pixel data through the VRAM aperture
+    /// (see `blit_mode::SYSTEM_SOURCE` and `SYSTEM_BLIT_CAPACITY`).
+    /// `None` the rest of the time, including for every ordinary
+    /// (VRAM-to-VRAM or pattern/solid) blit, which this model runs to
+    /// completion synchronously inside the register write that starts
+    /// it.
+    system_blit: Option<SystemBlit>,
+}
+
+/// State for an in-flight system-source (host-fed) blit: how many bytes
+/// the transfer needs, how many have arrived, and the bytes themselves
+/// in a fixed buffer (see `SYSTEM_BLIT_CAPACITY` for why it isn't sized
+/// to the transfer).
+struct SystemBlit {
+    expected: usize,
+    filled: usize,
+    buf: [u8; SYSTEM_BLIT_CAPACITY],
 }
 
 impl<'a> Cirrus542x<'a> {
@@ -219,6 +366,7 @@ impl<'a> Cirrus542x<'a> {
             dac_read_index: 0,
             dac_component: 0,
             dac_read_mode: false,
+            system_blit: None,
         }
     }
 
@@ -244,7 +392,18 @@ impl<'a> Cirrus542x<'a> {
     }
 
     /// Write a byte of VRAM through the linear aperture.
+    ///
+    /// While a system-source blit is armed and waiting for data, *every*
+    /// aperture write feeds that transfer instead of touching VRAM,
+    /// whatever `offset` is — real hardware routes the whole aperture to
+    /// the BitBLT FIFO in this state, and the driver always writes
+    /// through a fixed pointer rather than incrementing one of its own,
+    /// so the offset it happens to use is not meaningful here either.
     pub fn vram_write(&mut self, offset: usize, value: u8) {
+        if self.system_blit.is_some() {
+            self.feed_system_blit(value);
+            return;
+        }
         if let Some(slot) = self.vram.get_mut(offset) {
             *slot = value;
         }
@@ -469,6 +628,16 @@ impl<'a> Cirrus542x<'a> {
         if index > 8 && !self.extensions_unlocked() {
             return crate::OPEN_BUS_BYTE;
         }
+        if index == idx::GR_BLIT_START_STATUS {
+            // START/RESET are write-only triggers, never latched: only
+            // the busy bit is synthesised on readback, same shape as
+            // DMACONR's BBUSY in `crate::blitter`.
+            let mut value = self.gr[index as usize] & !blit_status::BUSY_MASK;
+            if self.system_blit.is_some() {
+                value |= blit_status::BUSY_MASK;
+            }
+            return value;
+        }
         self.gr[index as usize]
     }
 
@@ -478,6 +647,370 @@ impl<'a> Cirrus542x<'a> {
             return;
         }
         self.gr[index as usize] = value;
+        if index == idx::GR_BLIT_START_STATUS {
+            if value & blit_status::RESET != 0 {
+                self.system_blit = None;
+                self.gr[idx::GR_BLIT_START_STATUS as usize] &= !blit_status::BUSY_MASK;
+            } else if value & blit_status::START != 0 {
+                self.start_blit();
+            }
+        }
+    }
+
+    // ---- BitBLT engine ---------------------------------------------------
+
+    fn blit_width(&self) -> usize {
+        let lo = idx::GR_BLIT_WIDTH_LO as usize;
+        ((usize::from(self.gr[lo + 1] & 0x07) << 8) | usize::from(self.gr[lo])) + 1
+    }
+
+    fn blit_height(&self) -> usize {
+        let lo = idx::GR_BLIT_HEIGHT_LO as usize;
+        ((usize::from(self.gr[lo + 1] & 0x03) << 8) | usize::from(self.gr[lo])) + 1
+    }
+
+    fn blit_pitch(&self, low: u8) -> usize {
+        (usize::from(self.gr[low as usize + 1] & 0x1F) << 8) | usize::from(self.gr[low as usize])
+    }
+
+    fn blit_addr(&self, low: u8) -> usize {
+        let low = low as usize;
+        usize::from(self.gr[low])
+            | (usize::from(self.gr[low + 1]) << 8)
+            | (usize::from(self.gr[low + 2] & 0x1F) << 16)
+    }
+
+    /// The counterpart to `blit_addr`: a completed transfer leaves the
+    /// address registers where it stopped rather than reloading them
+    /// (real hardware behaviour graphics.library-equivalent Picasso96
+    /// drivers rely on — see `execute_blit`'s closing comment), so this
+    /// is called at the end of every blit, not just on a fresh program.
+    fn set_blit_addr(&mut self, low: u8, addr: usize) {
+        let addr = addr & BLIT_ADDR_MASK;
+        let low = low as usize;
+        self.gr[low] = addr as u8;
+        self.gr[low + 1] = (addr >> 8) as u8;
+        self.gr[low + 2] = (self.gr[low + 2] & !0x1F) | ((addr >> 16) as u8 & 0x1F);
+    }
+
+    fn blit_pixel_bytes(&self) -> usize {
+        match self.gr[idx::GR_BLIT_MODE as usize] & blit_mode::PIXEL_WIDTH_MASK {
+            0x00 => 1,
+            0x10 => 2,
+            0x20 => 3,
+            _ => 4,
+        }
+    }
+
+    /// Bytes per row a system-source transfer must supply: a plain
+    /// (non-expanded) source pads each row to a 4-byte boundary; a
+    /// colour-expanded one packs one bit per pixel and pads to 8 or 32
+    /// bits depending on `blit_modeext::DWORD_GRANULARITY`.
+    fn system_source_pitch(&self, width: usize) -> usize {
+        let mode = self.gr[idx::GR_BLIT_MODE as usize];
+        if mode & blit_mode::COLOR_EXPAND == 0 {
+            width.next_multiple_of(4)
+        } else {
+            let pixels = width.div_ceil(self.blit_pixel_bytes());
+            let granularity =
+                if self.gr[idx::GR_BLIT_MODE_EXT as usize] & blit_modeext::DWORD_GRANULARITY != 0 {
+                    32
+                } else {
+                    8
+                };
+            pixels.next_multiple_of(granularity) / 8
+        }
+    }
+
+    fn blit_fg_component(&self, component: usize) -> u8 {
+        const FG: [u8; 4] = [idx::GR_FG0, idx::GR_FG1, idx::GR_FG2, idx::GR_FG3];
+        self.gr[FG[component.min(3)] as usize]
+    }
+
+    fn blit_bg_component(&self, component: usize) -> u8 {
+        const BG: [u8; 4] = [idx::GR_BG0, idx::GR_BG1, idx::GR_BG2, idx::GR_BG3];
+        self.gr[BG[component.min(3)] as usize]
+    }
+
+    /// One source byte for a linear (non-colour-expanded) blit: a
+    /// pattern tile read modulo its own 8x8-pixel-row size, a
+    /// system-fed byte at `(y, x)` in the host buffer, or a plain VRAM
+    /// read walking forwards or backwards from `src_line`. Every path
+    /// reads through `slice::get`: `src_start`/`src_line`/`x` are all
+    /// guest-controlled and a wild combination must produce a defined
+    /// "as if unmapped" byte (0), never panic.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_blit_source(
+        &self,
+        system: Option<&[u8]>,
+        system_pitch: usize,
+        pattern: bool,
+        backwards: bool,
+        src_line: usize,
+        src_start: usize,
+        y: usize,
+        x: usize,
+        pixel_bytes: usize,
+    ) -> u8 {
+        if pattern {
+            let row_bytes = 8 * pixel_bytes;
+            let pattern_base = src_start & !3;
+            return self
+                .vram
+                .get(pattern_base + (y & 7) * row_bytes + (x % row_bytes.max(1)))
+                .copied()
+                .unwrap_or(0);
+        }
+        if let Some(data) = system {
+            return data.get(y * system_pitch + x).copied().unwrap_or(0);
+        }
+        let src = if backwards {
+            src_line.checked_sub(x)
+        } else {
+            src_line.checked_add(x)
+        };
+        src.and_then(|at| self.vram.get(at).copied()).unwrap_or(0)
+    }
+
+    fn start_blit(&mut self) {
+        if self.gr[idx::GR_BLIT_MODE as usize] & blit_mode::SYSTEM_SOURCE != 0 {
+            let width = self.blit_width();
+            let height = self.blit_height();
+            let expected = self
+                .system_source_pitch(width)
+                .saturating_mul(height)
+                .max(1);
+            self.system_blit = Some(SystemBlit {
+                expected,
+                filled: 0,
+                buf: [0; SYSTEM_BLIT_CAPACITY],
+            });
+        } else {
+            self.execute_blit(None);
+        }
+    }
+
+    /// Feed one host byte to a pending system-source transfer, running
+    /// the blit once enough have arrived. Bytes past `SYSTEM_BLIT_CAPACITY`
+    /// still count towards `expected` (so the driver's write count still
+    /// completes the handshake) but are not stored — see
+    /// `SYSTEM_BLIT_CAPACITY`'s doc comment.
+    fn feed_system_blit(&mut self, byte: u8) {
+        let Some(blit) = self.system_blit.as_mut() else {
+            return;
+        };
+        if blit.filled < blit.buf.len() {
+            blit.buf[blit.filled] = byte;
+        }
+        blit.filled += 1;
+        if blit.filled < blit.expected {
+            return;
+        }
+        // Copying the (small, fixed-size, `Copy`) buffer out sidesteps
+        // holding a `&self` borrow of it across the `&mut self` that
+        // `execute_blit` needs to write VRAM.
+        let len = blit.expected.min(blit.buf.len());
+        let data = blit.buf;
+        self.system_blit = None;
+        self.execute_blit(Some(&data[..len]));
+    }
+
+    /// Run one BitBLT transfer against VRAM: a minterm-free ROP combine
+    /// of a source (plain VRAM, an 8x8 pattern tile, a solid fill, a
+    /// colour-expanded monochrome stream, or host-fed system memory)
+    /// into the destination rectangle, honouring backwards traversal and
+    /// source transparency. `system` is `Some` only for a completed
+    /// system-source transfer (see `feed_system_blit`); every other mode
+    /// reads its source straight out of `self.vram`.
+    ///
+    /// Ported from the Cirrus datasheet's BitBLT description rather than
+    /// any emulator source (module docs), with behaviour cross-checked
+    /// against the Copperline and Amiberry oracles — the address-counter
+    /// end-of-transfer behaviour in particular (see the comment at the
+    /// bottom) is exactly the kind of driver-visible detail a datasheet
+    /// alone under-specifies and Picasso96's own CL-GD542x driver
+    /// depends on.
+    fn execute_blit(&mut self, system: Option<&[u8]>) {
+        let width = self.blit_width().min(self.vram.len().max(1));
+        let height = self.blit_height();
+        let dst_pitch = self.blit_pitch(idx::GR_BLIT_DST_PITCH_LO);
+        let src_pitch = self.blit_pitch(idx::GR_BLIT_SRC_PITCH_LO);
+        let dst_start = self.blit_addr(idx::GR_BLIT_DST_ADDR_LO);
+        let src_start = self.blit_addr(idx::GR_BLIT_SRC_ADDR_LO);
+        let mode = self.gr[idx::GR_BLIT_MODE as usize];
+        let backwards = mode & blit_mode::BACKWARDS != 0;
+        let color_expand = mode & blit_mode::COLOR_EXPAND != 0;
+        let pattern = mode & blit_mode::PATTERN != 0;
+        let pixel_bytes = self.blit_pixel_bytes();
+        let system_pitch = self.system_source_pitch(width);
+        let modeext = self.gr[idx::GR_BLIT_MODE_EXT as usize];
+        let solid_fill = pattern
+            && color_expand
+            && mode & blit_mode::TRANSPARENT == 0
+            && modeext & blit_modeext::SOLID_FILL != 0;
+
+        // Video-source colour expansion consumes one continuous bit
+        // stream across the whole transfer: a row that ends mid-byte
+        // rounds up to the next source byte rather than realigning, so
+        // it needs its own running address/bit-count independent of the
+        // pixel loop below (pattern and system-source expansion instead
+        // address their source freshly every row).
+        let mut expand_addr = src_start;
+        let mut expand_count = 0usize;
+        let expand_span = 8 * pixel_bytes;
+
+        for y in 0..height {
+            let dst_line = if backwards {
+                dst_start.saturating_sub(y.saturating_mul(dst_pitch))
+            } else {
+                dst_start.saturating_add(y.saturating_mul(dst_pitch))
+            };
+            let src_line = if backwards {
+                src_start.saturating_sub(y.saturating_mul(src_pitch))
+            } else {
+                src_start.saturating_add(y.saturating_mul(src_pitch))
+            };
+            for x in 0..width {
+                let expand_bit = color_expand.then(|| {
+                    let pixel = x / pixel_bytes;
+                    if pattern {
+                        let byte = self
+                            .vram
+                            .get(src_start.saturating_add(y & 7))
+                            .copied()
+                            .unwrap_or(0);
+                        (byte >> (7 - (pixel & 7))) & 1
+                    } else if let Some(data) = system {
+                        let byte = data.get(y * system_pitch + pixel / 8).copied().unwrap_or(0);
+                        (byte >> (7 - (pixel & 7))) & 1
+                    } else {
+                        let byte = self.vram.get(expand_addr).copied().unwrap_or(0);
+                        (byte >> (7 - expand_count / pixel_bytes)) & 1
+                    }
+                });
+                if color_expand && !pattern && system.is_none() {
+                    expand_count += 1;
+                    if expand_count == expand_span {
+                        expand_count = 0;
+                        expand_addr = if backwards {
+                            expand_addr.wrapping_sub(1)
+                        } else {
+                            expand_addr.wrapping_add(1)
+                        };
+                    }
+                }
+                let dst = if backwards {
+                    dst_line.checked_sub(x)
+                } else {
+                    dst_line.checked_add(x)
+                };
+                let Some(dst) = dst.filter(|at| *at < self.vram.len()) else {
+                    continue;
+                };
+                let component = x % pixel_bytes;
+                let source = if solid_fill {
+                    self.blit_fg_component(component)
+                } else if let Some(bit) = expand_bit {
+                    if bit != 0 {
+                        self.blit_fg_component(component)
+                    } else {
+                        self.blit_bg_component(component)
+                    }
+                } else {
+                    self.linear_blit_source(
+                        system,
+                        system_pitch,
+                        pattern,
+                        backwards,
+                        src_line,
+                        src_start,
+                        y,
+                        x,
+                        pixel_bytes,
+                    )
+                };
+
+                let transparent = if mode & blit_mode::TRANSPARENT == 0 {
+                    false
+                } else if let Some(bit) = expand_bit {
+                    if modeext & blit_modeext::COLOR_EXPAND_INVERT != 0 {
+                        bit != 0
+                    } else {
+                        bit == 0
+                    }
+                } else if pattern {
+                    false
+                } else {
+                    let pixel_base = x - component;
+                    (0..pixel_bytes).all(|c| {
+                        let source = self.linear_blit_source(
+                            system,
+                            system_pitch,
+                            false,
+                            backwards,
+                            src_line,
+                            src_start,
+                            y,
+                            pixel_base + c,
+                            pixel_bytes,
+                        );
+                        let mask = self.gr[idx::GR_BLIT_TRANSPARENT_MASK as usize + c];
+                        (source & !mask)
+                            == (self.gr[idx::GR_BLIT_TRANSPARENT_COMPARE as usize + c] & !mask)
+                    })
+                };
+                if transparent {
+                    continue;
+                }
+                let dest = self.vram[dst];
+                self.vram[dst] = apply_rop(self.gr[idx::GR_BLIT_ROP as usize], source, dest);
+            }
+            if color_expand && !pattern && system.is_none() && expand_count != 0 {
+                expand_count = 0;
+                expand_addr = if backwards {
+                    expand_addr.wrapping_sub(1)
+                } else {
+                    expand_addr.wrapping_add(1)
+                };
+            }
+        }
+
+        // The address registers are counters, not latches: a completed
+        // transfer leaves them where it stopped rather than where it
+        // started. Picasso96's Cirrus driver depends on this to fill a
+        // run wider than one tile — it blits one 8-pixel tile, then
+        // re-triggers with only width/height reprogrammed to replicate
+        // it, expecting the destination counter to have moved on past
+        // the tile it just wrote. Reloading the registers here would
+        // have the replication overwrite the pixels it just filled
+        // rather than continue past them.
+        //
+        // The destination is always walked byte for byte, so its
+        // counter ends a whole rectangle further on. The source is not:
+        // only a plain (non-pattern, non-system, non-colour-expanded)
+        // copy consumes it in lock-step with the destination. Video
+        // colour expansion instead reads one bit per pixel from a
+        // continuous stream — `expand_addr` above already tracks where
+        // that stream ended. A pattern is re-read from its fixed base
+        // every row, and a system-source transfer's data comes from the
+        // host, so neither advances the VRAM source counter at all.
+        let advance = |from: usize, span: usize| {
+            if backwards {
+                from.wrapping_sub(span)
+            } else {
+                from.wrapping_add(span)
+            }
+        };
+        let dst_end = advance(dst_start, height.saturating_sub(1) * dst_pitch + width);
+        let src_end = if pattern || system.is_some() {
+            src_start
+        } else if color_expand {
+            expand_addr
+        } else {
+            advance(src_start, height.saturating_sub(1) * src_pitch + width)
+        };
+        self.set_blit_addr(idx::GR_BLIT_DST_ADDR_LO, dst_end);
+        self.set_blit_addr(idx::GR_BLIT_SRC_ADDR_LO, src_end);
     }
 
     // ---- CRTC ------------------------------------------------------------
@@ -584,6 +1117,41 @@ impl<'a> Cirrus542x<'a> {
             self.dac_read_index = self.dac_read_index.wrapping_add(1);
         }
         value
+    }
+}
+
+/// The CL-GD542x BitBLT raster-operation encoding: a sparse set of byte
+/// codes selecting one of the 16 two-operand Boolean functions of
+/// `source` and `dest` (`source` doubling as the pattern/fill byte for
+/// pattern operations). Values are the Cirrus Logic Technical Reference
+/// Manual's BitBLT ROP table, not derived from either GPL oracle
+/// (module docs) — cross-checked behaviourally against Copperline,
+/// which flags `0x90` (NOR, `!source & !dest`) and `0xDA` (NAND,
+/// `!source | !dest`) as easy to transpose; the test below verifies
+/// both independently of this table rather than trusting that warning.
+fn apply_rop(rop: u8, source: u8, dest: u8) -> u8 {
+    match rop {
+        0x00 => 0,
+        0x05 => source & dest,
+        0x06 => dest,
+        0x09 => source & !dest,
+        0x0B => !dest,
+        0x0D => source,
+        0x0E => 0xFF,
+        0x50 => !source & dest,
+        0x59 => source ^ dest,
+        0x6D => source | dest,
+        0x90 => !source & !dest,
+        0x95 => !(source ^ dest),
+        0xAD => source | !dest,
+        0xD0 => !source,
+        0xD6 => !source | dest,
+        0xDA => !source | !dest,
+        // Every code P96's driver actually programs is above; an
+        // unrecognised one is guest-controlled input (a wild GR32
+        // write), so fall back to a plain copy rather than guessing at
+        // undocumented silicon behaviour.
+        _ => source,
     }
 }
 
@@ -983,5 +1551,305 @@ mod tests {
         }
         c.reg_write(port::PEL_MASK, 0xFF); // hidden DAC nibble 0xF w/ SR7 giving Bpp8
         assert_eq!(c.decoded_mode(), None, "runs off a 64-byte VRAM");
+    }
+
+    // ---- BitBLT engine ---------------------------------------------------
+
+    fn gr_write(c: &mut Cirrus542x, index: u8, value: u8) {
+        c.reg_write(port::GR_INDEX, index);
+        c.reg_write(port::GR_DATA, value);
+    }
+
+    fn gr_read(c: &mut Cirrus542x, index: u8) -> u8 {
+        c.reg_write(port::GR_INDEX, index);
+        c.reg_read(port::GR_DATA)
+    }
+
+    /// Program every blit register except the raster op (left at its
+    /// default of 0, which is why every test that cares about the
+    /// result explicitly sets `GR_BLIT_ROP` itself) and does not trigger
+    /// the transfer — callers set anything else they need (ROP,
+    /// fg/bg colours, transparency compare) before calling
+    /// [`trigger_blit`].
+    #[allow(clippy::too_many_arguments)]
+    fn setup_blit(
+        c: &mut Cirrus542x,
+        width: usize,
+        height: usize,
+        dst_pitch: usize,
+        src_pitch: usize,
+        dst: usize,
+        src: usize,
+        mode: u8,
+    ) {
+        unlock(c);
+        let w = width - 1;
+        let h = height - 1;
+        for (index, value) in [
+            (idx::GR_BLIT_WIDTH_LO, w as u8),
+            (idx::GR_BLIT_WIDTH_LO + 1, (w >> 8) as u8),
+            (idx::GR_BLIT_HEIGHT_LO, h as u8),
+            (idx::GR_BLIT_HEIGHT_LO + 1, (h >> 8) as u8),
+            (idx::GR_BLIT_DST_PITCH_LO, dst_pitch as u8),
+            (idx::GR_BLIT_DST_PITCH_LO + 1, (dst_pitch >> 8) as u8),
+            (idx::GR_BLIT_SRC_PITCH_LO, src_pitch as u8),
+            (idx::GR_BLIT_SRC_PITCH_LO + 1, (src_pitch >> 8) as u8),
+            (idx::GR_BLIT_DST_ADDR_LO, dst as u8),
+            (idx::GR_BLIT_DST_ADDR_LO + 1, (dst >> 8) as u8),
+            (idx::GR_BLIT_DST_ADDR_LO + 2, (dst >> 16) as u8),
+            (idx::GR_BLIT_SRC_ADDR_LO, src as u8),
+            (idx::GR_BLIT_SRC_ADDR_LO + 1, (src >> 8) as u8),
+            (idx::GR_BLIT_SRC_ADDR_LO + 2, (src >> 16) as u8),
+            (idx::GR_BLIT_MODE, mode),
+        ] {
+            gr_write(c, index, value);
+        }
+    }
+
+    fn trigger_blit(c: &mut Cirrus542x) {
+        gr_write(c, idx::GR_BLIT_START_STATUS, blit_status::START);
+    }
+
+    fn read_range(c: &Cirrus542x, at: usize, len: usize) -> std::vec::Vec<u8> {
+        (at..at + len).map(|i| c.vram_read(i)).collect()
+    }
+
+    #[test]
+    fn solid_fill_rectangle_including_partial_width() {
+        // A 4-wide, 3-tall rectangle inside an 8-byte-pitch buffer: the
+        // 4 bytes past each row's width must stay untouched, proving the
+        // fill respects width independently of pitch.
+        let mut vram = [0u8; 32];
+        let mut c = chip(&mut vram);
+        unlock(&mut c); // GR33 (MODE_EXT) is an extended register
+        gr_write(&mut c, idx::GR_FG0, 0xAB);
+        gr_write(&mut c, idx::GR_BLIT_MODE_EXT, blit_modeext::SOLID_FILL);
+        setup_blit(
+            &mut c,
+            4,
+            3,
+            8,
+            0,
+            0,
+            0,
+            blit_mode::PATTERN | blit_mode::COLOR_EXPAND,
+        );
+        gr_write(&mut c, idx::GR_BLIT_ROP, 0x0D); // D = S: the filled colour, unmixed
+        trigger_blit(&mut c);
+
+        for row in 0..3 {
+            let base = row * 8;
+            assert_eq!(read_range(&c, base, 4), [0xAB; 4], "row {row} filled");
+            assert_eq!(
+                read_range(&c, base + 4, 4),
+                [0; 4],
+                "row {row} past the fill width is untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn colour_expansion_from_monochrome_source_both_polarities() {
+        // One source byte, 8 pixels, video (VRAM) colour expansion: bit
+        // 7 (MSB) is pixel 0. Run it twice with complementary source
+        // bytes to confirm "1 -> fg, 0 -> bg" isn't a coincidence of one
+        // particular bit pattern.
+        let mut vram = [0u8; 32];
+        let mut c = chip(&mut vram);
+        gr_write(&mut c, idx::GR_FG0, 0xEE);
+        gr_write(&mut c, idx::GR_BG0, 0x11);
+        c.vram_write(16, 0b1100_0001); // pixels: 1,1,0,0,0,0,0,1
+        setup_blit(&mut c, 8, 1, 8, 0, 0, 16, blit_mode::COLOR_EXPAND);
+        gr_write(&mut c, idx::GR_BLIT_ROP, 0x0D);
+        trigger_blit(&mut c);
+        assert_eq!(
+            read_range(&c, 0, 8),
+            [0xEE, 0xEE, 0x11, 0x11, 0x11, 0x11, 0x11, 0xEE]
+        );
+
+        c.vram_write(16, 0b0011_1110); // the exact bitwise complement
+        setup_blit(&mut c, 8, 1, 8, 0, 0, 16, blit_mode::COLOR_EXPAND);
+        gr_write(&mut c, idx::GR_BLIT_ROP, 0x0D);
+        trigger_blit(&mut c);
+        assert_eq!(
+            read_range(&c, 0, 8),
+            [0x11, 0x11, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0x11],
+            "the complementary source flips every pixel's colour"
+        );
+    }
+
+    #[test]
+    fn screen_to_screen_move_forwards_backwards_and_overlapping() {
+        let mut vram = [0u8; 32];
+        let mut c = chip(&mut vram);
+        for (i, b) in [1u8, 2, 3, 4].into_iter().enumerate() {
+            c.vram_write(i, b);
+        }
+        setup_blit(&mut c, 4, 1, 8, 8, 16, 0, 0);
+        gr_write(&mut c, idx::GR_BLIT_ROP, 0x0D);
+        trigger_blit(&mut c);
+        assert_eq!(read_range(&c, 16, 4), [1, 2, 3, 4], "plain forward move");
+
+        // Overlapping move one byte further into memory: safe only
+        // descending (each byte is read before its own address is ever
+        // written), the same overlap-safe scroll idiom `blitter.rs`
+        // covers for the Amiga blitter.
+        for (i, b) in [10u8, 11, 12, 13, 14, 15, 16, 17].into_iter().enumerate() {
+            c.vram_write(i, b);
+        }
+        setup_blit(&mut c, 6, 1, 8, 8, 7, 5, blit_mode::BACKWARDS);
+        gr_write(&mut c, idx::GR_BLIT_ROP, 0x0D);
+        trigger_blit(&mut c);
+        assert_eq!(read_range(&c, 2, 6), [10, 11, 12, 13, 14, 15]);
+    }
+
+    #[test]
+    fn transparency_skips_matching_source_pixels() {
+        let mut vram = [0u8; 32];
+        let mut c = chip(&mut vram);
+        c.vram_write(0, 0x00); // matches the (default zero) compare colour
+        c.vram_write(1, 0x7A); // does not
+        c.vram_write(16, 0x55);
+        c.vram_write(17, 0x55);
+        // Compare colour and mask both left at their power-on zero:
+        // "transparent" means "source byte is exactly zero".
+        setup_blit(&mut c, 2, 1, 2, 2, 16, 0, blit_mode::TRANSPARENT);
+        gr_write(&mut c, idx::GR_BLIT_ROP, 0x0D);
+        trigger_blit(&mut c);
+        assert_eq!(
+            read_range(&c, 16, 2),
+            [0x55, 0x7A],
+            "the zero source byte left its destination alone"
+        );
+    }
+
+    #[test]
+    fn rops_match_independently_hand_derived_expectations() {
+        // source = 0xF0 (1111_0000), dest = 0xCC (1100_1100) — chosen so
+        // every one of the four (S,D) bit combinations appears somewhere
+        // in the byte, and every expected result below is arithmetic
+        // worked out by hand from that fact (AND/OR/XOR/NOT), never by
+        // calling `apply_rop` itself: a self-consistent check can't catch
+        // a wrong or transposed table (this project has shipped that bug
+        // twice — see `apply_rop`'s doc comment).
+        let cases: [(u8, u8); 16] = [
+            (0x00, 0x00),        // always 0
+            (0x05, 0xF0 & 0xCC), // S AND D  = 0xC0
+            (0x06, 0xCC),        // D
+            (0x09, 0xF0 & 0x33), // S AND NOT D = 0x30
+            (0x0B, 0x33),        // NOT D
+            (0x0D, 0xF0),        // S
+            (0x0E, 0xFF),        // always 1
+            (0x50, 0x0F & 0xCC), // NOT S AND D = 0x0C
+            (0x59, 0xF0 ^ 0xCC), // S XOR D = 0x3C
+            (0x6D, 0xF0 | 0xCC), // S OR D = 0xFC
+            (0x90, 0x0F & 0x33), // NOT S AND NOT D = 0x03
+            (0x95, 0xC3),        // NOT (S XOR D) = NOT 0x3C = 0xC3
+            (0xAD, 0xF0 | 0x33), // S OR NOT D = 0xF3
+            (0xD0, 0x0F),        // NOT S
+            (0xD6, 0x0F | 0xCC), // NOT S OR D = 0xCF
+            (0xDA, 0x0F | 0x33), // NOT S OR NOT D = 0x3F
+        ];
+        for (rop, expected) in cases {
+            assert_eq!(
+                apply_rop(rop, 0xF0, 0xCC),
+                expected,
+                "rop {rop:#04x}: source=0xF0 dest=0xCC"
+            );
+        }
+        // The pair the datasheet table is easiest to transpose: NOR is
+        // 0x90, NAND is 0xDA, not the other way around.
+        assert_eq!(apply_rop(0x90, 0xFF, 0x00), 0x00, "NOR(1,0) = 0");
+        assert_eq!(apply_rop(0x90, 0x00, 0x00), 0xFF, "NOR(0,0) = 1");
+        assert_eq!(apply_rop(0xDA, 0xFF, 0xFF), 0x00, "NAND(1,1) = 0");
+        assert_eq!(apply_rop(0xDA, 0xFF, 0x00), 0xFF, "NAND(1,0) = 1");
+    }
+
+    #[test]
+    fn busy_bit_clears_so_a_polling_driver_makes_progress() {
+        // An ordinary (VRAM-source) blit runs to completion synchronously
+        // inside the register write that starts it — the same house
+        // style as `crate::blitter` (module docs) — so the busy bit
+        // never has a chance to observably read set.
+        let mut vram = [0u8; 32];
+        let mut c = chip(&mut vram);
+        setup_blit(&mut c, 1, 1, 1, 1, 0, 0, 0);
+        trigger_blit(&mut c);
+        assert_eq!(
+            gr_read(&mut c, idx::GR_BLIT_START_STATUS) & blit_status::BUSY_MASK,
+            0,
+            "immediate blit: never observably busy"
+        );
+
+        // A system-source blit genuinely waits: busy while data is still
+        // outstanding, and clearing (letting a polling driver proceed)
+        // only once the transfer's full byte count has arrived.
+        setup_blit(&mut c, 4, 1, 0, 0, 8, 0, blit_mode::SYSTEM_SOURCE);
+        gr_write(&mut c, idx::GR_BLIT_ROP, 0x0D);
+        trigger_blit(&mut c);
+        assert_ne!(
+            gr_read(&mut c, idx::GR_BLIT_START_STATUS) & blit_status::BUSY_MASK,
+            0,
+            "armed and waiting for host data"
+        );
+        for byte in [1u8, 2, 3] {
+            c.vram_write(0, byte); // address is irrelevant while armed
+            assert_ne!(
+                gr_read(&mut c, idx::GR_BLIT_START_STATUS) & blit_status::BUSY_MASK,
+                0,
+                "still short of the 4 bytes this transfer needs"
+            );
+        }
+        c.vram_write(0, 4);
+        assert_eq!(
+            gr_read(&mut c, idx::GR_BLIT_START_STATUS) & blit_status::BUSY_MASK,
+            0,
+            "the 4th byte completes the transfer and runs it"
+        );
+        assert_eq!(read_range(&c, 8, 4), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn bounds_safety_wild_registers_never_panic() {
+        // The guest picks every one of these; garbage must clip or wrap,
+        // never panic or touch memory outside `vram`.
+        let mut vram = [0u8; 16];
+        let mut c = chip(&mut vram);
+        setup_blit(
+            &mut c,
+            2048, // maximum width the register field can hold
+            1024, // maximum height
+            0x1FFF,
+            0x1FFF,
+            0x1F_FFFF, // maximum 21-bit destination address
+            0x1F_FFFF,
+            blit_mode::COLOR_EXPAND | blit_mode::TRANSPARENT | blit_mode::BACKWARDS,
+        );
+        gr_write(&mut c, idx::GR_BLIT_ROP, 0x59);
+        trigger_blit(&mut c); // must not panic
+
+        // A system-source transfer whose declared size dwarfs
+        // `SYSTEM_BLIT_CAPACITY` must still accept bytes safely — never
+        // growing without bound (no allocator) or panicking on an index
+        // past the fixed buffer — however far short of completion it
+        // still is.
+        setup_blit(
+            &mut c,
+            2048,
+            1024,
+            0,
+            0,
+            0,
+            0,
+            blit_mode::SYSTEM_SOURCE | blit_mode::COLOR_EXPAND,
+        );
+        trigger_blit(&mut c);
+        for _ in 0..(SYSTEM_BLIT_CAPACITY + 1024) {
+            c.vram_write(0, 0xFF);
+        }
+        assert!(
+            gr_read(&mut c, idx::GR_BLIT_START_STATUS) & blit_status::BUSY_MASK != 0,
+            "still short of this (oversized) transfer's declared byte count"
+        );
     }
 }
