@@ -13,10 +13,16 @@
 //! and wire-format contract a driver author needs; this file's docs
 //! explain *why* each choice was made, not just what it is.
 //!
-//! This increment is **host side only**: the register interface and the
-//! transfer engine below. No m68k driver and no boot ROM exist yet —
-//! `docs/hostblk-protocol.md` is written for the driver author who comes
-//! next, not for a driver that exists today.
+//! This module is the register interface and transfer engine; a real
+//! m68k driver for the wire protocol below and an RDB mounter still don't
+//! exist. This card does carry a boot ROM now -- [`DIAG_ROM`], a DiagArea
+//! (`libraries/configregs.h`) served from this board's own AUTOCONFIG
+//! window at [`ROM_BASE`] -- but its job in this increment is narrower
+//! than a driver: prove Kickstart will run code straight from this
+//! board's DiagArea and that the code can reach this board's own
+//! registers. See `m68k/hostblk-rom/hostblk-diagrom.s` for that ROM's
+//! source and full design notes, and `docs/hostblk-protocol.md` section
+//! 12 for exactly what still doesn't exist (the driver, the mounter).
 //!
 //! # Descriptor pointer, not a raw `IORequest` pointer
 //!
@@ -253,7 +259,7 @@
 //! selected unit's change counter, which [`reg::UNIT_CHANGE_COUNT`]
 //! exposes for a driver's `TD_CHANGENUM`-style polling.
 
-use crate::autoconfig::{BoardSpec, ERT_ZORROIII};
+use crate::autoconfig::{BoardSpec, ERTF_DIAGVALID, ERT_ZORROIII};
 use crate::gayle::{BlockDevice, SECTOR_BYTES};
 
 /// **Placeholder, but a *reserved* one.** NDK 3.2
@@ -300,6 +306,55 @@ const ERFF_ZORRO_III: u8 = 1 << 4;
 /// table rather than Zorro II's 64 KB-8 MB one (`graffity.rs` module
 /// docs).
 const ERFF_EXTENDED: u8 = 1 << 5;
+
+/// This board's DiagArea boot ROM, assembled from `m68k/hostblk-rom/
+/// hostblk-diagrom.s` and vendored at `assets/hostblk-rom/
+/// hostblk-diagrom.bin` (`assets/hostblk-rom/PROVENANCE.md`) the same way
+/// `assets/aros/` vendors AROS -- `machine-core` has no allocator and no
+/// filesystem, and must build with no m68k toolchain present
+/// (`scripts/build-hostblk-rom.sh` is a separate, manually-run step, not
+/// part of `cargo build`).
+///
+/// **Scope of this increment:** this ROM proves Kickstart will run code
+/// from this board's own DiagArea and that the code can reach this
+/// board's own registers (`DiagEntry` in the source file reads
+/// [`reg::VERSION`]) -- it does not implement the `hostblk` wire protocol
+/// or an RDB mounter. See the source file's header and
+/// `docs/hostblk-protocol.md` section 12 for what is and isn't built yet.
+///
+/// `pub` (not just crate-internal) so a host-side introspection tool can
+/// search guest memory for a byte-identical copy of it without hardcoding
+/// a duplicate of these bytes itself (`machine-hosted`'s
+/// `find_diag_rom_copy_by_signature`) -- one source of truth for what the
+/// ROM's own bytes are.
+pub const DIAG_ROM: &[u8] = include_bytes!("../../../assets/hostblk-rom/hostblk-diagrom.bin");
+
+/// Where [`DIAG_ROM`] is mapped within this board's own AUTOCONFIG window,
+/// once configured -- the value [`BoardSpec::init_diag_vec`] advertises
+/// (`libraries/configregs.h`: "This offset is added to the base address
+/// of the configured board; the resulting address points to the start of
+/// this board's DiagArea", NDK 3.2). Chosen well clear of the register
+/// file above (which ends at [`reg::VERSION`], `0x3C`), with room to
+/// spare before it for the register file to grow. Kept in sync with
+/// `scripts/build-hostblk-rom.sh`'s own sanity check by literal value
+/// (that script greps for this exact line) rather than a shared constant,
+/// since the two live in different languages with no build-time link
+/// between them.
+pub const ROM_BASE: u32 = 0x1000;
+
+/// Byte offset, from the start of the DiagArea's RAM copy (the address
+/// `expansion.library` hands `DiagEntry` in `A2`, and the same address it
+/// stashes in the board's `ConfigDev.cd_Rom.er_Reserved0c..0f`, big-endian
+/// -- RKRM 3rd ed. "Expansion Library", "Events At DIAG Time"), of the
+/// scratch cell `DiagEntry` writes [`reg::VERSION`]'s value into
+/// (`hostblk-diagrom.s`'s `DiagMarker`). Fixed by `struct DiagArea`'s own
+/// documented layout (`libraries/configregs.h`): `da_Config`(1) +
+/// `da_Flags`(1) + `da_Size`(2) + `da_DiagPoint`(2) + `da_BootPoint`(2) +
+/// `da_Name`(2) + `da_Reserved01`(2) + `da_Reserved02`(2) = 14 bytes,
+/// which is exactly where `DiagMarker` sits in the source file --
+/// cross-checked against the assembled [`DIAG_ROM`] by this file's own
+/// `diag_rom_header_matches_the_documented_diagarea_layout` test.
+pub const DIAG_MARKER_OFFSET: u32 = 14;
 
 /// Units this card can address. Matches `mirage::UNIT_COUNT`; there is
 /// no protocol reason the two must agree, they simply both picked "one
@@ -578,12 +633,12 @@ impl<'a> Hostblk<'a> {
     /// Zorro III board, per the brief's item 1 and ADR 0003.
     pub fn board_spec() -> BoardSpec {
         BoardSpec {
-            board_type: ERT_ZORROIII, // extended-table code 0 == 16 MB
+            board_type: ERT_ZORROIII | ERTF_DIAGVALID, // extended-table code 0 == 16 MB, plus a DiagArea
             product: PRODUCT,
             flags: ERFF_ZORRO_III | ERFF_EXTENDED,
             manufacturer: MANUFACTURER,
             serial: 0,
-            init_diag_vec: 0,
+            init_diag_vec: ROM_BASE as u16, // fits: ROM_BASE (0x1000) << u16::MAX
             size_bytes: WINDOW_BYTES,
         }
     }
@@ -832,6 +887,9 @@ impl<'a> Hostblk<'a> {
                 byte_of(SUBMIT_QUEUE_CAPACITY as u32, o - reg::SUBMIT_CAPACITY)
             }
             o if in_slot(o, reg::VERSION) => byte_of(PROTOCOL_VERSION, o - reg::VERSION),
+            o if (ROM_BASE..ROM_BASE + DIAG_ROM.len() as u32).contains(&o) => {
+                DIAG_ROM[(o - ROM_BASE) as usize]
+            }
             _ => 0,
         }
     }
@@ -1540,14 +1598,89 @@ mod tests {
         let spec = Hostblk::board_spec();
         assert_eq!(spec.manufacturer, MANUFACTURER);
         assert_eq!(spec.size_bytes, WINDOW_BYTES);
-        assert_eq!(spec.board_type, ERT_ZORROIII);
+        assert_eq!(spec.board_type, ERT_ZORROIII | ERTF_DIAGVALID);
         assert_eq!(spec.flags, ERFF_ZORRO_III | ERFF_EXTENDED);
+        assert_eq!(
+            spec.init_diag_vec, ROM_BASE as u16,
+            "expansion.library adds er_InitDiagVec to the configured base \
+             address to find the DiagArea -- must point at ROM_BASE"
+        );
     }
 
     #[test]
     fn unimplemented_offsets_read_zero_not_open_bus() {
         let hb = Hostblk::new();
-        assert_eq!(hb.read(0x38), 0);
-        assert_eq!(hb.read(0x1000), 0);
+        assert_eq!(hb.read(0x38 + 4), 0); // one past VERSION's slot, before the ROM
+        assert_eq!(
+            hb.read(ROM_BASE + DIAG_ROM.len() as u32),
+            0,
+            "one past the ROM"
+        );
+        assert_eq!(hb.read(0x1_0000), 0, "deep in the unimplemented window");
+    }
+
+    // ---- the DiagArea boot ROM (brief items 1-4) --------------------------
+
+    #[test]
+    fn diag_rom_is_served_byte_for_byte_at_rom_base() {
+        let hb = Hostblk::new();
+        for (i, &expected) in DIAG_ROM.iter().enumerate() {
+            assert_eq!(
+                hb.read(ROM_BASE + i as u32),
+                expected,
+                "byte {i} of the embedded DiagArea ROM"
+            );
+        }
+    }
+
+    /// `libraries/configregs.h`'s `struct DiagArea` layout, read directly
+    /// out of [`DIAG_ROM`] the same way `expansion.library` would after
+    /// copying it into guest RAM -- an independent cross-check that the
+    /// assembled ROM's header fields agree with the source file's da_Config/
+    /// da_Size/da_DiagPoint/da_BootPoint layout, without re-deriving them
+    /// from the source file itself (this test would fail exactly as loudly
+    /// if the .s file's field order ever drifted from configregs.h).
+    #[test]
+    fn diag_rom_header_matches_the_documented_diagarea_layout() {
+        let rom = DIAG_ROM;
+        let da_config = rom[0];
+        let da_flags = rom[1];
+        let da_size = u16::from_be_bytes([rom[2], rom[3]]);
+        let da_diag_point = u16::from_be_bytes([rom[4], rom[5]]);
+        let da_boot_point = u16::from_be_bytes([rom[6], rom[7]]);
+
+        assert_eq!(da_config & 0xC0, 0x80, "DAC_WORDWIDE (configregs.h)");
+        assert_eq!(da_flags, 0, "da_Flags: configregs.h defines none");
+        assert_eq!(
+            da_size as usize,
+            rom.len(),
+            "da_Size covers the whole copy area"
+        );
+        assert_ne!(
+            da_diag_point, 0,
+            "a zero da_DiagPoint means 'no diagnostic code'"
+        );
+        assert_ne!(
+            da_boot_point, 0,
+            "RKRM 'Events At DIAG Time': a zero da_BootPoint means \
+             expansion.library never copies this area into RAM at all"
+        );
+        // Every field content byte in range, so a driver never reads past
+        // what was actually assembled.
+        assert!((da_diag_point as usize) < rom.len());
+        assert!((da_boot_point as usize) < rom.len());
+
+        // DIAG_MARKER_OFFSET must land exactly where DiagEntry's own
+        // scratch cell sits: right after the 14-byte DiagArea header, and
+        // immediately before DiagEntry's own code (da_DiagPoint).
+        assert_eq!(
+            DIAG_MARKER_OFFSET, 14,
+            "struct DiagArea's documented 14-byte size"
+        );
+        assert_eq!(
+            da_diag_point as u32,
+            DIAG_MARKER_OFFSET + 4,
+            "DiagEntry's code must start right after the 4-byte marker cell"
+        );
     }
 }

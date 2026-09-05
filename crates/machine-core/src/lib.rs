@@ -486,6 +486,25 @@ impl<'a> MachineBus<'a> {
         self.hostblk.as_mut()
     }
 
+    /// Where AUTOCONFIG placed `hostblk`'s single Zorro III board, once
+    /// `expansion.library` has configured it -- `None` before
+    /// [`Self::with_hostblk`] was called, or before the guest has written
+    /// the base-address sequence that configures it (`autoconfig`'s
+    /// module docs).
+    ///
+    /// This is what a host-side introspection tool (`machine-hosted`'s
+    /// `--inspect`) cross-checks against guest memory to confirm
+    /// Kickstart actually accepted this board: our own bus knowing where
+    /// it *offered* to place a board proves nothing about whether the
+    /// guest's own `ConfigDev` for it agrees -- the same "silent
+    /// rejection" trap `device-ledger.md`'s "rule for addresses" section
+    /// names for a `MEMLIST` board using the wrong manufacturer ID.
+    pub fn hostblk_board_base(&self) -> Option<u32> {
+        self.autoconfig
+            .placement(self.hostblk_board?)
+            .map(|p| p.base)
+    }
+
     /// Advance time by `cpu_clocks`, ticking the frame clock and both
     /// CIAs. Call this from the CPU's `sync` hook so device time and
     /// guest time stay in step.

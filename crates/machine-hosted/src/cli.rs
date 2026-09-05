@@ -134,9 +134,13 @@ pub struct Args {
     /// Same raw-sector `.hdf` shape as `--hd`; `machine-hosted`'s
     /// `FileBlockDevice` works unchanged behind either card (that's the
     /// point of `hostblk` reusing `machine_core::gayle::BlockDevice`).
-    /// Omit for no `hostblk` card at all -- the increment's boot ROM and
-    /// driver do not exist yet, so this flag exists to exercise the
-    /// register interface and transfer engine, not to boot from it.
+    /// Omit for no `hostblk` card at all. This board now carries a
+    /// DiagArea boot ROM (`m68k/hostblk-rom/`) that proves Kickstart runs
+    /// code from it and that the code can reach the board's own
+    /// registers -- see `--inspect`'s `hostblk state:` section -- but no
+    /// wire-protocol driver or RDB mounter exist yet, so this flag alone
+    /// still cannot boot a machine unaided (`docs/hostblk-protocol.md`
+    /// section 12).
     #[arg(long)]
     pub hostblk: Option<PathBuf>,
 

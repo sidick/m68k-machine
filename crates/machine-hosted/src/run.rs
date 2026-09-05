@@ -395,6 +395,12 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         if args.graphics {
             console.diag(&crate::introspect::format_graphics_state(&bus.0));
         }
+        if args.hostblk.is_some() {
+            console.diag(&crate::introspect::format_hostblk_state(
+                &mut bus.0,
+                exec_report.exec_base,
+            ));
+        }
     }
 
     if let Some(trace) = bus.1.take() {

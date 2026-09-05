@@ -58,6 +58,21 @@ mod execbase {
     /// ResourceList/DeviceList/IntrList/LibList/PortList, each a 14-byte
     /// `struct List`, sit between here and TaskReady.
     pub const MEM_LIST: u32 = 322;
+    /// `ExecBase->LibList`. `execbase.h`'s "System Lists (private!)"
+    /// block runs `MemList, ResourceList, DeviceList, IntrList, LibList,
+    /// PortList, TaskReady, TaskWait` -- six 14-byte `struct List`
+    /// headers before `TaskReady` (already known correct at `406`, this
+    /// module's original cross-check): `322 + 6*14 = 406`. `LibList` is
+    /// the fifth of those six, four list-widths after `MemList`:
+    /// `322 + 4*14 = 378`.
+    ///
+    /// Not walked for its own sake -- used only to find `expansion.
+    /// library`'s own `Library` node (a library's base pointer *is* its
+    /// node's address), the only way to reach `ExpansionBase` without
+    /// hardcoding its address (`device-ledger.md`, "the rule for
+    /// addresses" -- the same principle applied one level up, to a
+    /// library base rather than a board's).
+    pub const LIB_LIST: u32 = 378;
     pub const TASK_READY: u32 = 406;
     pub const TASK_WAIT: u32 = 420;
     // SoftInts[5] of `struct SoftIntList` (14 + 2 = 16 bytes each) = 80
@@ -80,6 +95,57 @@ mod node {
 mod list {
     pub const LH_HEAD: u32 = 0;
 }
+
+/// Byte offset of `ExpansionBase->MountList` (`libraries/expansionbase.h`).
+/// Unlike every other offset in this module, the fields *before* it are
+/// not documented by name -- the header spells them `eb_Private01`
+/// through `eb_Private05` with no stated semantics, only sizes -- so this
+/// is not the same derivation `execbase.h`'s "private" lists get
+/// elsewhere in this file (there, the header still gives every field's
+/// real name; here it deliberately withholds them). What *is* documented,
+/// and all this offset needs, is each private field's **size**: `struct
+/// Library LibNode`(34, `execbase.h`) + `UBYTE Flags`(1) + `UBYTE
+/// eb_Private01`(1) + `ULONG eb_Private02`(4) + `ULONG eb_Private03`(4) +
+/// `struct CurrentBinding eb_Private04`(16: four `APTR`/`STRPTR` fields --
+/// `cb_ConfigDev`, `cb_FileName`, `cb_ProductString`, `cb_ToolTypes`,
+/// `libraries/configvars.h`) + `struct List eb_Private05`(14) = 74. Skip
+/// past unnamed bytes by their documented width, land on a named,
+/// documented field (`MountList`) -- the same trick this module already
+/// uses for `execbase.h`'s nominally-"private" system lists, but here
+/// applied to fields whose *meaning* stays genuinely unknown, not merely
+/// discouraged from use.
+const EXPANSIONBASE_MOUNT_LIST: u32 = 74;
+
+/// Byte offsets into `struct ExpansionRom` (`libraries/configregs.h`), 16
+/// bytes, embedded as `struct ConfigDev`'s `cd_Rom` field.
+mod expansionrom {
+    pub const ER_TYPE: u32 = 0;
+    pub const ER_PRODUCT: u32 = 1;
+    pub const ER_MANUFACTURER: u32 = 4;
+    pub const ER_INIT_DIAG_VEC: u32 = 10;
+    /// `expansion.library` stashes the RAM address of the copied
+    /// `DiagArea` here (RKRM 3rd ed. "Expansion Library", "Events At DIAG
+    /// Time": "Expansion stores the ULONG address of that 'image' in the
+    /// UBYTES er_ReservedOc, Od, 0e and Of ... stored as a longword"), or
+    /// zero if `DiagEntry` returned failure (or was never called).
+    pub const ER_RESERVED_0C: u32 = 12;
+    pub const SIZE: u32 = 16;
+}
+
+/// Byte offsets into `struct ConfigDev` (`libraries/configvars.h`), past
+/// the embedded `struct Node cd_Node` (14 bytes, `node::SIZE`).
+mod configdev {
+    use super::{expansionrom, node};
+    /// `cd_Flags`(1) + `cd_Pad`(1) precede `cd_Rom`.
+    pub const CD_ROM: u32 = node::SIZE + 2;
+    pub const CD_BOARD_ADDR: u32 = CD_ROM + expansionrom::SIZE;
+    pub const CD_BOARD_SIZE: u32 = CD_BOARD_ADDR + 4;
+}
+
+/// Byte offset of `BootNode->bn_DeviceNode` (`libraries/expansionbase.h`),
+/// past the embedded `struct Node bn_Node` (14 bytes) and `UWORD
+/// bn_Flags` (2).
+const BOOTNODE_BN_DEVICE_NODE: u32 = node::SIZE + 2;
 
 /// Byte offsets into `struct MemHeader` (`exec/memory.h`), past the
 /// embedded `struct Node mh_Node` (14 bytes, `node::SIZE`).
@@ -753,6 +819,249 @@ pub fn format_graphics_state(bus: &MachineBus) -> String {
              decoded_mode is None (driver has not programmed a presentable mode yet)"
         ),
     }
+}
+
+/// One `hostblk` `ConfigDev` located in guest memory -- see
+/// [`find_hostblk_config_dev`] for how it's found.
+struct HostblkConfigDev {
+    address: u32,
+    er_type: u8,
+    er_init_diag_vec: u16,
+    board_addr: u32,
+    board_size: u32,
+    diag_copy_addr: u32,
+}
+
+/// Find a `Library` node on a `struct List` of them (e.g. `ExecBase->
+/// LibList`) by name, and return its address -- which, for a `Library`,
+/// *is* the base pointer callers use (`exec/libraries.h`: the negative-
+/// offset jump table lives before it, not after, so the node's own
+/// address is the library base). This is the only sanctioned-by-header
+/// way this module has to reach `ExpansionBase`: NDK 3.2 does not publish
+/// its address anywhere fixed, unlike `ExecBase` at `$4`.
+fn find_library_base(bus: &mut MachineBus, list_addr: u32, name: &str) -> Option<u32> {
+    let mut node_addr = bus.read_long(list_addr + list::LH_HEAD);
+    for _ in 0..MAX_WALK_ENTRIES {
+        let succ = bus.read_long(node_addr + node::LN_SUCC);
+        if succ == 0 {
+            break;
+        }
+        if bus.read_byte(node_addr + node::LN_TYPE) == NT_LIBRARY {
+            let (lib_name, _pri) = read_node_name(bus, node_addr);
+            if lib_name == name {
+                return Some(node_addr);
+            }
+        }
+        node_addr = succ;
+    }
+    None
+}
+
+/// Walk `ExpansionBase->MountList`: a priority-sorted `struct List` of
+/// `BootNode`s (`libraries/expansionbase.h`), one per board a driver has
+/// made bootable via `AddBootNode()`. Returns each node's address and its
+/// `bn_DeviceNode` pointer. Same termination shape as
+/// [`walk_task_list`]/[`walk_mem_list`].
+fn walk_boot_nodes(bus: &mut MachineBus, list_addr: u32) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut node_addr = bus.read_long(list_addr + list::LH_HEAD);
+    for _ in 0..MAX_WALK_ENTRIES {
+        let succ = bus.read_long(node_addr + node::LN_SUCC);
+        if succ == 0 {
+            break;
+        }
+        out.push((
+            node_addr,
+            bus.read_long(node_addr + BOOTNODE_BN_DEVICE_NODE),
+        ));
+        node_addr = succ;
+    }
+    out
+}
+
+/// Locate `hostblk`'s own `ConfigDev`, if `expansion.library` created one
+/// for it.
+///
+/// NDK 3.2 does not publish where `ExpansionBase` keeps the head of its
+/// `ConfigDev` list: `libraries/expansionbase.h` marks every field before
+/// `MountList` `eb_PrivateNN` with no documented semantics beyond size
+/// (see [`EXPANSIONBASE_MOUNT_LIST`]), and the autodoc for
+/// `expansion.library/FindConfigDev` documents only the call's register
+/// convention, never a memory layout -- confirming the RKRM's own
+/// "Expansion Library" chapter, which states plainly that "descriptions
+/// of all configured boards are kept in a **private** ExpansionBase list
+/// of ConfigDev structures" and gives `FindConfigDev()` as the only way
+/// to reach it. That is a real 68k call this host-side tool -- which
+/// reads guest memory directly rather than driving the emulated CPU --
+/// cannot make.
+///
+/// Guessing that private layout is exactly what this project's brief
+/// prohibits, so this takes a different, fully documented route instead:
+/// scan chip RAM for a `ConfigDev` (`libraries/configvars.h`, a public
+/// struct start to finish) whose `cd_Rom` identity and `cd_BoardAddr`
+/// agree with what our own AUTOCONFIG chain independently knows it placed
+/// this board at ([`MachineBus::hostblk_board_base`]). Three fields must
+/// agree at once (address, manufacturer, product), so this is a targeted
+/// check against ground truth this process already trusts, not a blind
+/// structural guess across RAM. Scoped to chip RAM only for this
+/// increment -- `expansion.library`'s own board-list allocations run very
+/// early in boot, well before a `--fast-ram` board (if any) would be
+/// linked in, so chip RAM is where a `ConfigDev` actually lands in
+/// practice; extending the scan to fast RAM is future work, not a
+/// limitation this increment's evidence depends on.
+fn find_hostblk_config_dev(bus: &mut MachineBus, expected_base: u32) -> Option<HostblkConfigDev> {
+    use machine_core::hostblk;
+    let mut addr = 0u32;
+    while (addr as usize) < machine_core::CHIP_RAM_SIZE {
+        if bus.read_long(addr + configdev::CD_BOARD_ADDR) == expected_base
+            && bus.read_word(addr + configdev::CD_ROM + expansionrom::ER_MANUFACTURER)
+                == hostblk::MANUFACTURER
+            && bus.read_byte(addr + configdev::CD_ROM + expansionrom::ER_PRODUCT)
+                == hostblk::PRODUCT
+        {
+            return Some(HostblkConfigDev {
+                address: addr,
+                er_type: bus.read_byte(addr + configdev::CD_ROM + expansionrom::ER_TYPE),
+                er_init_diag_vec: bus
+                    .read_word(addr + configdev::CD_ROM + expansionrom::ER_INIT_DIAG_VEC),
+                board_addr: expected_base,
+                board_size: bus.read_long(addr + configdev::CD_BOARD_SIZE),
+                diag_copy_addr: bus
+                    .read_long(addr + configdev::CD_ROM + expansionrom::ER_RESERVED_0C),
+            });
+        }
+        addr += 4;
+    }
+    None
+}
+
+/// Search chip RAM for a byte-for-byte copy of [`machine_core::hostblk::
+/// DIAG_ROM`]'s own header, so this check does not depend on
+/// `ConfigDev.cd_Rom.er_Reserved0c..0f` actually holding the copy address
+/// -- that field is, after all, named `Reserved`, and the RKRM behaviour
+/// this module cites for it is Release 2 (V37, 1991); a V47 Kickstart is
+/// not contractually bound to keep using it the same way. Finding the raw
+/// bytes is a second, independent way to answer "did expansion.library
+/// copy this board's DiagArea into RAM at all", not dependent on that one
+/// field's meaning having survived unchanged for three decades. If found,
+/// also reports the scratch marker cell DiagEntry writes to
+/// (`hostblk::DIAG_MARKER_OFFSET`) -- nonzero there is conclusive
+/// (DiagEntry's first instruction is the register read that feeds it),
+/// independent of both mechanisms above.
+fn find_diag_rom_copy_by_signature(bus: &mut MachineBus) -> Option<(u32, u32)> {
+    // First 8 bytes of the embedded ROM's own DiagArea header (da_Config,
+    // da_Flags, da_Size, da_DiagPoint) -- read from `hostblk::DIAG_ROM`
+    // itself so this never drifts from what was actually assembled.
+    let needle = &machine_core::hostblk::DIAG_ROM[0..8];
+    let mut addr = 0u32;
+    while (addr as usize) + needle.len() <= machine_core::CHIP_RAM_SIZE {
+        if (0..needle.len() as u32).all(|i| bus.read_byte(addr + i) == needle[i as usize]) {
+            let marker = bus.read_long(addr + machine_core::hostblk::DIAG_MARKER_OFFSET);
+            return Some((addr, marker));
+        }
+        addr += 1;
+    }
+    None
+}
+
+/// Summarise what Kickstart did with the `hostblk` board (`--hostblk`):
+/// whether AUTOCONFIG placed it, whether `expansion.library` created a
+/// `ConfigDev` for it and accepted its DiagArea, whether `DiagEntry`
+/// actually ran and reached the board's own registers, and whether a
+/// boot node exists yet (it won't, in this increment -- see
+/// `docs/hostblk-protocol.md` section 12). `exec_base` should be
+/// [`Report::exec_base`] from a prior [`inspect`] call on the same `bus`,
+/// so `ExpansionBase` can be found via `ExecBase->LibList`
+/// ([`find_library_base`]) without a second full walk.
+pub fn format_hostblk_state(bus: &mut MachineBus, exec_base: Option<u32>) -> String {
+    let Some(base) = bus.hostblk_board_base() else {
+        return "hostblk state: no board attached, or not yet configured by AUTOCONFIG".to_string();
+    };
+    let mut out = format!("hostblk state: AUTOCONFIG placed the board at {base:#010x}\n");
+
+    match find_hostblk_config_dev(bus, base) {
+        Some(cd) => {
+            let diagvalid = cd.er_type & machine_core::autoconfig::ERTF_DIAGVALID != 0;
+            out.push_str(&format!(
+                "  ConfigDev at {:#010x}: er_Type {:#04x} ({}DIAGVALID)  er_InitDiagVec {:#06x}  cd_BoardAddr {:#010x}  cd_BoardSize {:#010x}\n",
+                cd.address,
+                cd.er_type,
+                if diagvalid { "" } else { "no " },
+                cd.er_init_diag_vec,
+                cd.board_addr,
+                cd.board_size,
+            ));
+            // Read the DiagArea's header directly from the board's own
+            // live window (not the RAM copy) -- isolates "is this board's
+            // ROM correctly served at the address expansion.library
+            // would have read it from" from "did expansion.library go on
+            // to run DiagEntry", the two different things a zero
+            // diag_copy_addr below could mean.
+            let diag_area_addr = cd.board_addr + u32::from(cd.er_init_diag_vec);
+            let live_header: Vec<u8> = (0..8).map(|i| bus.read_byte(diag_area_addr + i)).collect();
+            out.push_str(&format!(
+                "  DiagArea live header at {diag_area_addr:#010x} (board_addr + er_InitDiagVec): {live_header:02x?}\n"
+            ));
+            match find_diag_rom_copy_by_signature(bus) {
+                Some((addr, marker)) => out.push_str(&format!(
+                    "  DiagArea RAM copy found by signature scan at {addr:#010x} \
+                     (independent of cd_Rom.er_Reserved0c) -- DiagMarker there: {marker:#010x}\n"
+                )),
+                None => out.push_str(
+                    "  no DiagArea RAM copy found anywhere in chip RAM by signature scan \
+                     -- expansion.library never copied it at all\n",
+                ),
+            }
+            if cd.diag_copy_addr == 0 {
+                out.push_str(
+                    "  ConfigDev.cd_Rom.er_Reserved0c..0f: 0 (DiagEntry returned failure, \
+                     was never called, or this Kickstart no longer uses this field the way \
+                     RKRM 3rd ed. describes -- see the signature-scan line above instead)\n",
+                );
+            } else {
+                let marker =
+                    bus.read_long(cd.diag_copy_addr + machine_core::hostblk::DIAG_MARKER_OFFSET);
+                out.push_str(&format!(
+                    "  DiagArea RAM copy kept at {:#010x} (DiagEntry returned success)\n",
+                    cd.diag_copy_addr
+                ));
+                out.push_str(&format!(
+                    "  DiagMarker {marker:#010x}{}\n",
+                    if marker == machine_core::hostblk::PROTOCOL_VERSION {
+                        " == hostblk::PROTOCOL_VERSION -- DiagEntry read the board's own VERSION register"
+                    } else {
+                        " -- unexpected value; DiagEntry did not run as written, or something overwrote it"
+                    }
+                ));
+            }
+        }
+        None => out.push_str(
+            "  no ConfigDev found in chip RAM for this board -- expansion.library never \
+             configured it (or the search above needs widening; see this function's doc comment)\n",
+        ),
+    }
+
+    match exec_base
+        .and_then(|eb| find_library_base(bus, eb + execbase::LIB_LIST, "expansion.library"))
+    {
+        Some(expansion_base) => {
+            let boot_nodes = walk_boot_nodes(bus, expansion_base + EXPANSIONBASE_MOUNT_LIST);
+            out.push_str(&format!(
+                "  ExpansionBase at {expansion_base:#010x}  MountList boot nodes: {}\n",
+                boot_nodes.len()
+            ));
+            for (addr, dev_node) in &boot_nodes {
+                out.push_str(&format!(
+                    "    BootNode {addr:#010x}  bn_DeviceNode {dev_node:#010x}\n"
+                ));
+            }
+        }
+        None => out.push_str(
+            "  ExpansionBase not found (expansion.library not linked into ExecBase->LibList yet)\n",
+        ),
+    }
+
+    out
 }
 
 /// Format one `MemList` entry, decoding the `MEMF_*` attribute bits that
