@@ -73,6 +73,12 @@ mod execbase {
     /// addresses" -- the same principle applied one level up, to a
     /// library base rather than a board's).
     pub const LIB_LIST: u32 = 378;
+    /// `ExecBase->DeviceList`: third of the six lists in `LIB_LIST`'s own
+    /// comment's ordering, `322 + 2*14 = 350`. Temporary diagnostic use
+    /// only (`format_hostblk_state`'s device-node dump) -- confirms
+    /// `AddDevice()` actually ran, which mere `MountList`/register state
+    /// cannot distinguish from "never got that far".
+    pub const DEVICE_LIST: u32 = 350;
     pub const TASK_READY: u32 = 406;
     pub const TASK_WAIT: u32 = 420;
     // SoftInts[5] of `struct SoftIntList` (14 + 2 = 16 bytes each) = 80
@@ -857,6 +863,29 @@ fn find_library_base(bus: &mut MachineBus, list_addr: u32, name: &str) -> Option
     None
 }
 
+/// Like [`find_library_base`], but for `ExecBase->DeviceList`: a device
+/// node's `ln_Type` is `NT_DEVICE` (3), not `NT_LIBRARY`, so reusing that
+/// function here would silently never match (the diagnostic dump's own
+/// first draft did exactly that).
+fn find_device_base(bus: &mut MachineBus, list_addr: u32, name: &str) -> Option<u32> {
+    const NT_DEVICE: u8 = 3;
+    let mut node_addr = bus.read_long(list_addr + list::LH_HEAD);
+    for _ in 0..MAX_WALK_ENTRIES {
+        let succ = bus.read_long(node_addr + node::LN_SUCC);
+        if succ == 0 {
+            break;
+        }
+        if bus.read_byte(node_addr + node::LN_TYPE) == NT_DEVICE {
+            let (dev_name, _pri) = read_node_name(bus, node_addr);
+            if dev_name == name {
+                return Some(node_addr);
+            }
+        }
+        node_addr = succ;
+    }
+    None
+}
+
 /// Walk `ExpansionBase->MountList`: a priority-sorted `struct List` of
 /// `BootNode`s (`libraries/expansionbase.h`), one per board a driver has
 /// made bootable via `AddBootNode()`. Returns each node's address and its
@@ -1051,14 +1080,64 @@ pub fn format_hostblk_state(bus: &mut MachineBus, exec_base: Option<u32>) -> Str
                 boot_nodes.len()
             ));
             for (addr, dev_node) in &boot_nodes {
+                // dos/filehandler.h's struct DeviceNode: dn_Name is the
+                // 11th field (four longwords each: dn_Next, dn_Type,
+                // dn_Task, dn_Lock, dn_Handler, dn_StackSize, dn_Priority,
+                // dn_Startup, dn_SegList, dn_GlobalVec, then dn_Name) --
+                // offset 40 -- and it is itself a BPTR (BCPL pointer, i.e.
+                // a real address / 4) to a BSTR (length byte then chars,
+                // not NUL-terminated). Decoded here only to tell which
+                // device a boot node actually names, for diagnosis.
+                let dn_name_bptr = bus.read_long(dev_node + 40);
+                let name_addr = dn_name_bptr.wrapping_mul(4);
+                let len = bus.read_byte(name_addr) as usize;
+                let mut name = String::new();
+                for i in 0..len.min(32) {
+                    name.push(bus.read_byte(name_addr + 1 + i as u32) as char);
+                }
                 out.push_str(&format!(
-                    "    BootNode {addr:#010x}  bn_DeviceNode {dev_node:#010x}\n"
+                    "    BootNode {addr:#010x}  bn_DeviceNode {dev_node:#010x}  dn_Name {name:?}\n"
                 ));
             }
         }
         None => out.push_str(
             "  ExpansionBase not found (expansion.library not linked into ExecBase->LibList yet)\n",
         ),
+    }
+
+    // Driver-increment diagnostics: read the live registers directly (no
+    // guest cooperation needed) to tell "the driver never submitted
+    // anything" apart from "it submitted but nothing ever completed" apart
+    // from "it's working fine, strap just hasn't looked yet".
+    use machine_core::hostblk::reg;
+    out.push_str(&format!(
+        "  registers: SUBMIT_OVERFLOW {}  COMPLETION_COUNT {}  INT_ENABLE {}  SUBMIT_CAPACITY {}\n",
+        bus.read_long(base + reg::SUBMIT_OVERFLOW),
+        bus.read_long(base + reg::COMPLETION_COUNT),
+        bus.read_long(base + reg::INT_ENABLE),
+        bus.read_long(base + reg::SUBMIT_CAPACITY),
+    ));
+
+    match exec_base
+        .and_then(|eb| find_device_base(bus, eb + execbase::DEVICE_LIST, "hostblk.device"))
+    {
+        Some(dev) => {
+            // m68k/hostblk-rom/hostblk-diagrom.s's own DEV_* equ block --
+            // duplicated here only for this diagnostic dump, not a shared
+            // contract with the ROM source.
+            out.push_str(&format!(
+                "  hostblk.device found at {dev:#010x}: sysbase {:#010x}  boardbase {:#010x}  \
+                 expbase {:#010x}  configdev {:#010x}  capacity {}  outstanding {}  slotbase {:#010x}\n",
+                bus.read_long(dev + 34),
+                bus.read_long(dev + 38),
+                bus.read_long(dev + 42),
+                bus.read_long(dev + 46),
+                bus.read_long(dev + 50),
+                bus.read_long(dev + 54),
+                bus.read_long(dev + 58),
+            ));
+        }
+        None => out.push_str("  hostblk.device not found in ExecBase->DeviceList\n"),
     }
 
     out

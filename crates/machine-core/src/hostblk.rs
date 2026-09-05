@@ -1651,10 +1651,22 @@ mod tests {
 
         assert_eq!(da_config & 0xC0, 0x80, "DAC_WORDWIDE (configregs.h)");
         assert_eq!(da_flags, 0, "da_Flags: configregs.h defines none");
-        assert_eq!(
-            da_size as usize,
-            rom.len(),
-            "da_Size covers the whole copy area"
+        // Since the driver increment, da_Size covers only the DiagArea
+        // header, the diagnostic marker, and the struct Resident (+ its two
+        // name strings) that Kickstart's cold-start scan needs to find in
+        // RAM -- NOT the whole assembled ROM. Everything else (rt_Init's
+        // real target, the exec device, the RDB mounter) executes straight
+        // off this board's own AUTOCONFIG window and is deliberately never
+        // copied (m68k/hostblk-rom/hostblk-diagrom.s's file header explains
+        // why: the window is ordinary bus-addressable memory the CPU can
+        // already run code from directly, so copying it would only cost RAM
+        // for no benefit). So da_Size must be strictly less than the full
+        // ROM, with room left over for that uncopied code.
+        assert!(
+            (da_size as usize) < rom.len(),
+            "da_Size must cover only the DiagArea/Resident copy region, \
+             leaving the exec device and RDB mounter uncopied in the \
+             board's own persistent window"
         );
         assert_ne!(
             da_diag_point, 0,
@@ -1665,10 +1677,11 @@ mod tests {
             "RKRM 'Events At DIAG Time': a zero da_BootPoint means \
              expansion.library never copies this area into RAM at all"
         );
-        // Every field content byte in range, so a driver never reads past
-        // what was actually assembled.
-        assert!((da_diag_point as usize) < rom.len());
-        assert!((da_boot_point as usize) < rom.len());
+        // da_DiagPoint/da_BootPoint are offsets *within the copied area*
+        // (their own field doc: "relative to the structure"), so they must
+        // fall inside da_Size, not merely inside the whole file.
+        assert!((da_diag_point as usize) < da_size as usize);
+        assert!((da_boot_point as usize) < da_size as usize);
 
         // DIAG_MARKER_OFFSET must land exactly where DiagEntry's own
         // scratch cell sits: right after the 14-byte DiagArea header, and

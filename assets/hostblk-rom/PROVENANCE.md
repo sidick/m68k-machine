@@ -9,10 +9,14 @@ never needs one (`docs/ci.md`).
 
 ## What this file is
 
-The hostblk card's DiagArea boot ROM (docs/hostblk-protocol.md, ADR 0003):
-32 bytes, a `struct DiagArea` (`libraries/configregs.h`) followed by one
-scratch longword and two tiny routines (`DiagEntry`, `BootEntry`). See the
-source file's header comment for the full design and citation trail.
+The hostblk card's DiagArea boot ROM, `hostblk.device` exec driver, and
+RDB partition mounter (docs/hostblk-protocol.md, ADR 0003): a small
+`struct DiagArea` + `struct Resident` copy region (found by Kickstart's
+cold-start "Events At ROMTAG INIT Time" scan, RKRM 3rd ed. "Expansion
+Library") followed by the device driver and mounter code, which executes
+in place from the board's own AUTOCONFIG window rather than being
+copied. See the source file's header comment for the full design and
+citation trail.
 
 `crates/machine-core/src/hostblk.rs` embeds this file verbatim via
 `include_bytes!` and serves it read-only from the board's own AUTOCONFIG
@@ -38,7 +42,7 @@ SHA256 of the file exactly as committed here (recompute and compare after
 a rebuild to confirm the toolchain reproduced the same bytes):
 
 ```
-a00f40d6cbccede0868e170b90692a7dc67bf6db742bc007898b3291c2b90afc  hostblk-diagrom.bin
+e043d75af9360ed468a6935461c409d7dbc765ce0877b22aec403dff57f049ac  hostblk-diagrom.bin
 ```
 
 ## License

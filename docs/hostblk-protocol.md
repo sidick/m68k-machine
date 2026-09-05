@@ -1,8 +1,11 @@
 # `hostblk` register and wire-format contract
 
-**Status:** host side implemented (`crates/machine-core/src/hostblk.rs`);
-no m68k driver or boot ROM yet. This document is the contract a driver
-author needs; it does not describe a driver that exists today.
+**Status:** host side implemented (`crates/machine-core/src/hostblk.rs`),
+and a first m68k driver and DiagArea boot ROM exist
+(`m68k/hostblk-rom/`). That driver registers, mounts an RDB and offers a
+boot node, but **does not yet boot a machine** — see §14. Sections
+carrying "driver feedback" record where this contract turned out to be
+wrong or underspecified once real 68k code used it.
 
 **Context:** `docs/adr-0003-native-block-storage-doorbell-not-pio.md`
 (the decision this implements); `docs/m68k-machine-proposal.md` §9 (the
@@ -128,6 +131,21 @@ while (COMPLETION_PTR != 0) {
 `0` is never a legitimate descriptor address in practice (`AllocMem`
 never returns it), so it doubles as this device's own "queue empty"
 sentinel — `COMPLETION_COUNT` exists only for convenience/diagnostics.
+
+**Driver feedback (m68k/hostblk-rom/hostblk-diagrom.s, first real driver
+against this contract):** the pseudocode above casting `COMPLETION_PTR`
+straight to `struct IORequest *` is misleading as written — it is the
+*descriptor's* address (§3), and a real driver's descriptor is a
+20-byte value type with no room for a back-pointer to the `IORequest`
+that produced it. A real driver needs its own indirection: this one
+keeps the descriptor pool as fixed-size "slots" (descriptor + an extra
+4-byte owner field), submits `&slot.descriptor` as the doorbell value,
+and on completion recovers the real `IORequest` from
+`slot.owner` — i.e. `COMPLETION_PTR` identifies *which slot* completed,
+not the request directly. Worth showing that shape (or at least naming
+the assumption) here rather than the direct-cast pseudocode, which only
+works if a driver's descriptor and its `IORequest` happen to be the same
+allocation.
 
 ## 6. Error codes and residue
 
@@ -270,6 +288,20 @@ RAM**: the card asks `MachineBus` through `GuestMemory::ram_slice`/
 without either range being hardcoded here. A driver may allocate its
 buffers `MEMF_FAST`. A span straddling two regions is refused rather
 than silently stitched together.
+
+**Driver feedback:** "may allocate `MEMF_FAST`" reads as an invitation
+to *prefer* it, and the first driver did exactly that for its
+descriptor/slot pool — which made `AllocMem` return `NULL` and the
+whole device silently fail to construct on any machine with no fast RAM
+attached at all (this project's own default test configuration has
+none). This is exactly the "silent failure is the norm" trap ADR 0003's
+device-ledger context already flags elsewhere (`0xFFFF` manufacturer,
+`$DE1000` open-bus, `DAC_NEVER`) — worth calling out explicitly here
+too: a driver's own allocations should default to `MEMF_PUBLIC`
+(satisfied by whatever memory actually exists) and treat `MEMF_FAST`
+as an optimization to request only when the caller's own buffer
+(`IORequest`'s `io_Data`) already happens to be fast RAM, not as the
+pool's own default.
 
 ## 13. Acceptance testing the driver
 
