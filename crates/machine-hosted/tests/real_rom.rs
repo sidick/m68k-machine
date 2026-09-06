@@ -700,6 +700,113 @@ fn scripted_double_click_on_the_sys_icon_opens_its_drawer() {
     let _ = std::fs::remove_file(&script_path);
 }
 
+/// End-to-end proof that `CHAR_DOWN`/`CHAR_UP` reach the guest through
+/// `MapANSI()` (`docs/input-protocol.md` sec 15, `m68k/input-rom/
+/// input-diagrom.s`'s `char_key_down`/`char_key_up`), not just that the
+/// driver task stays alive while they're queued.
+///
+/// Drives the exact click chain `scripted_double_click_on_the_sys_icon_
+/// opens_its_drawer` above already proves reaches Intuition -- SYS: ->
+/// System -> Shell -- three double-clicks deep, then types `ECHO Hi` with
+/// `TYPE` (7 characters, 14 `CHARDOWN`/`CHARUP` events -- comfortably
+/// under `input::QUEUE_CAPACITY` (16), so nothing here exercises the
+/// overflow path; a `TYPE` string long enough to overflow it was tried
+/// while building this driver and silently lost its tail end, which is
+/// real but separate behaviour, not this test's concern) and a real
+/// (not `TYPE`-synthesised) `KEYDOWN`/`KEYUP 0x44` for Return -- proving
+/// the plain `KEY_DOWN`/`KEY_UP` path in the same run, since AmigaDOS's
+/// `Echo` only ever runs if that Return keystroke was real.
+///
+/// System's icon: canvas (213, 128) -> screen (170, 84), measured the
+/// same way `scripted_double_click_on_the_sys_icon_opens_its_drawer`'s
+/// own doc comment derives the SYS: icon's. Shell's icon, inside the
+/// opened System drawer: canvas (224, 152) -> screen (192, 108).
+///
+/// The floor below is measured, not guessed, the same posture that
+/// test's own comment insists on and for the identical reason: a naive
+/// "something changed" assertion would also pass on a click that opened
+/// the Shell but typed nothing, or opened the wrong window entirely.
+/// Measured on this exact script: the Shell open with an empty prompt is
+/// 13,925 non-background pixels; with `ECHO Hi` typed, executed, and its
+/// `Hi` echoed back on the line under the prompt, it is 14,073. The floor
+/// sits between the two, so "opened a shell but nothing was typed" (or a
+/// character MapANSI silently failed to invert, leaving a blank line)
+/// fails this test exactly as a wrong-window click would fail the SYS:
+/// drawer test above.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
+fn scripted_typing_in_a_shell_opened_three_double_clicks_deep_is_echoed() {
+    let rom = kickstart_a1200();
+    let hd = hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+
+    let script_path =
+        std::env::temp_dir().join(format!("machine-hosted-type-{}.input", std::process::id()));
+    std::fs::write(
+        &script_path,
+        "SLEEP 4200\n\
+         MOVE 42 73\nSLEEP 10\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 5\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 300\n\
+         MOVE 170 84\nSLEEP 10\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 5\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 300\n\
+         MOVE 192 108\nSLEEP 10\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 5\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 600\n\
+         TYPE \"ECHO Hi\"\nSLEEP 30\nKEYDOWN 0x44\nSLEEP 2\nKEYUP 0x44\nSLEEP 300\n",
+    )
+    .expect("write input script");
+
+    let path = screenshot_path("shell-type");
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--input-script",
+        script_path.to_str().unwrap(),
+        "--screenshot",
+        path.to_str().unwrap(),
+        "--screenshot-frame",
+        "5700",
+        "--max-frames",
+        "5800",
+        "--max-instructions",
+        "900000000",
+        "--inspect",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    // Independent, non-visual confirmation alongside the screenshot below
+    // (the same "two ways" posture the pointer-motion work used
+    // IntuitionBase->MouseX/MouseY for): every one of the 14 CHARDOWN/
+    // CHARUP events plus the Return key actually drained out of the
+    // card's own queue, and none were dropped as an overflow.
+    assert!(
+        stdout.contains("EVENT_COUNT 0  EVENT_OVERFLOW 0"),
+        "expected the input card's queue fully drained with no drops by the end of the run: {stdout}"
+    );
+
+    let (width, height, rgba) = decode_png(&path);
+    assert_eq!(
+        (width, height),
+        (
+            machine_core::display::MAX_WIDTH as u32,
+            machine_core::display::MAX_HEIGHT as u32
+        )
+    );
+
+    let background = dominant_pixel(&rgba);
+    let non_background = rgba.chunks(4).filter(|px| *px != background).count();
+    assert!(
+        non_background > 14_000,
+        "expected 'ECHO Hi' typed, run, and its 'Hi' echoed in the opened Shell window, \
+         got {non_background} non-background pixels -- 13,925 would mean the Shell opened \
+         but nothing was typed (or MapANSI silently produced nothing); see this test's doc comment"
+    );
+
+    let _ = std::fs::remove_file(&script_path);
+}
+
 #[test]
 #[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
 fn kickstart_3_2_2_a1200_boots_from_hd_to_the_workbench_desktop() {

@@ -1182,6 +1182,22 @@ pub fn format_input_state(bus: &mut MachineBus) -> String {
         ),
     }
 
+    // Live register snapshot -- independent of whether DiagArea/ConfigDev
+    // were ever found above: this is the card's *event queue* right now,
+    // read the same way the driver itself would poll it (docs/
+    // input-protocol.md sec 5). Added for the CHAR_DOWN/CHAR_UP driver
+    // increment's own verification -- EVENT_COUNT back at 0 and
+    // EVENT_OVERFLOW still 0 after a typing run is independent, guest-
+    // side-adjacent evidence that every queued character was drained and
+    // none were silently dropped, the same role IntuitionBase->MouseX/
+    // MouseY already plays for the pointer-motion driver work above.
+    let event_count = bus.read_long(base + machine_core::input::reg::EVENT_COUNT);
+    let overflow = bus.read_long(base + machine_core::input::reg::EVENT_OVERFLOW);
+    let int_status = bus.read_byte(base + machine_core::input::reg::INT_STATUS + 3);
+    out.push_str(&format!(
+        "  live queue: EVENT_COUNT {event_count}  EVENT_OVERFLOW {overflow}  INT_STATUS {int_status}\n"
+    ));
+
     out
 }
 

@@ -393,18 +393,29 @@ what this section used to list as missing. What's left:
 - No `IESUBCLASS_TABLET`/`NEWTABLET` support -- this card only ever
   carries pixel coordinates (§6), so the driver only ever builds
   `IESUBCLASS_PIXEL`.
-- `CHAR_DOWN`/`CHAR_UP` (§15) are new in this increment and carry no
-  driver consumer at all yet -- no code in `input-diagrom.s` drains them
-  or calls `MapANSI()`. The card and `--input-script` side are done; the
-  `MapANSI()`-based driver is explicitly future work, not attempted here.
+- No user remap table ahead of `MapANSI()` -- `~/src/amirfb`'s own
+  proposal describes one as a later layer with no consumer yet either;
+  this driver, like amirfb without it, has no way to reach a
+  non-printable key (cursor keys, function keys, Return, Escape, ...)
+  from a bare Latin-1 byte, which is exactly why `CHAR_DOWN`/`CHAR_UP`
+  and `KEY_DOWN`/`KEY_UP` remain two separate event types rather than
+  one -- a script (or a future host input source) that needs Return
+  still has to send it as a raw key code, not a character.
 - Key-down/key-up and button-down/button-up were exercised as a
-  guest-stability smoke test (the driver task survives them, keeps
-  draining, and the machine keeps booting) but **not** independently
-  verified end-to-end the way pointer motion was (§13) -- there is no
-  guest fixture yet that reports back `IDCMP_RAWKEY`/
-  `IDCMP_MOUSEBUTTONS` the way §12 describes; building one is the
-  natural next increment's first task, same as §12 already said before
-  any driver existed.
+  guest-stability smoke test when this driver was first built (the
+  driver task survives them, keeps draining, and the machine keeps
+  booting), which is not the same claim as "a keystroke arrives
+  anywhere" -- §13's retrospective now records that plain `KEY_DOWN`/
+  `KEY_UP` **was** independently verified end-to-end once the
+  `CHAR_DOWN`/`CHAR_UP` increment needed a real guest fixture to test
+  against anyway: a scripted raw `KEYDOWN 0x44`/`KEYUP 0x44` (Return) is
+  what actually runs the `ECHO` command in
+  `crates/machine-hosted/tests/real_rom.rs`'s `scripted_typing_in_a_
+  shell_opened_three_double_clicks_deep_is_echoed`, alongside the typed
+  text itself. `IDCMP_RAWKEY`/`IDCMP_MOUSEBUTTONS` reported back from a
+  purpose-built guest fixture (§12's original framing) is still not
+  built, but a real Shell accepting a real Return keypress is at least
+  as convincing for the one case that mattered most to settle.
 
 ## 12. Acceptance testing the driver
 
@@ -505,6 +516,81 @@ reached `rts`) exists purely to keep that field non-zero.
   approximately the requested position on a live Workbench desktop, not
   stuck at the top-left corner or absent -- something that could only
   happen by the event actually reaching Intuition's input chain.
+
+### Retrospective: the `CHAR_DOWN`/`CHAR_UP` (`MapANSI()`) increment
+
+Confirmed exactly as §15 designed it, once written: `MapANSI()`'s
+calling convention (`actual = MapANSI(string, count, buffer, length,
+keyMap)` in `D0/A0,D0,A1,D1,A2`) matches `Include_H/inline/
+keymap_protos.h`'s `__reg()` annotations exactly, the same authoritative
+source (register annotations over autodoc prose) this file's header
+already insists on for every other LVO call in it. `NUM_MAP_PAIRS = 3`
+matches Autodocs `keymap.doc`'s own worked example almost verbatim
+(`STIMSIZE`, commented "two dead keys, one key").
+
+**A real bug this verification caught, not a design problem:**
+`char_key_up` was missing the `mulu.w #HELD_ENTRY_SIZE,d6` multiply
+`char_key_down` has, so it indexed `ST_HELD_TABLE` by the raw character
+code instead of by that code's byte offset into the table -- for every
+character above `HELD_ENTRY_SIZE` (8), this reads and clears some *other*
+character's entry instead of its own. Scripting `TYPE "Hi"` exposed it
+immediately: the guest echoed `H]` instead of `Hi`. What actually
+happened -- traced by fixing the bug and confirming the symptom
+disappeared, not guessed at -- is that `char_key_up('H')` hit the wrong
+(unused) entry, found it not held, and returned without ever calling
+`send_rawkey_raw`/`qualifier_release` for `H`'s own Shift press: Shift
+was pressed to type `H` and then never released, either in this driver's
+own `ST_HELD_QUALIFIER` bookkeeping or, more importantly, from real
+`input.device`'s point of view. This is exactly the "silent failure"
+category this project keeps a running count of (file header, project
+convention) -- the driver kept running, the queue kept draining, nothing
+crashed or logged an error; the only symptom was wrong text arriving in
+the guest, on a card whose whole justification is that the host cannot
+independently verify what the guest displays.
+
+An initial, wrong diagnosis is worth recording too, in the same
+"corrected in the open" spirit §6 already models: the first attempt at
+fixing this assumed `a4`/`d6`/`d7` had failed to survive the
+`jsr _LVOMapANSI(a6)` call despite the standard AmigaOS convention this
+file already leans on elsewhere (`d2`-`d7`/`a2`-`a6` preserved across a
+library call), and added code to re-derive them from `ST_MAPIN` after
+the call rather than trust them across it. That fix compiled, changed
+nothing observable, and was reverted once the real bug (in
+`char_key_up`, not `char_key_down`'s post-`MapANSI()` code at all) was
+found -- a reminder that "the convention might not hold here" is a much
+more expensive hypothesis to reach for than "re-read the code for a
+plain arithmetic omission", and should come second, not first.
+
+**Verification, both ways the brief asked for, after the fix:**
+
+- **Visible effect.** `crates/machine-hosted/tests/real_rom.rs`'s
+  `scripted_typing_in_a_shell_opened_three_double_clicks_deep_is_echoed`
+  drives the guest three double-clicks deep (`SYS:` → `System` → `Shell`,
+  the same click primitives §13's pointer-motion work already proved)
+  and types `ECHO Hi` via `TYPE`, followed by a real (not `TYPE`-
+  synthesised) `KEYDOWN`/`KEYUP 0x44` for Return. The resulting
+  screenshot shows `1.SYS:> ECHO Hi` followed by `Hi` on its own line --
+  AmigaDOS's `Echo` command actually ran and printed back exactly what
+  was typed, including the Shift-dependent capital `H` immediately
+  followed by the unshifted `i` that exposed the bug above.
+- **Guest-adjacent state.** `machine-hosted --inspect`'s `input state`
+  section (`crates/machine-hosted/src/introspect.rs`) now also reports
+  the card's live `EVENT_COUNT`/`EVENT_OVERFLOW`/`INT_STATUS` registers.
+  After the run above, `EVENT_COUNT 0  EVENT_OVERFLOW 0` -- every one of
+  the 14 `CHARDOWN`/`CHARUP` events `TYPE "ECHO Hi"` expands to, plus the
+  Return keypress, was drained by the driver with nothing dropped.
+
+**A queue-capacity nuance worth recording, not a bug:** an early attempt
+at this same test used `TYPE "ECHO Hello"` (10 characters, 20 `CHARDOWN`/
+`CHARUP` events). `--input-script` fires every event for one script line
+in the same tick, before the guest's driver gets to run at all, so all 20
+landed in the card's 16-entry queue in one instant -- the last two
+characters (`l`, `o`) were dropped by the documented, correct overflow
+policy (§9), and the guest echoed `HEL` instead of `Hello`. Nothing on
+the driver side misbehaved; this is `--input-script`'s own instant-tick
+delivery colliding with a `TYPE` string longer than `QUEUE_CAPACITY / 2`
+characters, worth knowing before writing a longer scripted `TYPE` than
+this document's own examples use.
 
 ## 14. `da_BootPoint` is not about being bootable
 
@@ -654,16 +740,14 @@ actually wants, rather than spelling out two directives per letter.
 
 ### What a driver still has to do
 
-Nothing on the guest side consumes these events yet.
-`m68k/input-rom/input-diagrom.s` has no code that drains `CHAR_DOWN`/
-`CHAR_UP`, let alone one that calls `MapANSI()` — that is the next driver
-increment's work, same as §7's held-qualifier bookkeeping and §11's other
-open items already are. What this increment built is only the
-*possibility*: an event type that carries a character, plumbed through
-the queue, the register file, and a script directive to produce one. The
-driver increment's job, once it exists, is to drain `CHAR_DOWN`/
-`CHAR_UP`, call `MapANSI()` to invert the Latin-1 byte into a
-rawkey-plus-qualifier combination under the guest's active keymap, and
-apply AmiRFB's press/hold/repeat/release-with-refcounted-qualifiers
-scheme described above when building the resulting `IECLASS_RAWKEY`
-`InputEvent`s.
+**This section described future work; §13's retrospective now records
+what actually happened building it.** `m68k/input-rom/input-diagrom.s`'s
+`char_key_down`/`char_key_up` drain `CHAR_DOWN`/`CHAR_UP`, call
+`MapANSI()` (opened via `keymap.library`, the same non-fatal
+open-and-retry idiom `input.device`/`intuition.library` already used) to
+invert the Latin-1 byte into a rawkey-plus-qualifier combination under
+the guest's active keymap, and `qualifier_hold`/`qualifier_release` apply
+AmiRFB's press/hold/repeat/release-with-refcounted-qualifiers scheme
+described above when building the resulting `IECLASS_RAWKEY`
+`InputEvent`s — verified end-to-end against a real Kickstart 3.2.2 boot,
+not just assembled and trusted (§13).

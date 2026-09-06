@@ -14,11 +14,21 @@
 * own context far later than rt_Init, open input.device and
 * intuition.library and install the INT2 interrupt server. This is the
 * task/interrupt split docs/input-protocol.md's brief calls for and this
-* file's header explains why below. NOT implemented this increment: no
-* held-state recovery on EVENT_OVERFLOW (docs/input-protocol.md sec 9's
-* future-work note), no IND_ADDEVENT (repeat-aware V47 sibling), no
-* IESUBCLASS_TABLET/NEWTABLET support (this card only ever produces pixel
-* coordinates).
+* file's header explains why below. Also opens keymap.library and drains
+* CHAR_DOWN/CHAR_UP (docs/input-protocol.md sec 15) via MapANSI(),
+* refcounting the qualifiers it presses on a character's behalf the way
+* ~/src/amirfb's src/amiga/rfb_server.c (BSD 2-Clause, the project
+* owner's own) does -- see char_key_down/char_key_up/qualifier_hold/
+* qualifier_release below, cited in full at their own definitions. NOT
+* implemented this increment: no held-state recovery on EVENT_OVERFLOW
+* (docs/input-protocol.md sec 9's future-work note), no IND_ADDEVENT
+* (repeat-aware V47 sibling), no IESUBCLASS_TABLET/NEWTABLET support
+* (this card only ever produces pixel coordinates), no user remap table
+* ahead of MapANSI() (amirfb's own proposal describes one as a later
+* layer; this driver, like amirfb without it, simply has no way to reach
+* a non-printable key from a bare character byte, which is exactly why
+* CHAR_DOWN/CHAR_UP and KEY_DOWN/KEY_UP remain two separate event types
+* rather than one).
 *
 * Assembled with vasm (Motorola syntax) to a flat binary; see
 * ../../scripts/build-input-rom.sh. Same two addressing regimes as
@@ -115,6 +125,23 @@
 *   - Autodocs/graphics.doc (NDK 3.2, via Include_I/lvo/graphics_lib.i for
 *     the LVO number): WaitTOF, used only as this file's cheap yield-and-
 *     retry primitive -- see the header discussion above.
+*   - Autodocs/keymap.doc, Include_H/inline/keymap_protos.h,
+*     Include_I/lvo/keymap_lib.i (NDK 3.2): MapANSI()'s SYNOPSIS
+*     (actual=MapANSI(string,count,buffer,length,keyMap), registers
+*     D0/A0,D0,A1,D1,A2), its RESULT/ERRORS (<=0 is an error or an
+*     ungeneratable character; NUM_MAP_PAIRS=3 matches the autodoc's own
+*     STIMSIZE worked example, "two dead keys, one key"), and the LVO
+*     offset (-48) -- confirmed directly against these headers, not taken
+*     on the brief's description, per this increment's own instruction to
+*     verify rather than trust a paraphrase.
+*   - ~/src/amirfb/src/amiga/rfb_server.c (BSD 2-Clause, the project
+*     owner's own): the press/hold/repeat/release-with-refcounted-
+*     qualifiers scheme char_key_down/char_key_up/qualifier_hold/
+*     qualifier_release implement, and the live "Shift-down then
+*     lowercase 'e'" bug its own comments record for why every emitted
+*     event -- including a qualifier's own press/release -- must carry
+*     the *current* combined qualifier state, not zero or just its own
+*     transition.
 *
 * One constant table in this file is NOT backed by any NDK 3.2 header --
 * flagged loudly here and again at its own definition
@@ -156,6 +183,8 @@ EV_KEY_UP               equ     2
 EV_POINTER_MOTION       equ     3
 EV_BUTTON_DOWN          equ     4
 EV_BUTTON_UP            equ     5
+EV_CHAR_DOWN            equ     6
+EV_CHAR_UP              equ     7
 
 * crates/machine-core/src/input.rs: `pub const ROM_BASE: u32 = 0x1000;`
 * for this card -- an independent namespace from hostblk's own ROM_BASE,
@@ -354,6 +383,9 @@ _LVOInitResident equ    -102
 
 _LVOWaitTOF     equ     -270    ; graphics.library
 
+* Include_I/lvo/keymap_lib.i: keymap.library's own LVO table.
+_LVOMapANSI     equ     -48
+
 * This driver's own private state block, allocated once from rt_Init and
 * owned by the task for the life of the machine (never freed -- same
 * "ROM-resident for the life of the machine, no unload story" posture
@@ -394,8 +426,73 @@ ST_PORT             equ     ST_INT+INTERRUPT_SIZE                   ; 282
 ST_IOREQ            equ     ST_PORT+MSGPORT_SIZE                    ; 316
 ST_EVENTBUF         equ     ST_IOREQ+IOSTD_SIZE                     ; 364
 ST_PIXBUF           equ     ST_EVENTBUF+INPUTEVENT_SIZE             ; 386
-ST_STACKPTR         equ     ST_PIXBUF+IEPOINTERPIXEL_SIZE+2         ; 396 (+2 pad to keep this APTR longword-aligned)
-ST_SIZE             equ     ST_STACKPTR+4                           ; 400
+
+* ----------------------------------------------------------------------
+* Character-typing state (docs/input-protocol.md sec 15; this driver's
+* MapANSI()-based increment). Everything below is this driver's own
+* bookkeeping, not an OS structure -- same "chosen here" disclaimer as
+* the fields above. Symbolic (each equ built on the one before) rather
+* than the hand-summed literals above it, specifically so appending
+* fields here can never silently misalign something later in the block
+* the way editing a literal offset by hand could.
+*
+* ST_KEYMAPBASE: keymap.library's own base, opened once from TaskEntry
+* (same non-fatal open-and-retry idiom as ST_GFXBASE/ST_INPUTBASE/
+* ST_INTUITIONBASE) -- MapANSI's own inline stub
+* (Include_H/inline/keymap_protos.h) wants A6=KeymapBase, not SysBase,
+* which is why this driver needs to remember it separately rather than
+* reusing ST_SYSBASE the way every exec.library call here does.
+*
+* ST_QREF_*: one refcount byte per IEQUALIFIER_* bit MapANSI can ask
+* this driver to hold (~/src/amirfb's g_qualifier_holds[], cited in
+* full at qualifier_hold/qualifier_release below) -- named fields
+* rather than a table, matching this file's existing preference
+* (modifier_bit_for_code/button_qualifier_bit/rawmouse_code_for_button
+* are all explicit chains, not table lookups). CAPSLOCK is deliberately
+* absent: it's a toggle read from the keymap, never something a driver
+* presses per-character (amirfb's own comment on its g_qualifier_keys
+* table says the same).
+*
+* ST_MAPIN/ST_MAPBUF: MapANSI's own string-in/pairs-out scratch. One
+* ANSI byte in, up to NUM_MAP_PAIRS code/qualifier pairs out (Autodocs
+* keymap.doc: "two dead keys, one key" is its own worked example's
+* comment for why 3, not 1, is the right buffer size -- a dead-key
+* prefix needs its own rawkey struck before the final character's).
+*
+* ST_HELD_TABLE: one entry per possible Latin-1 byte (256), directly
+* indexed by the character code itself rather than linearly searched
+* (~/src/amirfb's g_held_keys[]/amirfb_find_held() do search, since an
+* X11 keysym is a much wider space than one byte; a Latin-1 byte fits a
+* direct index instead, at the cost of a fixed 2 KB table). Zeroed by
+* rt_Init's own MEMF_CLEAR allocation, so HK_NPAIRS starting at 0
+* ("not currently held") needs no explicit initialisation here.
+* ----------------------------------------------------------------------
+ST_KEYMAPBASE       equ     ST_PIXBUF+IEPOINTERPIXEL_SIZE           ; 394, APTR
+ST_QREF_LSHIFT      equ     ST_KEYMAPBASE+4                         ; 398
+ST_QREF_RSHIFT      equ     ST_QREF_LSHIFT+1
+ST_QREF_CONTROL     equ     ST_QREF_RSHIFT+1
+ST_QREF_LALT        equ     ST_QREF_CONTROL+1
+ST_QREF_RALT        equ     ST_QREF_LALT+1
+ST_QREF_LCOMMAND    equ     ST_QREF_RALT+1
+ST_QREF_RCOMMAND    equ     ST_QREF_LCOMMAND+1                      ; 404
+ST_MAPIN            equ     ST_QREF_RCOMMAND+1                      ; 405
+ST_MAPBUF           equ     ST_MAPIN+1                               ; 406, NUM_MAP_PAIRS*2 bytes
+NUM_MAP_PAIRS       equ     3        ; Autodocs keymap.doc's own STIMSIZE
+                                      ; example: "two dead keys, one key"
+ST_HELD_TABLE       equ     ST_MAPBUF+(NUM_MAP_PAIRS*2)             ; 412
+HELD_ENTRY_SIZE     equ     8        ; HK_NPAIRS(1)+HK_CODES(3)+HK_QUALS(3)+1 pad
+HELD_TABLE_ENTRIES  equ     256      ; one per possible Latin-1 byte
+HELD_TABLE_SIZE     equ     HELD_TABLE_ENTRIES*HELD_ENTRY_SIZE      ; 2048
+
+HK_NPAIRS           equ     0        ; UBYTE: 0 = not currently held
+HK_CODES            equ     1        ; UBYTE[NUM_MAP_PAIRS]
+HK_QUALS            equ     4        ; UBYTE[NUM_MAP_PAIRS] (MapANSI's own
+                                      ; qualifier byte per pair -- the low
+                                      ; byte of ie_Qualifier, Autodocs
+                                      ; keymap.doc's own SYNOPSIS)
+
+ST_STACKPTR         equ     ST_HELD_TABLE+HELD_TABLE_SIZE           ; 2460 -- already even, no pad needed
+ST_SIZE             equ     ST_STACKPTR+4                           ; 2464
 
 STACK_SIZE          equ     4096    ; generous headroom for a small
                                      ; polling task that only ever calls
@@ -769,6 +866,27 @@ TaskEntry:
         bra     .open_intuition
 .intuition_open:
 
+        ; keymap.library: MapANSI() (docs/input-protocol.md sec 15) is the
+        ; whole reason character events exist as their own driver
+        ; increment. Opened with the same non-fatal retry-yield idiom as
+        ; input.device/intuition.library above, so a CHAR_DOWN/CHAR_UP
+        ; drained before this loop ever returns is structurally
+        ; impossible -- unlike ~/src/amirfb, which treats a failed open as
+        ; merely non-fatal (its on_key drops the character instead), this
+        ; driver has no equivalent "keep running without it" path since
+        ; TaskEntry hasn't reached its main loop yet.
+.open_keymap:
+        move.l  ST_SYSBASE(a3),a6
+        lea     KeymapName(pc),a1
+        moveq   #0,d0
+        jsr     _LVOOpenLibrary(a6)
+        move.l  d0,ST_KEYMAPBASE(a3)
+        bne     .keymap_open
+        move.l  ST_GFXBASE(a3),a6
+        jsr     _LVOWaitTOF(a6)
+        bra     .open_keymap
+.keymap_open:
+
         move.l  ST_SYSBASE(a3),a6
         move.l  #INTB_PORTS,d0
         lea     ST_INT(a3),a1
@@ -929,7 +1047,20 @@ dispatch_one:
         beq     .button_up
         cmp.l   #EV_POINTER_MOTION,d2
         beq     .motion
+        cmp.l   #EV_CHAR_DOWN,d2
+        beq     .char_down
+        cmp.l   #EV_CHAR_UP,d2
+        beq     .char_up
         rts                               ; EV_NONE or unrecognised
+
+.char_down:
+        move.b  d3,d0
+        bsr     char_key_down
+        rts
+.char_up:
+        move.b  d3,d0
+        bsr     char_key_up
+        rts
 
 .key_down:
         move.b  d3,d0
@@ -1037,6 +1168,315 @@ dispatch_one:
         clr.l   IE_TIMESTAMP+4(a0)
         bra     write_event
 .no_screen:
+        rts
+
+*-----------------------------------------------------------------------------
+* Character events (docs/input-protocol.md sec 15) -- MapANSI()-based
+* typing, layered exactly the way ~/src/amirfb's src/amiga/rfb_server.c
+* on_key/amirfb_qualifier_hold/amirfb_qualifier_release do (BSD 2-Clause,
+* the project owner's own; cited throughout, not guessed at):
+*
+*   - char_key_down/char_key_up are this driver's on_key: press/release a
+*     character, held per Latin-1 byte in ST_HELD_TABLE rather than
+*     amirfb's per-keysym linear search (a byte fits a direct index).
+*   - qualifier_hold/qualifier_release are amirfb_qualifier_hold/
+*     amirfb_qualifier_release verbatim in spirit: refcounted per bit
+*     (ST_QREF_*), pressing/releasing a qualifier's own rawkey only on
+*     the 0->1 / 1->0 transition, so two characters that both need Shift
+*     don't fight over who gets to release it.
+*   - send_rawkey_raw is amirfb_send_rawkey: stamps the *current* combined
+*     ST_HELD_QUALIFIER (docs sec 7's "full current state, not just this
+*     event's own transition") onto every event this subsystem emits,
+*     including a qualifier's own press/release -- amirfb's own comment on
+*     amirfb_send_rawkey records a real bug this exact omission caused
+*     (Shift-down then 'e'-down with ie_Qualifier=0 on both typed a
+*     lowercase "echo", not "ECHO", since nothing told the OS Shift was
+*     down during the 'e' keypress itself).
+*
+* All of this shares ST_HELD_QUALIFIER with the plain KEY_DOWN/KEY_UP
+* path above rather than keeping a separate mask: the guest's real
+* Shift-key state is one boolean regardless of which event source
+* asserted it, and IE_QUALIFIER on every event this driver emits, of
+* either kind, must reflect that single combined truth (sec 7).
+*-----------------------------------------------------------------------------
+
+* Qualifier bits MapANSI() can ask this driver to hold, and the rawkey
+* that presses each -- amirfb's g_qualifier_keys[] table, transcribed as
+* explicit macro invocations rather than an indexed table to match this
+* file's own established style (modifier_bit_for_code/button_qualifier_bit/
+* rawmouse_code_for_button are all explicit chains). Rawkey values are the
+* same hardware-convention citation as modifier_bit_for_code's own table
+* above (Include_H ships no rawkeycodes.h) -- corroborated independently
+* by amirfb's own AMIGA_RAWKEY_* constants using the identical values.
+QHOLD_BIT MACRO
+        move.b  d2,d0
+        and.b   #\1,d0
+        beq     .qhskip\@
+        tst.b   \3(a3)
+        bne.s   .qhbump\@
+        move.b  #\1,d0
+        or.b    d0,ST_HELD_QUALIFIER+1(a3) ; low (guest-visible) byte of
+                                             ; the UWORD -- see key_down's
+                                             ; identical convention above
+        moveq   #\2,d3
+        moveq   #0,d4
+        bsr     send_rawkey_raw
+.qhbump\@:
+        addq.b  #1,\3(a3)
+.qhskip\@:
+        ENDM
+
+QRELEASE_BIT MACRO
+        move.b  d2,d0
+        and.b   #\1,d0
+        beq     .qrskip\@
+        tst.b   \3(a3)
+        beq     .qrskip\@                 ; already 0 -- defensive, should
+                                            ; not happen if hold/release
+                                            ; calls stay balanced
+        subq.b  #1,\3(a3)
+        bne     .qrskip\@                 ; still needed by another held
+                                            ; character -- do not release
+        move.b  #\1,d0
+        not.b   d0
+        and.b   d0,ST_HELD_QUALIFIER+1(a3)
+        moveq   #\2,d3
+        moveq   #1,d4
+        bsr     send_rawkey_raw
+.qrskip\@:
+        ENDM
+
+*-----------------------------------------------------------------------------
+* qualifier_hold/qualifier_release -- in: d2.b = the qualifier byte one
+* MapANSI() pair asked for (0 = none). a3=state, a6=SysBase must already
+* be valid. Preserve every register they touch (d0/d3/d4 here; the
+* QHOLD_BIT/QRELEASE_BIT macros above also use d0/d3/d4, nothing else) so
+* a caller mid-loop over several pairs never has to know these were
+* called at all.
+*-----------------------------------------------------------------------------
+qualifier_hold:
+        movem.l d0/d3-d4,-(sp)
+        QHOLD_BIT IEQUALIFIER_LSHIFT,$60,ST_QREF_LSHIFT
+        QHOLD_BIT IEQUALIFIER_RSHIFT,$61,ST_QREF_RSHIFT
+        QHOLD_BIT IEQUALIFIER_CONTROL,$63,ST_QREF_CONTROL
+        QHOLD_BIT IEQUALIFIER_LALT,$64,ST_QREF_LALT
+        QHOLD_BIT IEQUALIFIER_RALT,$65,ST_QREF_RALT
+        QHOLD_BIT IEQUALIFIER_LCOMMAND,$66,ST_QREF_LCOMMAND
+        QHOLD_BIT IEQUALIFIER_RCOMMAND,$67,ST_QREF_RCOMMAND
+        movem.l (sp)+,d0/d3-d4
+        rts
+
+qualifier_release:
+        movem.l d0/d3-d4,-(sp)
+        QRELEASE_BIT IEQUALIFIER_LSHIFT,$60,ST_QREF_LSHIFT
+        QRELEASE_BIT IEQUALIFIER_RSHIFT,$61,ST_QREF_RSHIFT
+        QRELEASE_BIT IEQUALIFIER_CONTROL,$63,ST_QREF_CONTROL
+        QRELEASE_BIT IEQUALIFIER_LALT,$64,ST_QREF_LALT
+        QRELEASE_BIT IEQUALIFIER_RALT,$65,ST_QREF_RALT
+        QRELEASE_BIT IEQUALIFIER_LCOMMAND,$66,ST_QREF_LCOMMAND
+        QRELEASE_BIT IEQUALIFIER_RCOMMAND,$67,ST_QREF_RCOMMAND
+        movem.l (sp)+,d0/d3-d4
+        rts
+
+*-----------------------------------------------------------------------------
+* send_rawkey_raw -- in: d3.b=rawkey code, d4.b=0(down)/nonzero(up).
+* a3=state, a6=SysBase must be valid. Builds an IECLASS_RAWKEY InputEvent
+* stamped with the *current* ST_HELD_QUALIFIER (sec 7's "full current
+* state" rule, amirfb_send_rawkey's identical convention -- see this
+* section's header comment for the live bug that rule guards against),
+* and IND_WRITEEVENTs it via the shared write_event tail. Preserves every
+* register except its own d0 scratch and the InputEvent-building a0, so a
+* caller mid-loop (char_key_down/_up's pair loops, qualifier_hold/
+* _release's own callers) never has to save anything around a call.
+*
+* NOTE: write_event uses a4 as scratch (ST_IOREQ) -- this clobbers
+* whatever a caller further up the chain (char_key_down/char_key_up) was
+* using a4 for. Both of those routines are written to only need a4's
+* value *before* the first call into this subroutine, never after --
+* see their own comments at the point a4 is (re)computed.
+*-----------------------------------------------------------------------------
+send_rawkey_raw:
+        movem.l d0-d2/a0-a2,-(sp)
+        moveq   #0,d0
+        move.b  d3,d0
+        tst.b   d4
+        beq.s   .down
+        or.b    #IECODE_UP_PREFIX,d0
+.down:
+        lea     ST_EVENTBUF(a3),a0
+        clr.l   IE_NEXTEVENT(a0)
+        move.b  #IECLASS_RAWKEY,IE_CLASS(a0)
+        clr.b   IE_SUBCLASS(a0)
+        move.w  d0,IE_CODE(a0)
+        move.w  ST_HELD_QUALIFIER(a3),IE_QUALIFIER(a0)
+        clr.w   IE_POSITION(a0)
+        clr.w   IE_POSITION+2(a0)
+        clr.l   IE_TIMESTAMP(a0)
+        clr.l   IE_TIMESTAMP+4(a0)
+        bsr     write_event
+        movem.l (sp)+,d0-d2/a0-a2
+        rts
+
+*-----------------------------------------------------------------------------
+* char_key_down -- in: d0.b = Latin-1 character byte (EVENT_CODE for
+* EV_CHAR_DOWN). a3=state, a6=SysBase must be valid.
+*
+* d6/d7 (the held-table byte offset and the character code itself) are
+* kept live across every call this routine makes -- MapANSI() and every
+* library/subroutine call below it preserve d2-d7/a2-a6 per the standard
+* AmigaOS calling convention this whole file already relies on elsewhere
+* (e.g. main_loop's a3 surviving Wait()), so this is not a new
+* assumption, just a new place leaning on it.
+*-----------------------------------------------------------------------------
+char_key_down:
+        moveq   #0,d7
+        move.b  d0,d7                    ; d7 = char code, kept live
+        move.l  d7,d6
+        mulu.w  #HELD_ENTRY_SIZE,d6      ; d6 = byte offset into ST_HELD_TABLE
+        lea     ST_HELD_TABLE(a3),a4
+        adda.l  d6,a4                    ; a4 = this char's held entry --
+                                          ; valid until the first bsr below
+                                          ; clobbers it via write_event
+
+        moveq   #0,d5                    ; d5 = 0: fresh press this call
+        tst.b   HK_NPAIRS(a4)
+        beq     .fresh
+        moveq   #1,d5                    ; d5 = 1: auto-repeat -- qualifiers
+        bra     .press                   ; already held, don't re-press them
+
+.fresh:
+        ; Ask MapANSI() to invert this character under whatever keymap is
+        ; currently active (docs sec 15; Autodocs keymap.doc SYNOPSIS:
+        ; actual=MapANSI(string,count,buffer,length,keyMap) in
+        ; D0/A0,D0,A1,D1,A2 -- confirmed against
+        ; Include_H/inline/keymap_protos.h's __reg() annotations, the
+        ; authoritative source this file's own header already cites for
+        ; every other LVO call in it, not just the autodoc prose).
+        move.b  d7,ST_MAPIN(a3)
+        move.l  ST_KEYMAPBASE(a3),d0
+        beq     .drop                    ; keymap.library never became
+                                          ; available -- TaskEntry's own
+                                          ; retry loop makes this
+                                          ; unreachable in practice, but
+                                          ; guarded rather than assumed
+        move.l  ST_KEYMAPBASE(a3),a6     ; MapANSI's inline stub wants
+                                          ; A6=KeymapBase, not SysBase
+        lea     ST_MAPIN(a3),a0          ; A0 = string
+        moveq   #1,d0                    ; D0 = count
+        lea     ST_MAPBUF(a3),a1         ; A1 = buffer
+        moveq   #NUM_MAP_PAIRS,d1        ; D1 = length, in PAIRS, per
+                                          ; Autodocs keymap.doc's own
+                                          ; "buffer size in bytes divided
+                                          ; by two" definition -- not bytes
+        suba.l  a2,a2                    ; A2 = keyMap = NULL (active/
+                                          ; default keymap)
+        jsr     _LVOMapANSI(a6)
+        move.l  ST_SYSBASE(a3),a6        ; restore -- everything after this
+                                          ; point expects A6=SysBase again
+        tst.l   d0
+        ble     .drop                    ; <=0: internal error / overflow /
+                                          ; ungeneratable under the active
+                                          ; keymap (Autodocs keymap.doc's
+                                          ; own RESULT/ERRORS section) --
+                                          ; dropped, not substituted, this
+                                          ; card's own "hostile input fails
+                                          ; cleanly" posture
+                                          ; (crates/machine-core/src/input.rs)
+        moveq   #NUM_MAP_PAIRS,d1
+        cmp.l   d1,d0
+        ble.s   .fits
+        move.l  d1,d0                    ; clamp -- this buffer only holds
+                                          ; NUM_MAP_PAIRS pairs; a longer
+                                          ; dead-key chain than that is not
+                                          ; expected for Latin-1 input, but
+                                          ; clamped defensively rather than
+                                          ; overrun HK_CODES/HK_QUALS
+.fits:
+        move.b  d0,HK_NPAIRS(a4)
+        lea     ST_MAPBUF(a3),a1
+        lea     HK_CODES(a4),a2
+        lea     HK_QUALS(a4),a0          ; A0 free again (string arg no
+                                          ; longer needed)
+        moveq   #0,d1
+        move.b  d0,d1
+.copy:
+        tst.l   d1
+        beq     .press
+        move.b  (a1)+,(a2)+              ; this pair's rawkey code
+        move.b  (a1)+,(a0)+              ; this pair's qualifier byte
+        subq.l  #1,d1
+        bra     .copy
+
+.press:
+        ; a4 is still this char's held entry here -- nothing between
+        ; .fresh's entry and here calls write_event, so it has not yet
+        ; been clobbered (see send_rawkey_raw's own NOTE above).
+        moveq   #0,d1
+        move.b  HK_NPAIRS(a4),d1
+        beq     .drop                    ; nothing to press (should not
+                                          ; happen: MapANSI already
+                                          ; returned <=0 above in that case)
+        lea     HK_CODES(a4),a0
+        lea     HK_QUALS(a4),a1
+.press_loop:
+        tst.l   d1
+        beq     .drop
+        move.b  (a1)+,d2                 ; this pair's qualifier byte
+        tst.b   d5
+        bne.s   .press_skip_qual         ; auto-repeat: qualifiers already
+                                          ; held (docs sec 15/amirfb)
+        bsr     qualifier_hold
+.press_skip_qual:
+        move.b  (a0)+,d3                 ; this pair's rawkey code
+        moveq   #0,d4                    ; down
+        bsr     send_rawkey_raw
+        subq.l  #1,d1
+        bra     .press_loop
+.drop:
+        rts
+
+*-----------------------------------------------------------------------------
+* char_key_up -- in: d0.b = Latin-1 character byte (EVENT_CODE for
+* EV_CHAR_UP). a3=state, a6=SysBase must be valid. Mirrors amirfb's own
+* on_key up-path: release each pair's main rawkey, then decrement that
+* pair's qualifiers, in that order (matches amirfb_send_rawkey(...,1)
+* immediately followed by amirfb_qualifier_release(...) in on_key).
+*-----------------------------------------------------------------------------
+char_key_up:
+        moveq   #0,d7
+        move.b  d0,d7
+        move.l  d7,d6
+        mulu.w  #HELD_ENTRY_SIZE,d6      ; d6 = byte offset into ST_HELD_TABLE
+                                          ; -- kept live -- recomputed into a4
+                                          ; again after the loop below,
+                                          ; since send_rawkey_raw's own
+                                          ; write_event clobbers a4 on the
+                                          ; first iteration
+        lea     ST_HELD_TABLE(a3),a4
+        adda.l  d6,a4
+
+        moveq   #0,d1
+        move.b  HK_NPAIRS(a4),d1
+        beq     .cu_done                 ; up with no matching down --
+                                          ; nothing to release (amirfb's
+                                          ; on_key: "hk == NULL -> return")
+        lea     HK_CODES(a4),a0
+        lea     HK_QUALS(a4),a1
+.cu_loop:
+        tst.l   d1
+        beq     .cu_finish
+        move.b  (a0)+,d3
+        moveq   #1,d4                    ; up
+        bsr     send_rawkey_raw
+        move.b  (a1)+,d2
+        bsr     qualifier_release
+        subq.l  #1,d1
+        bra     .cu_loop
+.cu_finish:
+        lea     ST_HELD_TABLE(a3),a4     ; a4 was clobbered by write_event
+        adda.l  d6,a4                    ; inside the loop above -- recompute
+        clr.b   HK_NPAIRS(a4)            ; before touching it again
+.cu_done:
         rts
 
 *-----------------------------------------------------------------------------
@@ -1169,6 +1609,9 @@ InputDevName:
         even
 IntuitionName:
         dc.b    "intuition.library",0
+        even
+KeymapName:
+        dc.b    "keymap.library",0
         even
 
 * End of file. See this file's header for what this increment does and
