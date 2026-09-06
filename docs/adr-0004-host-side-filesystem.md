@@ -5,7 +5,11 @@
 **Context:** ADR-0003 (which named the ceiling this removes);
 `docs/storage.md` ("Booting AROS from an AROS-built image");
 `~/src/emulator_disk_speed/REPORT.md` (Copperline storage-backend
-matrix, the measurements that motivated this).
+matrix, the measurements that motivated this);
+[AmiPart](https://github.com/ChuckyGang/AmiPart) (MIT — a C RDB
+partition editor with filesystem-driver block support that builds both
+as a native AmigaOS tool and as a Linux CLI over hdf files: a readable
+reference for the RDB/FSHD layer, and same-code-many-hosts proven in C).
 
 ---
 
@@ -71,10 +75,16 @@ disk; a crate that pretended otherwise would have no coherent API.
   image dead-end (`docs/storage.md`) was a DOS\7 volume nothing in the
   guest ROM could read; a DOS\3-only crate rebuilds that wall.
 
-**Write support is staged.** Read-only first — enough to serve SYS: and
-measure — because the write path is where images get corrupted. Writes
-land only behind a differential suite: mutate through guest packets,
-verify from outside with xdftool (GPL: run as oracle, never copy).
+**Three entry points, staged by risk.** *Mount existing* and
+*create-from-tree* first; *mutate in place* last. Creation is write-path
+code with nothing to corrupt — build a fresh image from a host tree,
+read it straight back, diff the trees — so it is both the safest write
+code to ship first and the best test vector for the read path. It is
+also the API external consumers actually want: Copperline creates
+OFS/FFS drives dynamically from directories today, and amibake's
+dir-to-hdf build is the same operation again. In-place mutation lands
+only behind a differential suite: mutate through guest packets, verify
+from outside with xdftool (GPL: run as oracle, never copy).
 `nondistribution/aros/aros.hdf` (via `tools/amibake/aros.toml`) is a
 fully redistributable DOS\7 fixture, so this suite can run in CI where
 no licensed image can.
