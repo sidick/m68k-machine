@@ -207,6 +207,42 @@ Phase 4 measurements this ADR is deferred to will speak to throughput,
 not to whether the drivers can be written at all, which is the actual
 ARM constraint.
 
+### The trigger for ARM is SystemReady, and it is testable
+
+The reframing above is not a permanent verdict against ARM bare metal —
+it is a verdict against ARM bare metal *on boards that ship vendor
+U-Boot and undocumented blocks*. Arm's SystemReady programme and EBBR
+change that: a SystemReady board boots **UEFI**, and a UEFI board hands
+us GOP for display, `EFI_SIMPLE_TEXT_INPUT_PROTOCOL` for keyboard, and
+Block I/O for storage — the same standard surface x86 already gives us,
+from the same specification.
+
+So the trigger is a property of the board, not a judgement call:
+**does the target ship SystemReady-class firmware?** If yes, ARM moves
+toward the bare-metal column; if it ships U-Boot and a device tree, it
+stays in the Linux column, because the constraint there was never effort
+but missing documentation.
+
+**And the work already done transfers.** `aarch64-unknown-uefi` is a
+supported Rust target, and every UEFI protocol this project uses is
+architecture-neutral. `board-qemu-q35` is therefore not "the x86 board"
+in any deep sense — it is *the UEFI board*, which happens to be built
+for x86 today. On a SystemReady ARM machine most of it should be a
+retarget rather than a rewrite.
+
+That materially changes the cost of option A on ARM, and in a direction
+nothing else in this ADR does. Every other ARM cost recorded here is
+per-board and does not amortise; this one amortises across every
+SystemReady board *and* shares its implementation with x86. It is worth
+weighing at Phase 5 against a native RK3588 layer, which by construction
+serves exactly one SoC.
+
+The honest caveat: SystemReady adoption is uneven, and neither of this
+project's named ARM targets currently qualifies. The Rock 5B boots
+U-Boot; the Pi 5 can run EDK2 but that is not its default. So this is a
+trigger to watch rather than a plan to act on — and a reason to keep the
+UEFI board layer clean of x86 assumptions, which costs nothing today.
+
 ## Recommendation
 
 **Still open — deliberately not decided here.** Option B buys roughly a
