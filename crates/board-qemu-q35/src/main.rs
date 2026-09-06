@@ -45,11 +45,18 @@ use uefi::prelude::*;
 use uefi::proto::console::gop::{BltOp, BltPixel, BltRegion, GraphicsOutput};
 
 /// COM1 I/O port base, per the standard PC UART memory map.
+///
+/// x86 only: there is no PC-compatible UART at a fixed I/O port on other
+/// UEFI targets, and the diagnostics path falls back to the UEFI console
+/// there (see `serial_write_byte`).
+#[cfg(target_arch = "x86_64")]
 const COM1_PORT: u16 = 0x3F8;
 
 /// Line Status Register offset from the UART base; bit 5 (`0x20`) is
 /// Transmit Holding Register Empty (THRE).
+#[cfg(target_arch = "x86_64")]
 const LSR_OFFSET: u16 = 5;
+#[cfg(target_arch = "x86_64")]
 const LSR_THRE: u8 = 0x20;
 
 /// Read one byte from an x86 I/O port.
@@ -58,6 +65,7 @@ const LSR_THRE: u8 = 0x20;
 /// The caller must ensure `port` is a valid, safe-to-read I/O port for the
 /// current platform. This module only ever calls it with the fixed COM1
 /// port numbers above, which is always safe to probe under QEMU/OVMF.
+#[cfg(target_arch = "x86_64")]
 unsafe fn inb(port: u16) -> u8 {
     let value: u8;
     unsafe {
@@ -72,6 +80,7 @@ unsafe fn inb(port: u16) -> u8 {
 /// The caller must ensure `port` is a valid, safe-to-write I/O port for the
 /// current platform. This module only ever calls it with the fixed COM1
 /// port numbers above, which is always safe to drive under QEMU/OVMF.
+#[cfg(target_arch = "x86_64")]
 unsafe fn outb(port: u16, value: u8) {
     unsafe {
         asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
@@ -83,6 +92,7 @@ unsafe fn outb(port: u16, value: u8) {
 /// Polled and blocking: fine for a low-volume Phase 0 hello banner, not
 /// meant to be a real serial driver (that lands, if ever needed, with the
 /// rest of the chipset in later phases).
+#[cfg(target_arch = "x86_64")]
 fn serial_write_byte(byte: u8) {
     // SAFETY: COM1_PORT + LSR_OFFSET is the fixed, well-known Line Status
     // Register address for the first PC-compatible UART; reading it has no
@@ -94,6 +104,26 @@ fn serial_write_byte(byte: u8) {
     // first PC-compatible UART.
     unsafe { outb(COM1_PORT, byte) };
 }
+
+/// The same, where there is no PC-compatible UART at a fixed I/O port --
+/// which is every non-x86 UEFI target.
+///
+/// This board is *the UEFI board*, not the x86 board: every protocol it
+/// uses (GOP for display, boot services for allocation) is
+/// architecture-neutral, and `aarch64-unknown-uefi` is a supported Rust
+/// target, so a SystemReady ARM machine should be a retarget rather than
+/// a rewrite (ADR 0001, "The trigger for ARM is SystemReady"). Building
+/// for aarch64 established that claim is very nearly true: the *only*
+/// x86-specific code in this crate was the four `in`/`out` instructions
+/// above. Gating them keeps that true rather than letting it rot.
+///
+/// Diagnostics still reach the UEFI console on every target -- this
+/// board already prints to both, which is why q35's serial log shows
+/// each line twice -- so nothing is lost here beyond the second copy.
+/// A UEFI Serial I/O Protocol path would restore it portably if a
+/// non-x86 target ever needs the serial capture that CI greps on q35.
+#[cfg(not(target_arch = "x86_64"))]
+fn serial_write_byte(_byte: u8) {}
 
 /// Write a string to the COM1 serial port, translating `\n` to `\r\n` so
 /// terminal capture (e.g. `-serial stdio`) renders lines correctly.
@@ -283,6 +313,7 @@ mod heapless_line {
 /// `no_std` payload installs an IDT to report one legibly, so it is worth
 /// ruling out up front rather than debugging blind if AROS ever stalls
 /// immediately after `CpuCore::new()`.
+#[cfg(target_arch = "x86_64")]
 fn enable_sse() {
     unsafe {
         let mut cr0: u64;
@@ -297,6 +328,13 @@ fn enable_sse() {
         asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
     }
 }
+
+/// Nothing to do off x86: `cr0`/`cr4` do not exist, and the aarch64 UEFI
+/// environment is required to hand a payload a usable floating-point and
+/// SIMD state already -- the same guarantee this function leans on for
+/// x86, where it is defensive rather than corrective (see above).
+#[cfg(not(target_arch = "x86_64"))]
+fn enable_sse() {}
 
 #[entry]
 fn main() -> Status {
@@ -322,7 +360,19 @@ fn main() -> Status {
     // would then fall through to a boot menu or reset -- `hlt` looping
     // here is simpler and matches board-qemu-virt).
     loop {
-        unsafe { asm!("hlt", options(nomem, nostack)) };
+        // `hlt` on x86, `wfi` on aarch64 -- the same "park until an
+        // interrupt that will never come" idle, spelled differently. The
+        // only other architecture-specific line in this crate, and worth
+        // gating rather than replacing with a spin: a busy loop would peg
+        // a core for the whole run.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            asm!("hlt", options(nomem, nostack))
+        };
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            asm!("wfi", options(nomem, nostack))
+        };
     }
 }
 
