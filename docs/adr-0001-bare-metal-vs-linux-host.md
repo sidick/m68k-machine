@@ -237,11 +237,47 @@ SystemReady board *and* shares its implementation with x86. It is worth
 weighing at Phase 5 against a native RK3588 layer, which by construction
 serves exactly one SoC.
 
-The honest caveat: SystemReady adoption is uneven, and neither of this
-project's named ARM targets currently qualifies. The Rock 5B boots
-U-Boot; the Pi 5 can run EDK2 but that is not its default. So this is a
-trigger to watch rather than a plan to act on — and a reason to keep the
-UEFI board layer clean of x86 assumptions, which costs nothing today.
+**Demonstrated, not argued** (2026-09-06). The same UEFI board crate,
+built for `aarch64-unknown-uefi` and booted under EDK2 on QEMU's ARM
+`virt`, runs AROS for 4,274,371 m68k instructions and presents through
+GOP at 1280x800 — the identical instruction count the x86 build reaches.
+The entire x86-specific surface was four `cfg`-gated items: COM1 port
+I/O and its constants, an `enable_sse` that pokes `cr0`/`cr4`, and the
+`hlt` idle (`wfi` on aarch64). Nothing else needed touching.
+
+**And the trigger has already fired for the Rock 5B.** The caveat this
+paragraph used to carry — that neither named ARM target qualifies, the
+Rock 5B booting U-Boot — is out of date. `edk2-porting/edk2-rk3588`
+provides EDK2 UEFI firmware for RK3588 boards with the Rock 5B in its
+**Platinum** support tier, and reports GOP graphics output, USB 3/2/1.1,
+PCIe 3.0/2.1, SATA and SD/eMMC all working, in both ACPI and device-tree
+modes. BSD-2-Clause-Patent, with some GPL-2.0 components carried from
+Linux and U-Boot — which does not reach a payload that merely runs on
+it.
+
+That is the whole device set this project needs on ARM, from standard
+protocols, without writing a single RK3588 driver: GOP for display,
+`EFI_SIMPLE_TEXT_INPUT_PROTOCOL` over working USB for keyboard, and
+Block I/O over SD/eMMC or NVMe for storage. Precisely the drivers the
+"undocumented vendor blocks" argument above says are expensive to own.
+
+Three things to keep honest about it:
+
+- It claims no SystemReady compliance. It is a **community port**, so
+  this trades a vendor-documentation dependency for a third-party
+  firmware dependency — better, but not the same as a standard the
+  board ships with.
+- Relying on it means staying in boot services, so firmware drivers
+  remain live under a long-running payload. Unusual, though it is
+  already exactly what the q35 board does.
+- Its own notes say there are no plans to improve ACPI for non-Windows
+  operating systems. Immaterial while we use GOP and Block I/O rather
+  than enumerating hardware through ACPI, but it bounds how far the
+  ACPI mode can be leaned on later.
+
+So the reframing above stands, with its ARM verdict narrowed further:
+the case for a Linux host on ARM rests on *vendor U-Boot boards*, and
+the Rock 5B need not be one of them.
 
 ## Recommendation
 
