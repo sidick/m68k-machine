@@ -7,7 +7,10 @@ including all 256 minterms checked against an independently written truth
 table). This document covers the differential half, implemented in
 `crates/machine-hosted/tests/blitter_differential.rs`.
 
-**Bottom line: all 1,245 cases agree exactly with Copperline 0.18.0.**
+**Bottom line: all 1,245 cases agree exactly with Copperline 0.19.0.**
+Re-verified against 0.19.0 (the installed stable release as of this
+update) rather than assumed carried over from the original 0.18.0 run:
+1,245 cases, 0 divergences, an identical result to that original run.
 1,245 cases -- 424 randomised (minterms, channel-enable
 combinations, shifts, masks, fill modes, modulos/sizes, and line-mode
 octants), 30 area-mode and 791 line-mode distinct register signatures
@@ -39,7 +42,9 @@ deleted either.
 cargo test -p machine-hosted --test blitter_differential -- --ignored --nocapture
 ```
 
-Needs `copperline` (0.18.0 tested) on `PATH`. Skips cleanly (prints
+Needs `copperline` (0.19.0 tested; originally verified against 0.18.0,
+re-verified against 0.19.0 with an identical result -- see the bottom
+line above) on `PATH`. Skips cleanly (prints
 `SKIP: ...`, does not fail) if it isn't found, the same convention
 `crates/machine-hosted/tests/real_rom.rs` uses for its ROM-dependent
 tests. It is `#[ignore]`d, so it never runs under a bare `cargo test`.

@@ -623,6 +623,7 @@ pub fn read_mirrored(image: &[u8], base: u32, address: u32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::string::String;
     use std::vec;
     use std::vec::Vec;
 
@@ -922,11 +923,67 @@ mod tests {
 
     // ---- real ROM image tests --------------------------------------
     //
-    // These read fixed absolute paths to non-redistributable ROM images
-    // that only exist on this developer's machine (or similar external
-    // checkouts). They must never fail CI on a machine without them, so
-    // each one is guarded by `load_rom`, which logs and returns `None`
-    // rather than panicking when the file is absent.
+    // These exist to check `identify()` against real ROM images, not
+    // just the synthetic fixtures built above -- a parser that only
+    // ever agrees with its own hand-built test data hasn't proven it
+    // agrees with anything a real Amiga ever shipped.
+    //
+    // This module used to read ten absolute paths into three other
+    // checkouts (`~/src/external/Copperline`, `~/src/amirfb`,
+    // `~/src/amibake`) and assert an exact revision against whatever it
+    // found there. Those checkouts move independently of this project:
+    // Copperline's own vendored AROS pair was rebuilt at some point
+    // after these assertions were written, and its exec.library
+    // advanced from 51.8 to 51.9 -- a change to a fixture we do not
+    // control, breaking a test that had nothing to do with it. Every
+    // test here now resolves its fixture from a location this project
+    // actually owns or controls the update cadence of:
+    //
+    // - The AROS 68k ROM pair is freely redistributable and vendored in
+    //   this repository at `assets/aros/` (see
+    //   `assets/aros/PROVENANCE.md`), which is why its tests below run
+    //   unconditionally (no file to be missing) and assert exact
+    //   revisions: we own this file, so it can only change when we
+    //   deliberately refresh it (`scripts/fetch-aros-rom.sh`), in the
+    //   same commit as the assertions below.
+    // - Every Kickstart image is a vendor's licensed property and
+    //   cannot live in this repository. These resolve from
+    //   `nondistribution/` (see `nondistribution/README.md`),
+    //   overridable per-fixture by an environment variable, and skip
+    //   cleanly -- print, don't fail -- when the file is absent, so a
+    //   clean clone with no licensed media still goes green. (None of
+    //   the specific filenames below are populated in
+    //   `nondistribution/` yet; a developer who wants this coverage
+    //   drops the file in, or points the environment variable at an
+    //   existing copy, and adds a line to that directory's README.)
+    //
+    // A second, subtler bug lived alongside the rotted paths: a test
+    // named for a *release* ("Kickstart 3.1") asserted the exact
+    // revision of *one machine's* ROM. Kickstart 3.1 genuinely shipped
+    // as both 40.63 (e.g. the A4000) and 40.68 (e.g. the A1200)
+    // depending on the machine; neither is more "3.1" than the other.
+    // `real_kickstart_3_1`/`real_kickstart_3_2` below now assert only
+    // what the name actually implies -- kind, major version,
+    // bootability, checksum validity -- and say so in their doc
+    // comments. Tests whose name and fixture already pin one specific,
+    // individually-built image (`kickstart-47.7.rom`,
+    // `kickstart-34.5.rom`, `kickstart-46.143.rom` -- each an
+    // intentionally reproducible `tools/amibake` output, not "a 3.x
+    // ROM" in the abstract) keep their exact assertions: there the test
+    // is that this named file is what it claims to be, which is a
+    // legitimate thing to pin.
+    //
+    // One outright duplicate was found and deleted rather than fixed:
+    // `real_kickstart_1_3_doubled_is_too_old_for_zorro_iii` (via
+    // `~/src/external/Copperline/test-assets/KICK13.ROM`) and
+    // `real_kickstart_34_5_doubled_is_too_old_for_zorro_iii` (via
+    // `~/src/amibake/assets/roms/kickstart-34.5.rom`) asserted the
+    // identical thing -- same 34.5 image, same doubled layout, same
+    // `TooOldForZorroIII` rejection -- against what the old comments
+    // already admitted was "the same 34.5 image under a different
+    // filename/source". One of the two now stands as
+    // `real_kickstart_34_5_doubled_is_too_old_for_zorro_iii` below;
+    // nothing is lost by dropping its twin.
 
     fn load_rom(path: &str) -> Option<Vec<u8>> {
         match std::fs::read(path) {
@@ -938,11 +995,44 @@ mod tests {
         }
     }
 
+    /// Resolve a licensed-ROM fixture this repo cannot carry: an
+    /// environment variable if the caller sets one, otherwise
+    /// `nondistribution/` at the repo root (see
+    /// `nondistribution/README.md`). Mirrors
+    /// `crates/machine-hosted/tests/real_rom.rs`'s `fixture()` helper --
+    /// same shape, same reasoning: resolving relative to
+    /// `CARGO_MANIFEST_DIR` keeps the path stable across machines, so
+    /// absence means "this machine has no media" rather than "the path
+    /// rotted under someone else's checkout".
+    fn nondistribution_fixture(env_var: &str, name: &str) -> String {
+        if let Ok(path) = std::env::var(env_var) {
+            return path;
+        }
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../nondistribution")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The AROS 68k main ROM, vendored in-repo -- see
+    /// `assets/aros/PROVENANCE.md`. Freely redistributable, so this
+    /// (unlike every Kickstart fixture below) is not optional: if this
+    /// path doesn't resolve, the repository itself is incomplete.
+    const AROS_MAIN: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../assets/aros/aros-amiga-m68k-rom.bin"
+    );
+    /// The AROS 68k extended ROM. See [`AROS_MAIN`].
+    const AROS_EXT: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../assets/aros/aros-amiga-m68k-ext.bin"
+    );
+
     #[test]
     fn real_a1200_kickstart_3_2_2() {
-        let Some(image) =
-            load_rom("/Users/simond/src/amirfb/nondistribution/roms/A1200.47.115.rom")
-        else {
+        let rom = nondistribution_fixture("M68K_TEST_KICKSTART", "A1200.47.115.rom");
+        let Some(image) = load_rom(&rom) else {
             return;
         };
         let info = identify(&image).expect("A1200 3.2.2 ROM should have a valid header");
@@ -955,13 +1045,13 @@ mod tests {
         assert!(info.checksum_ok);
     }
 
+    /// `identify()` against the vendored AROS main ROM. Runs
+    /// unconditionally -- see the module-level doc comment on why this
+    /// fixture, unlike every Kickstart one below, is never expected to
+    /// be absent.
     #[test]
     fn real_aros_main_rom() {
-        let Some(image) =
-            load_rom("/Users/simond/src/external/Copperline/assets/aros/aros-amiga-m68k-rom.bin")
-        else {
-            return;
-        };
+        let image = load_rom(AROS_MAIN).expect("AROS main ROM is vendored in-repo (assets/aros/)");
         let info = identify(&image).expect("AROS main ROM should have a valid header");
         assert_eq!(info.kind, RomKind::Aros);
         assert_eq!(info.rev, (46, 12));
@@ -970,17 +1060,17 @@ mod tests {
         assert!(info.checksum_ok);
         // The header's own exec_rev claim (46, 12) undersells what's
         // actually inside; the resident-derived version is what the
-        // running OS reports.
-        assert_eq!(info.exec_rev, (51, 8));
+        // running OS reports. Confirmed against this exact vendored
+        // file's own `PROVENANCE.md` ("Local verification" section) --
+        // 51.9, not the 51.8 an earlier revision of this ROM reported.
+        assert_eq!(info.exec_rev, (51, 9));
     }
 
+    /// `identify()` against the vendored AROS extended ROM. See
+    /// [`real_aros_main_rom`].
     #[test]
     fn real_aros_ext_rom() {
-        let Some(image) =
-            load_rom("/Users/simond/src/external/Copperline/assets/aros/aros-amiga-m68k-ext.bin")
-        else {
-            return;
-        };
+        let image = load_rom(AROS_EXT).expect("AROS ext ROM is vendored in-repo (assets/aros/)");
         let info = identify(&image).expect("AROS ext ROM should have a valid header");
         assert_eq!(info.kind, RomKind::Aros);
         assert_eq!(info.rev, (46, 11));
@@ -993,38 +1083,58 @@ mod tests {
         assert_eq!(info.exec_rev, (46, 11));
     }
 
+    /// A Kickstart 3.1 ROM -- deliberately *not* one exact image.
+    /// Kickstart 3.1 genuinely shipped as both 40.63 (e.g. the A4000)
+    /// and 40.68 (e.g. the A1200) depending on the machine; both are
+    /// real, correct 3.1 ROMs, and pinning either one as "the" 3.1
+    /// revision would fail on a legitimate image of the other. This
+    /// asserts what `identify()` is actually responsible for getting
+    /// right for *any* 3.1 image: major version, kind, bootability, and
+    /// checksum validity -- not which specific machine it shipped on.
     #[test]
     fn real_kickstart_3_1() {
-        let Some(image) = load_rom("/Users/simond/src/external/Copperline/test-assets/KICK31.ROM")
-        else {
+        let rom = nondistribution_fixture("M68K_TEST_KICKSTART_3_1", "kickstart-3.1.rom");
+        let Some(image) = load_rom(&rom) else {
             return;
         };
         let info = identify(&image).expect("Kickstart 3.1 should have a valid header");
         assert_eq!(info.kind, RomKind::Kickstart);
-        assert_eq!(info.rev, (40, 63));
-        assert_eq!(info.exec_rev, (40, 10));
+        assert_eq!(info.rev.0, 40, "Kickstart 3.1 is ROM version 40");
         assert!(info.bootable);
         assert!(info.checksum_ok);
+        assert_eq!(info.supported, Ok(()));
     }
 
+    /// A Kickstart 3.2 ROM. Same reasoning as [`real_kickstart_3_1`]:
+    /// AmigaOS 3.2's point releases (3.2, 3.2.1, 3.2.2, ...) span
+    /// several distinct ROM revisions under the one version number 47,
+    /// so this asserts the shape any of them must have, not one exact
+    /// revision. (`real_a1200_kickstart_3_2_2` above is the deliberately
+    /// exact counterpart: it names one specific point release and pins
+    /// its one specific file.)
     #[test]
     fn real_kickstart_3_2() {
-        let Some(image) = load_rom("/Users/simond/src/external/Copperline/test-assets/KICK32.ROM")
-        else {
+        let rom = nondistribution_fixture("M68K_TEST_KICKSTART_3_2", "kickstart-3.2.rom");
+        let Some(image) = load_rom(&rom) else {
             return;
         };
         let info = identify(&image).expect("Kickstart 3.2 should have a valid header");
         assert_eq!(info.kind, RomKind::Kickstart);
-        assert_eq!(info.rev, (47, 95));
-        assert_eq!(info.exec_rev, (47, 7));
+        assert_eq!(info.rev.0, 47, "Kickstart 3.2 is ROM version 47");
         assert!(info.bootable);
         assert!(info.checksum_ok);
+        assert_eq!(info.supported, Ok(()));
     }
 
+    /// One specific, individually-built ROM (`tools/amibake`'s
+    /// `kickstart-47.7.rom` output) -- unlike the two tests above, this
+    /// names one exact reproducible artifact, so pinning its exact
+    /// revision is legitimate: the test is "this named file is what it
+    /// claims to be", not "any 3.2 ROM has this revision".
     #[test]
     fn real_kickstart_47_7() {
-        let Some(image) = load_rom("/Users/simond/src/amibake/assets/roms/kickstart-47.7.rom")
-        else {
+        let rom = nondistribution_fixture("M68K_TEST_KICKSTART_47_7", "kickstart-47.7.rom");
+        let Some(image) = load_rom(&rom) else {
             return;
         };
         let info = identify(&image).expect("kickstart-47.7.rom should have a valid header");
@@ -1035,42 +1145,35 @@ mod tests {
         assert!(info.checksum_ok);
     }
 
+    /// Kickstart 1.3, ROM revision 34.5 -- one specific, well-known
+    /// image (distributed as a 256 KB image doubled to fill a 512 KB
+    /// EEPROM footprint, see `doubled_copy`'s doc comment), and this
+    /// project's real-world regression case for
+    /// [`Unsupported::TooOldForZorroIII`].
     #[test]
-    fn real_kickstart_1_3_doubled_is_too_old_for_zorro_iii() {
-        // KICK13.ROM: Kickstart 1.3, 34.5, distributed as a 256 KB image
-        // doubled to fill a 512 KB file (see module-level doc comment).
-        let Some(image) = load_rom("/Users/simond/src/external/Copperline/test-assets/KICK13.ROM")
-        else {
+    fn real_kickstart_34_5_doubled_is_too_old_for_zorro_iii() {
+        let rom = nondistribution_fixture("M68K_TEST_KICKSTART_34_5", "kickstart-34.5.rom");
+        let Some(image) = load_rom(&rom) else {
             return;
         };
         assert_eq!(image.len(), 512 * 1024);
-        let info = identify(&image).expect("doubled 1.3 image should still identify");
-        assert!(info.doubled, "KICK13.ROM is a 256K image doubled to 512K");
+        let info = identify(&image).expect("doubled 34.5 image should still identify");
+        assert!(
+            info.doubled,
+            "kickstart-34.5.rom is a 256K image doubled to 512K"
+        );
         assert_eq!(info.size, 512 * 1024);
         assert_eq!(info.rev, (34, 5));
         assert_eq!(info.supported, Err(Unsupported::TooOldForZorroIII));
     }
 
-    #[test]
-    fn real_kickstart_34_5_doubled_is_too_old_for_zorro_iii() {
-        // Same 34.5 image under a different filename/source; same doubled
-        // layout and the same rejection reason.
-        let Some(image) = load_rom("/Users/simond/src/amibake/assets/roms/kickstart-34.5.rom")
-        else {
-            return;
-        };
-        assert_eq!(image.len(), 512 * 1024);
-        let info = identify(&image).expect("doubled 34.5 image should still identify");
-        assert!(info.doubled);
-        assert_eq!(info.rev, (34, 5));
-        assert_eq!(info.supported, Err(Unsupported::TooOldForZorroIII));
-    }
-
+    /// Another individually-built, exactly-named `tools/amibake` output
+    /// -- see [`real_kickstart_47_7`]'s doc comment for why an exact
+    /// pin is legitimate here.
     #[test]
     fn real_kickstart_46_143_is_byte_swapped_and_corrects_to_a_valid_checksum() {
-        let Some(mut image) =
-            load_rom("/Users/simond/src/amibake/assets/roms/kickstart-46.143.rom")
-        else {
+        let rom = nondistribution_fixture("M68K_TEST_KICKSTART_46_143", "kickstart-46.143.rom");
+        let Some(mut image) = load_rom(&rom) else {
             return;
         };
 
@@ -1103,9 +1206,8 @@ mod tests {
         // A1200.47.115.rom is already correct (not swapped); prove the
         // swap/unswap machinery is lossless against a real, large,
         // non-synthetic image, not just the small synthetic fixtures.
-        let Some(original) =
-            load_rom("/Users/simond/src/amirfb/nondistribution/roms/A1200.47.115.rom")
-        else {
+        let rom = nondistribution_fixture("M68K_TEST_KICKSTART", "A1200.47.115.rom");
+        let Some(original) = load_rom(&rom) else {
             return;
         };
         let original_info = identify(&original).expect("valid header");
