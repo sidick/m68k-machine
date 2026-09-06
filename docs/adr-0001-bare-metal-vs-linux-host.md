@@ -106,10 +106,7 @@ What survives is narrower: exiting boot services, which a long-running
 bare-metal payload normally wants in order to own the memory map and
 silence the firmware's timer and watchdog, costs `SetMode` along with
 it. That is a real trade against option A, but it is a choice about when
-to exit rather than a property of bare metal.
-Whether the guest can change resolution without restarting the machine
-is user-visible behaviour rather than an implementation detail, and it
-falls out differently under A than under B. See ADR 0002's "Mode
+to exit rather than a property of bare metal. See ADR 0002's "Mode
 setting, and what it means for ADR 0001".
 
 ### B. Linux-as-firmware — the Amithlon model
