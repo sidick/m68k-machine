@@ -18,9 +18,16 @@
 # interactively by starting the server by hand once no soak is running.
 # What differs is only that nothing starts it at boot.
 #
-# devsoak is not started at boot either, and deliberately: it overwrites
-# every sector in the range it is given, so a boot-time run would be
-# destructive on every start.
+# devsoak IS started at boot here, which is only safe because of two
+# things that arrived together. It runs in devsoak 1.1's partition mode
+# -- a positional `DH1:` makes the partition's own extent the range, so
+# there is no hand-computed sector range to get wrong, and no way to
+# name a range that reaches past the partition into DH0. And its
+# confirmation tiers escalate by what is actually on the target: `-y`
+# skips the prompt for an unrecognisable or merely formatted partition,
+# but a **live mounted volume** makes devsoak refuse the run outright
+# rather than proceed. So a misconfigured manifest cannot destroy a
+# filesystem someone is using; the worst case is a refusal.
 #
 # [hdf].scratch gives it somewhere safe to do that. It reserves a second,
 # unformatted DH1 partition at the end of the disk -- a real RDB entry,
@@ -47,3 +54,13 @@ output   = ["hdf"]
 
 [hdf]
 scratch = "8M"
+
+# The soak itself. `-o ser` emits through RawPutChar, which is why
+# nothing may hold serial.device on this image (see above); the runner
+# captures it. `-K` is driver-under-test mode: ignore the quirks file
+# entirely, since a quirk entry for our own driver would be us excusing
+# our own bug. detach so a 30s soak does not hold up the boot script.
+[[run]]
+command = "C:devsoak"
+args    = "DH1: -d -t 30s -y -K -o ser"
+detach  = true

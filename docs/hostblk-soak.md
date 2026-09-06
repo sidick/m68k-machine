@@ -40,17 +40,45 @@ this project's own RDB mounter offers `DH0` as the boot node and `DH1`
 as a non-bootable one, and Workbench shows a third icon reading
 `DH1:Uninitialized` — no requester, no stall.
 
-Point devsoak at that partition's sectors, which `rdbtool <image> info`
-reports (`DH1` starting at cylinder 640 with 32 blocks per cylinder is
-block 20480, for 16384 sectors):
+The soak now runs **unattended**: the manifest's `[[run]]` entry starts
+it at boot, so building the image and booting it is the whole procedure.
 
-```
-C:devsoak hostblk.device 0 -d -r 20480,16384 -t 30s -y -K -o ser
+```toml
+[[run]]
+command = "C:devsoak"
+args    = "DH1: -d -t 30s -y -K -o ser"
+detach  = true
 ```
 
-devsoak is gaining volume-name support, which will retire that
-arithmetic entirely — naming `DH1` is both safer and clearer than a
-sector range that is only correct for one image's geometry.
+Two things arriving together made autostarting a destructive test
+acceptable, and neither alone would have been enough.
+
+**Partition mode.** A positional `DH1:` makes the partition's own extent
+the range. devsoak resolves it itself — the run log reads `DH1: =
+hostblk.device unit 0, partition sectors 20480..36864` — so there is no
+hand-computed range to get wrong, and no way to name one that reaches
+past the partition into `DH0`. The arithmetic this replaced was correct
+only for one image's geometry and would have silently become wrong the
+moment `DH0` grew.
+
+**Confirmation tiers that escalate by what is actually there.** `-y`
+skips the prompt for an unrecognisable or merely formatted partition,
+but a **live mounted volume** makes devsoak *refuse* the run rather than
+proceed. So a misconfigured manifest cannot destroy a filesystem someone
+is using; the worst case is a refusal. devsoak also inhibits the
+partition for the duration, blocking filesystem access while it writes.
+
+`-K` is driver-under-test mode — ignore the quirks file entirely, since
+a quirk entry describing our own driver would be us excusing our own
+bug.
+
+### Result
+
+`RESULT PASS`, 0 errors, 4 matrix passes with 0 failures and 0 warnings,
+initial and final audits clean over 16,384 sectors, all three dialects
+(`CMD`, `TD64`, `NSD64`) exercised, and **`quirks: 0 applied`** — §13's
+stated criterion, since needing a `maxinflight` entry would have meant
+the driver was not self-limiting against `SUBMIT_CAPACITY`.
 
 ### Why the soak needs its own manifest
 
