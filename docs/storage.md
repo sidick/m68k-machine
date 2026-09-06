@@ -389,14 +389,21 @@ do. Clicking Cancel through the native input card
 AROS carries on.
 
 So there is no storage defect. What fails is booting an **AmigaOS 3.2.2
-install under AROS**: the image's `Startup-Sequence` is AmigaOS's, and
-something references `ENV:` before that environment exists. That is an
-OS-mixing problem, not a driver one.
+install under AROS**, and the reason is specific rather than mysterious:
+**AROS was written for AmigaOS 3.1 compatibility, and 3.2 has diverged.**
+3.2 reworked the startup sequence and its environment handling, so a
+3.2.2 image's `Startup-Sequence` reaches for an `ENV:` that AROS's
+3.1-era conventions never set up. Nothing here is broken; the two halves
+simply come from different releases.
+
+That means the fix is a matter of pairing, not of patching. Boot AROS
+from an **AROS-built** image, or — if the goal really is AmigaOS under
+AROS — from a **3.1** one, which is what AROS was built to run.
+`tools/amibake` has recipes for both (`aros68k` and `os3.1.4`).
 
 Two things follow. A board that wants to boot AROS should be given an
-**AROS-built image** — `tools/amibake` has an `aros68k` recipe, and AROS
-is redistributable, so unlike the AmigaOS image that path could run in
-CI. And a diagnosis of "parked in STOP" is worth distrusting on this
+**AROS-built image** — `tools/amibake`'s `aros68k` recipe, and AROS being
+redistributable means unlike the AmigaOS image that path could run in CI. And a diagnosis of "parked in STOP" is worth distrusting on this
 machine now that input exists: a guest waiting on a requester looks
 exactly like a guest that has given up, and the two are told apart by
 looking at the screen rather than at the CPU.
