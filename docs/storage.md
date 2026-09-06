@@ -355,3 +355,54 @@ x86 CI markers, and nothing in this increment's evidence needed it —
 the DiagArea risk check and the disk-selection work both run
 end-to-end against the embedded AROS ROM alone. Worth its own
 increment rather than folding in here.
+
+## AROS and `hostblk`: it works, and the failure was somewhere else
+
+The bare-metal board work raised a risk worth checking: `hostblk`'s
+driver ships in a DiagArea boot ROM proven only against Kickstart 3.2.2,
+and AROS is the only guest a board can boot without licensed media. If
+AROS ignored DiagArea, a board could serve a disk no guest could read.
+
+It does not. Checked in the hosted runner, which needs no board code:
+
+```sh
+machine-hosted --rom assets/aros/aros-amiga-m68k-rom.bin \
+  --ext-rom assets/aros/aros-amiga-m68k-ext.bin \
+  --hostblk nondistribution/m68k-machine.hdf --inspect
+```
+
+AROS reports `Diag board ... InitResident ... 'hostblk.device 1.0
+(2026)'`, opens the device (`lib_OpenCnt 1`), accepts the mounter's
+`AddBootNode` — the boot node carries an `FSSM` naming `hostblk.device`
+unit 0 and a correct `DosEnvec` (`TableSize 16`, `LowCyl 1`, `HighCyl
+575`, `DosType 0x444f5303`) — mounts the partition, and issues real
+filesystem reads: `--inspect` catches a 3,584-byte read at LBA 16,573,
+deep inside `DH0` rather than at a boot block.
+
+**Then it opens a Workbench screen and blocks on a requester reading
+"Please insert volume ENV: in any drive".** That is what an earlier
+investigation saw as AROS "parking permanently in its post-boot STOP
+idle" — it is not idle, it is a modal requester waiting for a click that
+never came, and the CPU sits in `STOP` because there is nothing else to
+do. Clicking Cancel through the native input card
+(`--input-script`, `MOVE 460 144` then a button press) dismisses it and
+AROS carries on.
+
+So there is no storage defect. What fails is booting an **AmigaOS 3.2.2
+install under AROS**: the image's `Startup-Sequence` is AmigaOS's, and
+something references `ENV:` before that environment exists. That is an
+OS-mixing problem, not a driver one.
+
+Two things follow. A board that wants to boot AROS should be given an
+**AROS-built image** — `tools/amibake` has an `aros68k` recipe, and AROS
+is redistributable, so unlike the AmigaOS image that path could run in
+CI. And a diagnosis of "parked in STOP" is worth distrusting on this
+machine now that input exists: a guest waiting on a requester looks
+exactly like a guest that has given up, and the two are told apart by
+looking at the screen rather than at the CPU.
+
+Also worth noting for anyone reading `--inspect` against AROS: its
+`DosList` walk reports empty here even though the volume is plainly
+mounted. AROS's `dos.library` is 50.80 and the walk assumes Kickstart's
+layout, so that particular line is unreliable against AROS -- the
+screenshot and the `hostblk` slot state are the evidence to trust.
