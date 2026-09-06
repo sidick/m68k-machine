@@ -21,14 +21,36 @@ partition-table surgery, no second unit, and nothing DOS can trip over.
 ```sh
 ~/src/amibake/.venv/bin/amibake build tools/amibake/m68k-machine-soak.toml \
   --recipes ~/src/amibake/recipes --assets ~/src/amibake/assets --out out/
-dd if=/dev/zero bs=1048576 count=8 >> out/m68k-machine-soak.hdf   # 8 MiB past DH0
 ```
 
-devsoak and its quirks database are installed by amibake, so nothing is
-hand-patched in with `xdftool` any more; only the extension is manual,
-because amibake has no way to express "make the image larger than its
-last partition". Then run it from the guest's shell, or add a `[[run]]`
-entry if an unattended soak is wanted.
+Nothing else. devsoak, its quirks database and devtest are installed by
+amibake, and the manifest's `[hdf].scratch = "8M"` reserves a second,
+unformatted `DH1` partition at the end of the disk for devsoak to
+destroy. `DH0` keeps the system intact.
+
+That replaces an earlier `dd` extension of the built image. Both give
+devsoak somewhere safe to write, but the extension left the space
+**invisible to the RDB** — raw sectors past the last partition, with a
+range that had to be computed by hand from `DH0`'s geometry and would
+have silently eaten the filesystem if computed wrong. A real partition
+is bounded by the RDB itself.
+
+Verified: the guest boots normally with the scratch partition present,
+this project's own RDB mounter offers `DH0` as the boot node and `DH1`
+as a non-bootable one, and Workbench shows a third icon reading
+`DH1:Uninitialized` — no requester, no stall.
+
+Point devsoak at that partition's sectors, which `rdbtool <image> info`
+reports (`DH1` starting at cylinder 640 with 32 blocks per cylinder is
+block 20480, for 16384 sectors):
+
+```
+C:devsoak hostblk.device 0 -d -r 20480,16384 -t 30s -y -K -o ser
+```
+
+devsoak is gaining volume-name support, which will retire that
+arithmetic entirely — naming `DH1` is both safer and clearer than a
+sector range that is only correct for one image's geometry.
 
 ### Why the soak needs its own manifest
 

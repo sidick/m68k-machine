@@ -20,11 +20,15 @@
 #
 # devsoak is not started at boot either, and deliberately: it overwrites
 # every sector in the range it is given, so a boot-time run would be
-# destructive on every start. It also needs the image extended past its
-# last partition, which amibake does not express -- see
-# docs/hostblk-soak.md for the `dd` step and why aiming devsoak at a
-# partition rather than past one destroys the filesystem it is running
-# from.
+# destructive on every start.
+#
+# [hdf].scratch gives it somewhere safe to do that. It reserves a second,
+# unformatted DH1 partition at the end of the disk -- a real RDB entry,
+# mountable and non-bootable, with no filesystem written -- so the target
+# is partition-bounded rather than raw space past the last partition.
+# This replaces a `dd` extension of the built image, which worked but
+# left the space invisible to the RDB and made the sector range something
+# to compute by hand and get wrong.
 #
 # Build:
 #
@@ -40,3 +44,6 @@ packages = [
   "devtest",
 ]
 output   = ["hdf"]
+
+[hdf]
+scratch = "8M"
