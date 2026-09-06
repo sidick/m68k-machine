@@ -539,3 +539,50 @@ copied and its `da_DiagPoint` called, and that is all -- anything further
 must come from a `struct Resident`'s `rt_Init`, which is what both this
 ROM and `hostblk`'s do. A future ROM wanting code to run at configuration
 time cannot get it this way.
+
+## 15. Typing characters: what AmiRFB solved that this card has not
+
+`~/src/amirfb` (BSD 2-Clause, the project owner's) injects input into a
+live AmigaOS from a VNC client, and its `src/amiga/rfb_server.c` solves
+the keyboard problem in a way this card's current design cannot. Worth
+recording before the next driver increment repeats the mistake.
+
+**The problem.** This card carries *raw Amiga keycodes*. That is fine for
+a scripted test which can hardcode them, and wrong for anything else: raw
+keycodes are **physical key positions**, so turning "the user typed `@`"
+into one requires knowing the guest's *active keymap*, which the host
+cannot know and should not have to.
+
+**The solution, and it is not a lookup table.** `keymap.library`'s
+`MapANSI()` inverts a character into the rawkey-plus-qualifier
+combination that produces it under whatever keymap is currently active —
+the opposite direction to the more familiar `MapRawKey()`, confirmed to
+work that way and available since V36. So the *driver* converts, not the
+host, and it self-adapts to the guest's keymap for free.
+
+AmiRFB layers it:
+
+1. **Printable characters** go through `MapANSI()`.
+2. **Non-printables** — cursor keys, function keys, Return, Escape, Tab,
+   Delete, Backspace, Help, and the modifier keys themselves — use a
+   small fixed table, because those *are* keymap-independent by
+   construction, being physical positions with no character.
+
+**Consequence for this card:** the event queue should carry a
+*character* event type alongside the raw-keycode one, and the driver
+should invert it with `MapANSI()`. Sending only raw keycodes pushes an
+impossible problem onto the host.
+
+**And qualifiers must be reference-counted.** Two held keys can both
+want Shift, so a key-up may not release it. AmiRFB presses the qualifiers
+a key needs, holds them, treats auto-repeat as re-sending only the main
+rawkey since the qualifiers are already down, and on key-up releases the
+main rawkey while decrementing each qualifier — releasing one only when
+nothing held still needs it. §7's rule that `ie_Qualifier` carries the
+full current state is the *what*; this is the *how*.
+
+Separately, AmiRFB independently uses the same raw keycode assignments
+this project's ROM does for keys with no character. That is corroboration
+from a second implementation, not a header citation — `Include_H` still
+ships no `rawkeycodes.h`, so the caveat in
+`m68k/input-rom/input-diagrom.s` stands unchanged.
