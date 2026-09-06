@@ -125,6 +125,7 @@ disjoint borrows of `self`'s fields, not a conflict, but only once
 | Cirrus CL-GD542x | **bring-up** | generic virtual board (ADR 0002) | demoted to compatibility tier, not removed |
 | Graffity Z2/Z3 | **bring-up** | as Cirrus | as Cirrus |
 | `input` native input card | permanent | — | never; the machine's own keyboard/mouse path |
+| `rtgboard` native RTG display board | permanent, host side only | — | never; ADR 0002's generic-board tier. No P96 `.card` driver yet — see below |
 
 ### Permanent
 
@@ -271,6 +272,30 @@ path is for display, and may still be built if this driver-carrying
 board proves fragile: a board that misbehaves leaves the machine
 unusable rather than merely less comfortable. But it is no longer the
 default answer.
+
+**`rtgboard` native RTG display board** — `rtgboard.rs`. ADR 0002's
+generic-board tier, built: an AUTOCONFIG identity distinct from every
+other board here (manufacturer `$07DB`, product `4`), a linear VRAM
+aperture the guest CPU writes pixels into directly (no accelerator —
+ADR 0002's verified fact that a P96 driver overriding no render vector
+still draws a full desktop through the core's own `*Default` CPU
+renderers), a synchronous mode-programming register interface
+(`docs/rtgboard-protocol.md`) with a caller-supplied mode catalog rather
+than an internal one — a rich list for a host with real modesetting, a
+single entry for a fixed-mode board, so the interface can express
+"exactly these modes and no others" without lying when that is the
+honest answer (a UEFI GOP framebuffer fixed at `ExitBootServices`) — and
+the `machine-hosted --rtgboard WIDTHxHEIGHT` flag to attach it. **Not yet
+built:** the P96 `.card` driver and any DiagArea boot ROM — the same
+scope line `hostblk`'s and `input`'s own first increments drew, and the
+same honest limitation: no guest has ever seen a pixel through this
+board yet, only a host-side test committing a mode and writing VRAM
+directly through the register interface a driver will eventually use.
+`machine-hosted`'s screenshot path can present this board's VRAM the same
+way it already does Graffity's, which is what proves a known pattern
+written into VRAM really does become pixels — see
+`docs/rtgboard-protocol.md` for the register contract the driver is
+written against next.
 
 ### Capped
 

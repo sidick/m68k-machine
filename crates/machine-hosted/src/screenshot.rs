@@ -48,9 +48,84 @@ use std::path::{Path, PathBuf};
 
 use machine_core::display::{DisplaySurface, Framebuffer, MAX_HEIGHT, MAX_WIDTH};
 use machine_core::render::{render_rtg, Renderer};
+use machine_core::rtgboard::format as rtg_format;
 use machine_core::{MachineBus, CHIP_RAM_BASE, CHIP_RAM_SIZE};
 
 use crate::console::Console;
+
+/// Walk `rtgboard`'s currently applied mode and convert each pixel to
+/// `0xAARRGGBB`, the same job [`render_rtg`] does for a Graffity/Cirrus
+/// framebuffer -- but written fresh here rather than by feeding
+/// `render_rtg` a synthesised `cirrus::DecodedMode`, because
+/// `rtgboard::format`'s three pixel formats (module docs there: explicit
+/// big-endian `RGB_565`, and UEFI-named `RGBX_8888`/`BGRX_8888` with
+/// their own byte order) do not correspond to any of `render_rtg`'s four
+/// depths, which are little-endian VGA/Cirrus conventions this project's
+/// own module docs there admit are "best-effort", not something
+/// `rtgboard`'s own explicit-by-design formats should be forced through.
+/// `render.rs` is also outside this increment's edit scope.
+///
+/// Every VRAM access is bounds-checked (`vram.get`, defaulting to `0`
+/// past the end) even though [`machine_core::rtgboard::RtgBoard::
+/// current_mode`]'s own commit validation already guarantees the
+/// described rectangle fits -- the same defence-in-depth [`render_rtg`]
+/// applies to its own already-validated `DecodedMode`, cheap insurance
+/// against this function ever being handed a mode that didn't actually
+/// come from the same board's own `current_mode()`.
+fn render_rtgboard(
+    width: u32,
+    height: u32,
+    format: u8,
+    stride: u32,
+    fb_offset: u32,
+    vram: &[u8],
+    fb: &mut Framebuffer,
+) {
+    let width = (width as usize).min(fb.width);
+    let height = (height as usize).min(fb.height);
+
+    for y in 0..height {
+        let row_start = fb_offset as usize + y * stride as usize;
+        for x in 0..width {
+            let argb = match format {
+                rtg_format::RGB_565 => {
+                    let off = row_start + x * 2;
+                    let hi = vram.get(off).copied().unwrap_or(0) as u16;
+                    let lo = vram.get(off + 1).copied().unwrap_or(0) as u16;
+                    let v = (hi << 8) | lo; // big-endian, per `rtgboard::format::RGB_565`
+                    let r = (v >> 11) & 0x1F;
+                    let g = (v >> 5) & 0x3F;
+                    let b = v & 0x1F;
+                    let expand5 = |c: u16| -> u32 { ((c as u32) << 3) | ((c as u32) >> 2) };
+                    let expand6 = |c: u16| -> u32 { ((c as u32) << 2) | ((c as u32) >> 4) };
+                    0xFF00_0000 | (expand5(r) << 16) | (expand6(g) << 8) | expand5(b)
+                }
+                rtg_format::RGBX_8888 => {
+                    let off = row_start + x * 4;
+                    let r = vram.get(off).copied().unwrap_or(0) as u32;
+                    let g = vram.get(off + 1).copied().unwrap_or(0) as u32;
+                    let b = vram.get(off + 2).copied().unwrap_or(0) as u32;
+                    0xFF00_0000 | (r << 16) | (g << 8) | b
+                }
+                rtg_format::BGRX_8888 => {
+                    let off = row_start + x * 4;
+                    let b = vram.get(off).copied().unwrap_or(0) as u32;
+                    let g = vram.get(off + 1).copied().unwrap_or(0) as u32;
+                    let r = vram.get(off + 2).copied().unwrap_or(0) as u32;
+                    0xFF00_0000 | (r << 16) | (g << 8) | b
+                }
+                // Unrecognised format: `current_mode()` can only ever
+                // hold a format `RtgBoard::commit` already validated
+                // against its catalog, so this is unreachable in
+                // practice; render black rather than panic if it is ever
+                // reached anyway (same defensive posture as an
+                // out-of-bounds VRAM read above).
+                _ => 0xFF00_0000,
+            };
+            fb.put(x, y, argb);
+        }
+    }
+}
 
 /// Reconstruct chip RAM's contents through the bus's own read path. See
 /// this module's doc comment for why a direct slice isn't available.
@@ -165,11 +240,19 @@ fn frame_stats(pixels: &[u32]) -> FrameStats {
 /// programmed mode (`decoded_mode()` returns `Some`), that RTG framebuffer
 /// is what gets captured, walked straight out of VRAM via
 /// [`render_rtg`] -- no `chip_ram` snapshot needed at all, since RTG pixel
-/// data never touches chip RAM. Otherwise (no card attached, or attached
-/// but not yet programmed) this falls back to the stop-gap planar
-/// renderer exactly as before `--graphics` existed, so a run with no card
-/// attached is byte-for-byte unaffected by this function's RTG branch
-/// ever having been added.
+/// data never touches chip RAM. Otherwise, if the native `rtgboard`
+/// (`--rtgboard`) has a mode applied (`current_mode()` returns `Some` --
+/// through the register interface described in
+/// `docs/rtgboard-protocol.md`, since no driver exists yet to program one
+/// from a guest; a host-side test committing a mode directly is exactly
+/// how this path is exercised today), that board's VRAM is captured
+/// instead, via [`render_rtgboard`]. Graffity is checked first,
+/// deliberately, so attaching both at once (not a configuration any
+/// baseline uses) cannot change which one Graffity's own baseline
+/// captures. Otherwise (neither card attached, or attached but not yet
+/// programmed) this falls back to the stop-gap planar renderer exactly as
+/// before either card existed, so a run with neither attached is
+/// byte-for-byte unaffected by either RTG branch ever having been added.
 fn capture(bus: &mut MachineBus, surface: &mut PngSurface) -> FrameStats {
     if let Some(mode) = bus.graphics().and_then(|card| card.decoded_mode()) {
         let width = mode.width as usize;
@@ -192,6 +275,33 @@ fn capture(bus: &mut MachineBus, surface: &mut PngSurface) -> FrameStats {
         }
         let stats = frame_stats(&pixels);
         surface.present(&pixels, width, height);
+        return stats;
+    }
+
+    if let Some((width, height, format, stride, fb_offset)) =
+        bus.rtgboard().and_then(|card| card.current_mode())
+    {
+        let w = width as usize;
+        let h = height as usize;
+        let mut pixels = vec![0u32; w * h];
+        {
+            let mut fb = Framebuffer::new(&mut pixels, w, h)
+                .expect("scratch buffer sized exactly to the applied mode's own geometry");
+            let card = bus
+                .rtgboard()
+                .expect("just matched Some(mode) from this same board above");
+            render_rtgboard(
+                width,
+                height,
+                format,
+                stride,
+                fb_offset,
+                card.vram(),
+                &mut fb,
+            );
+        }
+        let stats = frame_stats(&pixels);
+        surface.present(&pixels, w, h);
         return stats;
     }
 
@@ -294,19 +404,17 @@ impl ScreenshotJob {
         };
         self.surface.set_target(target.clone());
 
-        let is_rtg = bus
-            .graphics()
-            .and_then(|card| card.decoded_mode())
-            .is_some();
+        let graffity_mode = bus.graphics().and_then(|card| card.decoded_mode());
+        let rtgboard_mode = bus.rtgboard().and_then(|card| card.current_mode());
         let stats = capture(bus, &mut self.surface);
-        let (width, height) = if is_rtg {
-            // Whatever the driver actually programmed, not the planar
-            // renderer's fixed worst-case canvas -- see `capture`'s doc
-            // comment on present-path selection.
-            bus.graphics()
-                .and_then(|card| card.decoded_mode())
-                .map(|m| (m.width as usize, m.height as usize))
-                .unwrap_or((MAX_WIDTH, MAX_HEIGHT))
+        // `capture`'s own present-path priority, mirrored here so the
+        // diagnostic line reports whichever geometry actually got
+        // captured: Graffity first, then `rtgboard`, then the planar
+        // renderer's fixed worst-case canvas.
+        let (width, height) = if let Some(m) = graffity_mode {
+            (m.width as usize, m.height as usize)
+        } else if let Some((w, h, ..)) = rtgboard_mode {
+            (w as usize, h as usize)
         } else {
             (MAX_WIDTH, MAX_HEIGHT)
         };
@@ -331,7 +439,152 @@ impl ScreenshotJob {
 
 #[cfg(test)]
 mod tests {
+    use machine_core::rtgboard::{format, ModeDescriptor};
+    use machine_core::CHIP_RAM_SIZE;
+
     use super::*;
+
+    // ---- render_rtgboard: a known VRAM pattern comes out as pixels ---------
+
+    #[test]
+    fn rgbx8888_pattern_in_vram_decodes_to_the_expected_argb_pixels() {
+        // Two pixels, hand-built per `rtgboard::format::RGBX_8888`'s own
+        // documented byte order (R,G,B,pad, low to high address).
+        let vram = [
+            0x11, 0x22, 0x33, 0x00, // pixel 0: R=0x11 G=0x22 B=0x33
+            0xAA, 0xBB, 0xCC, 0x00, // pixel 1: R=0xAA G=0xBB B=0xCC
+        ];
+        let mut pixels = [0u32; 2];
+        let mut fb = Framebuffer::new(&mut pixels, 2, 1).unwrap();
+        render_rtgboard(2, 1, format::RGBX_8888, 8, 0, &vram, &mut fb);
+        assert_eq!(pixels[0], 0xFF11_2233);
+        assert_eq!(pixels[1], 0xFFAA_BBCC);
+    }
+
+    #[test]
+    fn bgrx8888_pattern_uses_the_opposite_channel_order_from_rgbx() {
+        let vram = [0x11, 0x22, 0x33, 0x00]; // B=0x11 G=0x22 R=0x33
+        let mut pixels = [0u32; 1];
+        let mut fb = Framebuffer::new(&mut pixels, 1, 1).unwrap();
+        render_rtgboard(1, 1, format::BGRX_8888, 4, 0, &vram, &mut fb);
+        assert_eq!(
+            pixels[0], 0xFF33_2211,
+            "BGRX_8888 must not decode identically to RGBX_8888 (ADR 0002's black-screen warning)"
+        );
+    }
+
+    #[test]
+    fn render_rtgboard_honours_a_stride_wider_than_the_true_row() {
+        // Two rows of one RGBX_8888 pixel each, but padded to 16 bytes/row
+        // rather than the true 4 -- the second pixel must be read from the
+        // padded offset, not immediately after the first.
+        let mut vram = [0u8; 32];
+        vram[0..4].copy_from_slice(&[0x01, 0x02, 0x03, 0x00]);
+        vram[16..20].copy_from_slice(&[0x04, 0x05, 0x06, 0x00]);
+        let mut pixels = [0u32; 2];
+        let mut fb = Framebuffer::new(&mut pixels, 1, 2).unwrap();
+        render_rtgboard(1, 2, format::RGBX_8888, 16, 0, &vram, &mut fb);
+        assert_eq!(pixels[0], 0xFF01_0203);
+        assert_eq!(
+            pixels[1], 0xFF04_0506,
+            "must read the second row from the padded stride offset"
+        );
+    }
+
+    #[test]
+    fn render_rtgboard_never_panics_on_a_short_vram_slice() {
+        let vram = [0u8; 2]; // far short of what a 4x4 RGBX_8888 frame needs
+        let mut pixels = [0u32; 16];
+        let mut fb = Framebuffer::new(&mut pixels, 4, 4).unwrap();
+        render_rtgboard(4, 4, format::RGBX_8888, 16, 0, &vram, &mut fb); // must not panic
+    }
+
+    // ---- end-to-end through the real screenshot present path ---------------
+
+    /// The brief's own ask: "if you can render the board's framebuffer
+    /// through the existing screenshot path so a host-side test can prove
+    /// a known pattern in VRAM comes out as pixels, that is worth
+    /// having." No guest driver exists yet, so the mode here is committed
+    /// directly through the register interface (exactly as a host-side
+    /// test, not a guest, would) rather than by booting a ROM.
+    #[test]
+    fn a_mode_committed_through_the_register_interface_captures_through_the_real_present_path() {
+        let mut chip_ram: Box<[u8; CHIP_RAM_SIZE]> = vec![0u8; CHIP_RAM_SIZE]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap();
+        let rom = [0u8; 0];
+        let mut vram = vec![0u8; 4 * 4 * 4];
+        let modes = [ModeDescriptor {
+            width: 4,
+            height: 4,
+            format: format::RGBX_8888,
+        }];
+        let mut bus = MachineBus::new(&mut chip_ram, &rom).with_rtgboard(&mut vram, &modes);
+        let base = 0x4000_0000u32;
+        // Configure the Zorro III base-address sequence directly -- the
+        // same two-byte write this project's `autoconfig` module docs
+        // describe, exercised the same way `machine-core`'s own bus tests
+        // do (a host-side test standing in for `expansion.library`).
+        bus.write_byte(
+            machine_core::autoconfig::AUTOCONFIG_BASE
+                + machine_core::autoconfig::ec::Z3_BASEADDRESS,
+            (base >> 24) as u8,
+        );
+        bus.write_byte(
+            machine_core::autoconfig::AUTOCONFIG_BASE
+                + machine_core::autoconfig::ec::Z3_BASEADDRESS
+                + 1,
+            (base >> 16) as u8,
+        );
+
+        let write_u32 = |bus: &mut MachineBus, addr: u32, value: u32| {
+            bus.write_byte(addr, (value >> 24) as u8);
+            bus.write_byte(addr + 1, (value >> 16) as u8);
+            bus.write_byte(addr + 2, (value >> 8) as u8);
+            bus.write_byte(addr + 3, value as u8);
+        };
+        write_u32(&mut bus, base + machine_core::rtgboard::reg::SET_WIDTH, 4);
+        write_u32(&mut bus, base + machine_core::rtgboard::reg::SET_HEIGHT, 4);
+        bus.write_byte(
+            base + machine_core::rtgboard::reg::SET_FORMAT + 3,
+            format::RGBX_8888,
+        );
+        write_u32(&mut bus, base + machine_core::rtgboard::reg::SET_STRIDE, 16);
+        write_u32(
+            &mut bus,
+            base + machine_core::rtgboard::reg::SET_FB_OFFSET,
+            0,
+        );
+        bus.write_byte(base + machine_core::rtgboard::reg::COMMIT + 3, 0);
+        assert_eq!(
+            bus.read_byte(base + machine_core::rtgboard::reg::STATUS + 3),
+            machine_core::rtgboard::status::APPLIED
+        );
+
+        // A known pattern: the top-left pixel bright red, everything else
+        // black.
+        let vram_addr = base + machine_core::rtgboard::VRAM_BASE;
+        bus.write_byte(vram_addr, 0xFF); // R
+        bus.write_byte(vram_addr + 1, 0x00); // G
+        bus.write_byte(vram_addr + 2, 0x00); // B
+
+        let target = std::env::temp_dir().join(format!(
+            "rtgboard-screenshot-test-{}.png",
+            std::process::id()
+        ));
+        let mut surface = PngSurface::new(target.clone());
+        let stats = capture(&mut bus, &mut surface);
+
+        assert_eq!(
+            stats.distinct_colours, 2,
+            "one red pixel against a black background"
+        );
+        assert_eq!(stats.non_background_pixels, 1);
+        assert_eq!(stats.total_pixels, 16);
+
+        let _ = std::fs::remove_file(&target);
+    }
 
     #[test]
     fn sequence_path_inserts_frame_before_extension() {

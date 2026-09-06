@@ -249,6 +249,58 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         Vec::new()
     };
 
+    // `--rtgboard`'s geometry, parsed up front (a bad `WIDTHxHEIGHT` is a
+    // CLI usage error, reported before any allocation or bus construction
+    // happens) -- and its VRAM, allocated outside the `Option` handling
+    // below for the same `with_rtgboard`-borrows-it-`&'a mut` lifetime
+    // reason `graphics_vram`/`fast_ram` are. Only allocated at all when
+    // `--rtgboard` is passed, matching every other optional card's "absent
+    // unless attached" contract.
+    let rtgboard_geometry = match &args.rtgboard {
+        Some(spec) => match crate::cli::parse_rtgboard_geometry(spec) {
+            Ok(wh) => Some(wh),
+            Err(e) => return setup_error(console, e),
+        },
+        None => None,
+    };
+    let rtgboard_format = args.rtgboard_format.to_format_byte();
+    let mut rtgboard_vram: Vec<u8> = if rtgboard_geometry.is_some() {
+        vec![0u8; args.rtgboard_vram_mb as usize * 1024 * 1024]
+    } else {
+        Vec::new()
+    };
+    // A single-entry catalog is this flag's whole point (`cli.rs`'s own
+    // doc comment on `--rtgboard`): the honest shape of a fixed-mode
+    // Phase 5 board, not a menu this host doesn't actually offer.
+    let rtgboard_modes: [machine_core::rtgboard::ModeDescriptor; 1] = match rtgboard_geometry {
+        Some((width, height)) => [machine_core::rtgboard::ModeDescriptor {
+            width,
+            height,
+            format: rtgboard_format,
+        }],
+        None => [machine_core::rtgboard::ModeDescriptor {
+            width: 0,
+            height: 0,
+            format: machine_core::rtgboard::format::INVALID,
+        }],
+    };
+    if let Some((width, height)) = rtgboard_geometry {
+        let bpp = machine_core::rtgboard::format::bytes_per_pixel(rtgboard_format)
+            .expect("RtgFormatArg::to_format_byte only ever produces a recognised format");
+        let needed = (width as u64) * (height as u64) * (bpp as u64);
+        if needed > rtgboard_vram.len() as u64 {
+            return setup_error(
+                console,
+                format!(
+                    "--rtgboard {width}x{height} at this format needs {needed} bytes of VRAM, \
+                     but --rtgboard-vram-mb {} only provides {}",
+                    args.rtgboard_vram_mb,
+                    rtgboard_vram.len()
+                ),
+            );
+        }
+    }
+
     let machine_bus = MachineBus::new(&mut chip_ram, &rom_bytes);
     let machine_bus = match &ext_rom_bytes {
         Some(ext) => machine_bus.with_ext_rom(ext),
@@ -310,6 +362,25 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     let machine_bus = if args.input_script.is_some() {
         console.diag("input: native input card attached (Zorro III AUTOCONFIG)");
         machine_bus.with_input()
+    } else {
+        machine_bus
+    };
+    // Same "only exists when asked for" shape again: omitting `--rtgboard`
+    // leaves this board's AUTOCONFIG window and the bus's routing branch
+    // entirely unregistered (`MachineBus::with_rtgboard`'s own doc
+    // comment), so every existing baseline (planar and Graffity RTG
+    // alike) is untouched by this flag ever having been added. No P96
+    // `.card` driver exists yet (`machine_core::rtgboard`'s module docs) --
+    // attaching this board with nothing on the guest to program it is
+    // inert, the same shape `--hostblk`'s and `--input-script`'s own
+    // first, driver-less increments took.
+    let machine_bus = if let Some((width, height)) = rtgboard_geometry {
+        console.diag(&format!(
+            "rtgboard: native RTG board attached (Zorro III AUTOCONFIG), one advertised mode \
+             {width}x{height}, {} MB VRAM",
+            args.rtgboard_vram_mb
+        ));
+        machine_bus.with_rtgboard(&mut rtgboard_vram, &rtgboard_modes)
     } else {
         machine_bus
     };

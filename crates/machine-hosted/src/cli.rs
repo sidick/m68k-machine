@@ -275,6 +275,106 @@ pub struct Args {
     /// for it (`docs/device-ledger.md`'s fast RAM row).
     #[arg(long, default_value_t = 256)]
     pub fast_ram_mb: u32,
+
+    /// Attach the native RTG display board (`machine_core::rtgboard`,
+    /// ADR 0002) over heap-allocated VRAM, with a **single** advertised
+    /// mode: `WIDTHxHEIGHT`, e.g. `640x480`. Without this flag nothing
+    /// about the boot path changes -- the chain and every address this
+    /// board would occupy stay untouched
+    /// (`MachineBus::with_rtgboard`'s own doc comment).
+    ///
+    /// A single-entry catalog, not a menu, is the deliberate choice: it
+    /// is the honest shape of what a real Phase 5 board (a UEFI GOP
+    /// framebuffer fixed at `ExitBootServices`) can actually offer --
+    /// `machine_core::rtgboard`'s module docs, "Mode advertisement". A
+    /// richer host could advertise more, but nothing in this project
+    /// currently negotiates that, and there is no driver yet to consume
+    /// it either way (this board's own module docs: host side only,
+    /// this increment).
+    #[arg(long)]
+    pub rtgboard: Option<String>,
+
+    /// Pixel format `--rtgboard`'s single advertised mode uses --
+    /// `rgb565`, `rgbx8888` (default) or `bgrx8888`
+    /// (`machine_core::rtgboard::format`). Ignored without `--rtgboard`.
+    #[arg(long, default_value = "rgbx8888")]
+    pub rtgboard_format: RtgFormatArg,
+
+    /// VRAM size, in megabytes, for `--rtgboard`'s board. Must be large
+    /// enough to hold one frame of the requested mode at the requested
+    /// format (width * height * bytes-per-pixel); `run.rs` refuses to
+    /// start rather than silently truncating a framebuffer that would
+    /// not fit. Ignored without `--rtgboard`.
+    #[arg(long, default_value_t = 8)]
+    pub rtgboard_vram_mb: u32,
+}
+
+/// CLI surface for [`machine_core::rtgboard::format`] -- kept as a
+/// separate type so `clap`'s `ValueEnum` derive doesn't need to live on
+/// the foreign `machine-core` constants (same shape as [`FloppyArg`]/
+/// [`CpuTypeArg`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum RtgFormatArg {
+    Rgb565,
+    Rgbx8888,
+    Bgrx8888,
+}
+
+impl RtgFormatArg {
+    pub fn to_format_byte(self) -> u8 {
+        match self {
+            RtgFormatArg::Rgb565 => machine_core::rtgboard::format::RGB_565,
+            RtgFormatArg::Rgbx8888 => machine_core::rtgboard::format::RGBX_8888,
+            RtgFormatArg::Bgrx8888 => machine_core::rtgboard::format::BGRX_8888,
+        }
+    }
+}
+
+/// Parse `--rtgboard`'s `WIDTHxHEIGHT` value. A parse failure here is a
+/// CLI usage error (`run.rs` exits with a message), not a guest-visible
+/// condition -- this never reaches `rtgboard::RtgBoard`, which only ever
+/// sees the resulting, already-valid [`machine_core::rtgboard::
+/// ModeDescriptor`].
+pub fn parse_rtgboard_geometry(spec: &str) -> Result<(u32, u32), String> {
+    let (w, h) = spec
+        .split_once('x')
+        .ok_or_else(|| format!("--rtgboard expects WIDTHxHEIGHT, got {spec:?}"))?;
+    let width: u32 = w
+        .parse()
+        .map_err(|_| format!("--rtgboard: invalid width {w:?}"))?;
+    let height: u32 = h
+        .parse()
+        .map_err(|_| format!("--rtgboard: invalid height {h:?}"))?;
+    if width == 0 || height == 0 {
+        return Err("--rtgboard: width and height must both be nonzero".to_string());
+    }
+    Ok((width, height))
+}
+
+#[cfg(test)]
+mod rtgboard_cli_tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_well_formed_geometry() {
+        assert_eq!(parse_rtgboard_geometry("640x480"), Ok((640, 480)));
+    }
+
+    #[test]
+    fn rejects_missing_separator() {
+        assert!(parse_rtgboard_geometry("640480").is_err());
+    }
+
+    #[test]
+    fn rejects_zero_dimensions() {
+        assert!(parse_rtgboard_geometry("0x480").is_err());
+        assert!(parse_rtgboard_geometry("640x0").is_err());
+    }
+
+    #[test]
+    fn rejects_non_numeric_fields() {
+        assert!(parse_rtgboard_geometry("wideXhigh").is_err());
+    }
 }
 
 /// CLI surface for [`machine_core::cia::FloppyPresence`] -- kept as a

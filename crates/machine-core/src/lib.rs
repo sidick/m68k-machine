@@ -57,6 +57,7 @@ pub mod input;
 pub mod mirage;
 pub mod render;
 pub mod rom;
+pub mod rtgboard;
 
 use autoconfig::AutoConfig;
 use blitter::Blitter;
@@ -67,6 +68,7 @@ use graffity::Graffity;
 use hostblk::Hostblk;
 use input::NativeInput;
 use mirage::Mirage;
+use rtgboard::{ModeDescriptor, RtgBoard};
 
 /// Size in bytes of the chip RAM region, `$000000`-`$1FFFFF` (2 MB).
 ///
@@ -232,6 +234,18 @@ pub struct MachineBus<'a> {
     /// shape as [`Self::mirage_board`]/[`Self::hostblk_board`].
     input_board: Option<usize>,
 
+    /// The native RTG display board ([`rtgboard`], ADR 0002), when the
+    /// board layer has attached one via [`Self::with_rtgboard`]. Absent
+    /// by default -- with no call to `with_rtgboard`, neither its
+    /// AUTOCONFIG board nor this field's routing branch exist, so a
+    /// machine with no RTG board attached is completely unaffected, the
+    /// same guarantee every other optional card on this bus gives.
+    rtg: Option<RtgBoard<'a>>,
+    /// AUTOCONFIG chain index the RTG board's single board landed at,
+    /// once [`Self::with_rtgboard`] has registered it -- the same seam
+    /// shape as [`Self::mirage_board`]/[`Self::hostblk_board`].
+    rtg_board: Option<usize>,
+
     /// While set, the ROM is mirrored over the bottom of the address
     /// space so the CPU's reset vector fetch from `$000000`/`$000004`
     /// lands in ROM. Real hardware does this with Gary, driven by CIA-A
@@ -309,6 +323,8 @@ impl<'a> MachineBus<'a> {
             fast_ram_board: None,
             input: None,
             input_board: None,
+            rtg: None,
+            rtg_board: None,
             overlay: true,
         }
     }
@@ -420,6 +436,24 @@ impl<'a> MachineBus<'a> {
             self.input_board = self.autoconfig.add_board(NativeInput::board_spec());
             self.input = Some(NativeInput::new());
         }
+        self
+    }
+
+    /// Attach the native RTG display board ([`rtgboard`], ADR 0002) over
+    /// caller-owned VRAM (borrowed, like chip RAM and Graffity's VRAM --
+    /// this crate has no allocator) and a caller-owned mode catalog --
+    /// [`rtgboard`]'s module docs, "Mode advertisement": a rich list for
+    /// a host with real modesetting, or a single entry for a fixed-mode
+    /// Phase 5 board layer. Absent a call to this, the chain and every
+    /// address this board would occupy are untouched, the same "nothing
+    /// changes unless attached" guarantee every other optional card here
+    /// gives -- this board carries no P96 `.card` driver yet (host side
+    /// only, this increment), so attaching it with no guest-side driver
+    /// installed is inert but harmless, the same shape `hostblk`'s and
+    /// `input`'s own first, driver-less increments took.
+    pub fn with_rtgboard(mut self, vram: &'a mut [u8], catalog: &'a [ModeDescriptor]) -> Self {
+        self.rtg_board = self.autoconfig.add_board(RtgBoard::board_spec());
+        self.rtg = Some(RtgBoard::new(vram, catalog));
         self
     }
 
@@ -543,6 +577,28 @@ impl<'a> MachineBus<'a> {
     /// it. See [`Self::hostblk_board_base`], the same shape.
     pub fn input_board_base(&self) -> Option<u32> {
         self.autoconfig.placement(self.input_board?).map(|p| p.base)
+    }
+
+    /// Borrow the attached RTG display board, if [`Self::with_rtgboard`]
+    /// was called -- e.g. for a screenshot path to walk its currently
+    /// applied mode via [`rtgboard::RtgBoard::current_mode`]/
+    /// [`rtgboard::RtgBoard::vram`], the same shape [`Self::graphics`]
+    /// offers for the emulated-silicon path.
+    pub fn rtgboard(&self) -> Option<&RtgBoard<'a>> {
+        self.rtg.as_ref()
+    }
+
+    /// Mutable access to the attached RTG board, see [`Self::rtgboard`].
+    pub fn rtgboard_mut(&mut self) -> Option<&mut RtgBoard<'a>> {
+        self.rtg.as_mut()
+    }
+
+    /// Where AUTOCONFIG placed the RTG board's single Zorro III board,
+    /// once `expansion.library` has configured it -- `None` before
+    /// [`Self::with_rtgboard`] was called or before the guest has
+    /// configured it. See [`Self::hostblk_board_base`], the same shape.
+    pub fn rtgboard_base(&self) -> Option<u32> {
+        self.autoconfig.placement(self.rtg_board?).map(|p| p.base)
     }
 
     /// Advance time by `cpu_clocks`, ticking the frame clock and both
@@ -756,6 +812,15 @@ impl<'a> MachineBus<'a> {
                 }
                 None => OPEN_BUS_BYTE,
             }
+        } else if let Some(offset) = self.rtg_target(address) {
+            match &self.rtg {
+                // No interrupt to check here -- `rtgboard`'s module docs,
+                // "no asynchronous boundary to defer across": mode
+                // programming is synchronous and this board never
+                // asserts INT2 at all.
+                Some(dev) => dev.read(offset),
+                None => OPEN_BUS_BYTE,
+            }
         } else {
             OPEN_BUS_BYTE
         }
@@ -769,6 +834,21 @@ impl<'a> MachineBus<'a> {
     /// some other board. See [`Self::hostblk_target`], the same shape.
     fn input_target(&self, address: u32) -> Option<u32> {
         let idx = self.input_board?;
+        if self.autoconfig.board_at(address) != Some(idx) {
+            return None;
+        }
+        let base = self.autoconfig.placement(idx)?.base;
+        Some(address - base)
+    }
+
+    /// Whether `address` falls inside the RTG board's configured
+    /// AUTOCONFIG window, and if so, the board-relative offset -- the
+    /// input to [`rtgboard::RtgBoard::read`]/[`rtgboard::RtgBoard::write`].
+    /// `None` whenever no board is attached ([`Self::rtg_board`] is
+    /// `None` until [`Self::with_rtgboard`] runs) or the address belongs
+    /// to some other board. See [`Self::hostblk_target`], the same shape.
+    fn rtg_target(&self, address: u32) -> Option<u32> {
+        let idx = self.rtg_board?;
         if self.autoconfig.board_at(address) != Some(idx) {
             return None;
         }
@@ -1010,6 +1090,12 @@ impl<'a> MachineBus<'a> {
                 if dev.irq_pending() {
                     self.chipset.raise_int(chipset::intbit::PORTS);
                 }
+            }
+        } else if let Some(offset) = self.rtg_target(address) {
+            if let Some(dev) = &mut self.rtg {
+                dev.write(offset, value);
+                // No interrupt check here -- see `read_byte`'s matching
+                // arm above.
             }
         }
         // ROM and open-bus writes: discarded.
@@ -2163,6 +2249,113 @@ mod tests {
         assert_eq!(
             bus.read_byte(base + input::reg::EVENT_TYPE + 3),
             input::ev::NONE
+        );
+    }
+
+    // ---- rtgboard wiring: "a machine without the board is unaffected" ----
+
+    #[test]
+    fn no_rtgboard_leaves_the_chain_empty_and_everything_else_unaffected() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let bus = new_bus(&mut ram, &rom);
+
+        assert_eq!(bus.rtg_board, None);
+        assert!(bus.rtgboard().is_none());
+        assert_eq!(bus.autoconfig.board_at(0x4000_0000), None);
+    }
+
+    #[test]
+    fn with_rtgboard_registers_one_zorro_iii_board_alongside_input() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut vram = std::vec![0u8; 64 * 1024];
+        let modes = [rtgboard::ModeDescriptor {
+            width: 640,
+            height: 480,
+            format: rtgboard::format::RGBX_8888,
+        }];
+        let mut bus = new_bus(&mut ram, &rom)
+            .with_input()
+            .with_rtgboard(&mut vram, &modes);
+
+        assert!(bus.input().is_some());
+        assert!(bus.rtgboard().is_some());
+        assert_eq!(bus.input_board, Some(0));
+        assert_eq!(bus.rtg_board, Some(1));
+        assert_eq!(
+            bus.autoconfig.read(autoconfig::AUTOCONFIG_BASE + 4) >> 4,
+            !input::PRODUCT >> 4,
+            "input's own product number, not rtgboard's, answers at chain index 0"
+        );
+    }
+
+    /// End-to-end through the real bus (not `rtgboard`'s own flat-RAM
+    /// unit tests): a mode committed through the configured AUTOCONFIG
+    /// window is visible via the `CUR_*` registers, and a pixel pattern
+    /// written into the VRAM aperture round-trips -- proving the register
+    /// file and the VRAM aperture share one address window without
+    /// aliasing each other once real AUTOCONFIG placement is involved.
+    #[test]
+    fn configured_rtgboard_programs_a_mode_and_round_trips_vram_through_the_real_bus() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut vram = std::vec![0u8; 640 * 480 * 4 + 4096];
+        let modes = [rtgboard::ModeDescriptor {
+            width: 640,
+            height: 480,
+            format: rtgboard::format::RGBX_8888,
+        }];
+        let mut bus = new_bus(&mut ram, &rom).with_rtgboard(&mut vram, &modes);
+        let base = 0x4000_0000u32;
+        configure_zorro_iii(&mut bus, base);
+
+        let write_u32 = |bus: &mut MachineBus, addr: u32, value: u32| {
+            bus.write_byte(addr, (value >> 24) as u8);
+            bus.write_byte(addr + 1, (value >> 16) as u8);
+            bus.write_byte(addr + 2, (value >> 8) as u8);
+            bus.write_byte(addr + 3, value as u8);
+        };
+        let read_u32 = |bus: &mut MachineBus, addr: u32| -> u32 {
+            u32::from_be_bytes([
+                bus.read_byte(addr),
+                bus.read_byte(addr + 1),
+                bus.read_byte(addr + 2),
+                bus.read_byte(addr + 3),
+            ])
+        };
+
+        write_u32(&mut bus, base + rtgboard::reg::SET_WIDTH, 640);
+        write_u32(&mut bus, base + rtgboard::reg::SET_HEIGHT, 480);
+        bus.write_byte(
+            base + rtgboard::reg::SET_FORMAT + 3,
+            rtgboard::format::RGBX_8888,
+        );
+        write_u32(&mut bus, base + rtgboard::reg::SET_STRIDE, 640 * 4);
+        write_u32(&mut bus, base + rtgboard::reg::SET_FB_OFFSET, 0);
+        bus.write_byte(base + rtgboard::reg::COMMIT + 3, 0);
+
+        assert_eq!(
+            bus.read_byte(base + rtgboard::reg::STATUS + 3),
+            rtgboard::status::APPLIED
+        );
+        assert_eq!(read_u32(&mut bus, base + rtgboard::reg::CUR_WIDTH), 640);
+        assert_eq!(read_u32(&mut bus, base + rtgboard::reg::CUR_HEIGHT), 480);
+
+        // A pixel pattern written through the CPU-visible VRAM aperture
+        // lands in the board's own VRAM -- the "no accelerator, the
+        // guest CPU writes pixels directly" story ADR 0002 verified.
+        let vram_addr = base + rtgboard::VRAM_BASE;
+        bus.write_byte(vram_addr, 0x11);
+        bus.write_byte(vram_addr + 1, 0x22);
+        bus.write_byte(vram_addr + 2, 0x33);
+        assert_eq!(bus.read_byte(vram_addr), 0x11);
+        assert_eq!(bus.read_byte(vram_addr + 1), 0x22);
+        assert_eq!(bus.read_byte(vram_addr + 2), 0x33);
+        assert_eq!(
+            bus.rtgboard().unwrap().vram()[0..3],
+            [0x11, 0x22, 0x33],
+            "the bus's VRAM aperture and the board's own borrowed slice must be the same bytes"
         );
     }
 }
