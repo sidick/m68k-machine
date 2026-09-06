@@ -246,14 +246,24 @@ asynchronous completion over INT2 via a bounded completion queue — see
 ADR 0003 for why the boot path is not PIO, and `docs/hostblk-protocol.md`
 for the register/wire-format contract.
 
-*Built so far (host side only):* the register interface (`hostblk.rs`),
-the transfer engine, per-unit discovery (attached/size/write-protect/
-change-counter — the gap the MIRAGE review found missing), the
-submission and completion queues and their overflow/backpressure rules,
-and the `machine-hosted --hostblk` CLI flag. **Not yet built:** the m68k
-driver and the DiagArea boot ROM that mounts an RDB from it — this
-increment cannot boot a machine on its own, only exercise the card's
-host-side half end to end.
+*Built:* the register interface (`hostblk.rs`), the transfer engine,
+per-unit discovery (attached/size/write-protect/change-counter — the
+gap the MIRAGE review found missing), the submission and completion
+queues and their overflow/backpressure rules, the `machine-hosted
+--hostblk` CLI flag, and the m68k half: the DiagArea boot ROM, exec
+device and RDB mounter (`m68k/hostblk-rom/`) that boot AmigaOS 3.2.2
+and AROS unassisted. devsoak passes against it (`docs/hostblk-soak.md`).
+
+**Packet-transport card + host-side filesystems** — ADR 0004, not yet
+built. The layer above `hostblk`: a doorbell card carrying DosPackets,
+so the *filesystem* runs as host code while the guest runs only a thin
+handler stub. Exists because the Copperline measurements showed the
+remaining 4x between a host-speed block device and a host-speed volume
+is FFS itself executing as emulated 68k. Backends are interchangeable
+behind the one transport: host-implemented FFS against ordinary images
+first (`amiga-ffs` crate, one filesystem family per crate), live host
+directory passthrough later. Complements `hostblk`, does not replace
+it — one is "a disk", this is "a volume".
 
 **MIRAGE block plane** — `mirage.rs`. Native rather than bring-up: a
 board designed for this machine and driven by our own m68k code, not a
