@@ -141,10 +141,31 @@ the BitBLT engine already shows what those hooks are asked to do.
 This is the part that reaches outside Phase 5, and it is the reason this
 ADR is being written now rather than at Phase 5.
 
-Under UEFI you enumerate GOP modes and set one **before**
-`ExitBootServices`. Afterwards the mode is effectively fixed. A
-bare-metal board layer would therefore advertise the boot-time mode, or
-a small fixed list, and refuse changes at runtime.
+Under UEFI you enumerate GOP modes and set one with `SetMode`. That
+remains available for as long as boot services do — and **this
+project's q35 board is a UEFI application that never calls
+`ExitBootServices`**, so runtime modesetting is available to it today.
+It simply is not used yet: the board reads `current_mode_info()` and
+nothing more.
+
+An earlier revision of this ADR asserted the mode is "effectively fixed"
+after `ExitBootServices`, and used that to argue a bare-metal layer must
+advertise a single boot-time mode. That is true only if we exit, which
+we do not. Corrected here because it also overstated a cost against
+ADR 0001's option A.
+
+Exiting is not free to keep avoiding, though, and the trade is worth
+stating: staying in boot services leaves the firmware owning the memory
+map and running its own timer and watchdog, which a long-running payload
+normally wants gone. If this project ever needs that control, `SetMode`
+goes with it and the fixed-mode story returns — so the mode catalog
+should stay able to express one entry, even where it can currently
+express many.
+
+None of this transfers to ARM. RK3588 does not boot UEFI, so there is no
+GOP: the display controller is driven directly, or whatever U-Boot left
+configured is inherited. The Pi 5 under EDK2 is the exception rather
+than the rule.
 
 Under a Linux host, DRM/KMS gives real runtime modesetting, and a P96
 mode change maps onto it directly.

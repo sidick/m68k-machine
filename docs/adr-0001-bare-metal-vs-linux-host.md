@@ -91,10 +91,22 @@ Keeps: instant boot, no host OS, a single self-contained artifact, and
 the Emu68-variant door (§5.3) fully open.
 
 One cost this ADR did not originally record, raised by ADR 0002:
-**runtime display modesetting**. Under UEFI the mode is chosen before
-`ExitBootServices` and is effectively fixed afterwards, so a bare-metal
-board layer advertises the boot-time mode and refuses changes; under
-option B, DRM/KMS makes a guest mode change an ordinary operation.
+**runtime display modesetting** — though weaker than first stated, and
+the correction is recorded here rather than quietly dropped.
+
+The original claim was that UEFI fixes the mode at `ExitBootServices`,
+so a bare-metal layer must advertise the boot-time mode and refuse
+changes. That holds only if the payload exits, and this project's q35
+board is a UEFI application that does not: GOP's `SetMode` is available
+to it at runtime. So on x86 the gap against a Linux host's DRM/KMS is
+much smaller than claimed, and on ARM it is a different question
+entirely, since RK3588 does not boot UEFI and has no GOP at all.
+
+What survives is narrower: exiting boot services, which a long-running
+bare-metal payload normally wants in order to own the memory map and
+silence the firmware's timer and watchdog, costs `SetMode` along with
+it. That is a real trade against option A, but it is a choice about when
+to exit rather than a property of bare metal.
 Whether the guest can change resolution without restarting the machine
 is user-visible behaviour rather than an implementation detail, and it
 falls out differently under A than under B. See ADR 0002's "Mode
