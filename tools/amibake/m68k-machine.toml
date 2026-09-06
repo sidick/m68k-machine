@@ -63,3 +63,27 @@ packages = [
 ]
 output   = ["hdf", "dir"]
 emit     = ["copperline"]
+
+# Start AmiPilot's automation server on the serial wire at boot.
+#
+# SERIAL, not TCP: this machine has no networking yet, and the serial
+# path is the one that is actually proven -- `machine-hosted
+# --serial-tcp ADDR` bridges the guest's serial port to a socket, and
+# AmiPilot's host client handshakes and answers SCREENS over it
+# (docs/serial-debugging.md). AmiPilot's own wire is transport-agnostic,
+# so a socket and a real serial port are equally first-class to it; the
+# choice here is about what this machine can carry.
+#
+# detach so the boot script does not block on a server that never exits.
+# No `output`: the server's diagnostics are not the wire, and pointing
+# them at SER: would interleave them with the protocol.
+#
+# devsoak and devtest are deliberately *not* started at boot. devsoak
+# overwrites every sector in the range it is given, so a boot-time run
+# would be destructive on every start, and it also needs an image
+# extended past its last partition -- see docs/hostblk-soak.md, which
+# keeps that a deliberate, separate step.
+[[run]]
+command = "C:AmiPilotServer"
+args    = "SERIAL"
+detach  = true

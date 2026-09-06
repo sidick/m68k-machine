@@ -19,12 +19,38 @@ because `FileBlockDevice` takes its sector count from the file. No
 partition-table surgery, no second unit, and nothing DOS can trip over.
 
 ```sh
-cp nondistribution/m68k-machine.hdf soak.hdf
-dd if=/dev/zero bs=1048576 count=8 >> soak.hdf     # 8 MiB past DH0
-xdftool soak.hdf write ~/src/devsoak/devsoak devsoak
-# append to S/User-Startup (it already carries the Picasso96 assign):
-#   SYS:devsoak hostblk.device 0 -d -r 18432,16384 -t 30s -y -K -o ser
+~/src/amibake/.venv/bin/amibake build tools/amibake/m68k-machine-soak.toml \
+  --recipes ~/src/amibake/recipes --assets ~/src/amibake/assets --out out/
+dd if=/dev/zero bs=1048576 count=8 >> out/m68k-machine-soak.hdf   # 8 MiB past DH0
 ```
+
+devsoak and its quirks database are installed by amibake, so nothing is
+hand-patched in with `xdftool` any more; only the extension is manual,
+because amibake has no way to express "make the image larger than its
+last partition". Then run it from the guest's shell, or add a `[[run]]`
+entry if an unattended soak is wanted.
+
+### Why the soak needs its own manifest
+
+`tools/amibake/m68k-machine-soak.toml` exists solely because
+**AmiPilot and a serial devsoak run cannot share an image.**
+
+devsoak's `-o ser` emits through `RawPutChar`, the ROM debug serial
+port, and its own documentation is explicit: *"nothing else may have
+serial.device open during a serial run — RawPutChar drives the same
+hardware serial.device would use"*. The main manifest autostarts
+AmiPilotServer, which holds `serial.device` unit 0 for its wire, so on
+that image the two fight over the same Paula registers.
+
+The conflict cannot be dodged by changing devsoak's sink. Serial is the
+only way to get its output off this machine — there is no console
+capture, so `-o con` would leave the results visible only in a
+screenshot. The server has to not be running, which means a separate
+image rather than a flag.
+
+AmiPilot is still *installed* on the soak image, so it can be started by
+hand for interactive use once no soak is in progress. Only the autostart
+differs.
 
 `-r` is in **sectors**, not bytes. `-o ser` sends output to serial,
 which the runner already captures, so no log file or screen scraping is

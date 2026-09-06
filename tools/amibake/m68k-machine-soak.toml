@@ -1,0 +1,42 @@
+# Soak image: the same machine as m68k-machine.toml, with no automation
+# server running.
+#
+# It exists for one reason. devsoak's `-o ser` emits through
+# `RawPutChar`, the ROM debug serial port, and its own documentation is
+# explicit that "nothing else may have serial.device open during a
+# serial run — RawPutChar drives the same hardware serial.device would
+# use". AmiPilotServer holds serial.device unit 0 for its wire, so on an
+# image where it autostarts the two fight over the same Paula registers.
+#
+# Serial is also the only way to get devsoak's output off this machine:
+# there is no console capture, and `-o con` would leave the results
+# visible only in a screenshot. So the conflict cannot be dodged by
+# changing devsoak's sink -- the server has to not be running, which
+# means a separate image rather than a flag.
+#
+# amipilot is still *installed* here, so this image can be used
+# interactively by starting the server by hand once no soak is running.
+# What differs is only that nothing starts it at boot.
+#
+# devsoak is not started at boot either, and deliberately: it overwrites
+# every sector in the range it is given, so a boot-time run would be
+# destructive on every start. It also needs the image extended past its
+# last partition, which amibake does not express -- see
+# docs/hostblk-soak.md for the `dd` step and why aiming devsoak at a
+# partition rather than past one destroys the filesystem it is running
+# from.
+#
+# Build:
+#
+#   ~/src/amibake/.venv/bin/amibake build tools/amibake/m68k-machine-soak.toml \
+#     --recipes ~/src/amibake/recipes --assets ~/src/amibake/assets --out <dir>
+base     = "os3.2.2"
+machine  = { cpu = "68040", fpu = true, ram = "chip:2M,z3:256M", rtg = true }
+packages = [
+  { name = "picasso96-3", card = "graffity", fake-native-modes = true },
+  "mmulibs",
+  "amipilot",
+  "devsoak",
+  "devtest",
+]
+output   = ["hdf"]

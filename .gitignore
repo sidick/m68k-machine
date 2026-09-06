@@ -15,3 +15,12 @@
 # be committed by accident, with only the README explaining what belongs.
 /nondistribution/*
 !/nondistribution/README.md
+
+# amibake's content-addressed download/layer cache. It defaults to the
+# working directory, so a build run from the repo root drops ~90 MB here
+# -- including the licensed AmigaOS base layers, which must never be
+# committed for exactly the reasons nondistribution/README.md gives.
+# Ignored rather than merely remembered: it was committed once by a
+# `git add -A`, which is precisely the accident an ignore rule exists to
+# make impossible.
+/.amibake-cache/
