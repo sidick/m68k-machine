@@ -158,6 +158,55 @@ seriously.
 Rejected: more work than option A's conversion chore, for the same
 outcome.
 
+## The decision may not be one decision
+
+Recorded 2026-09-06, and it reframes the options above rather than
+adding to them.
+
+This ADR has been written throughout as a single choice: bare metal or a
+Linux host, for the project. That framing may be wrong. **The honest
+answer may be per-platform, and permanently so** — bare metal on x86,
+Linux with KVM on ARM — rather than option B shipping first and option A
+following everywhere it can.
+
+The asymmetry is not speculative; this project has already felt it. On
+x86, UEFI is a *standard*: GOP gave the q35 board a real framebuffer in
+one increment, `EFI_SIMPLE_TEXT_INPUT_PROTOCOL` offers keyboard on the
+same terms, and NVMe and xHCI are documented interfaces with published
+specifications. On ARM there is no equivalent. The `virt` board needed a
+fw_cfg and ramfb driver written from scratch to get a framebuffer at
+all — and `virt` is QEMU, the *easy* ARM target, where the hardware is
+whatever QEMU chose to emulate and is documented in QEMU's own tree.
+
+Real ARM silicon is worse in kind, not degree. RK3588's display
+controller, PCIe root complex and USB stack are vendor blocks whose
+documentation ranges from partial to absent, which is why the roadmap's
+own §13 describes that work as "U-Boot-derived" — deriving it from
+someone else's driver is the realistic route, and that is a standing
+cost, not a one-off. Every board differs, so the work does not amortise
+across ARM the way it does across x86.
+
+Linux is precisely the thing that has already absorbed that cost. On
+ARM its DRM/KMS, USB and NVMe drivers exist, are maintained by the
+vendors' own engineers, and follow the boards. Reimplementing them to
+own the boot process is a poor trade on a platform where the
+documentation is the scarce resource rather than the effort.
+
+**This is architecturally cheap to adopt**, which is what makes it worth
+saying out loud. Proposal §4's board-layer trait boundary already means
+the m68k side cannot tell the difference: under Linux the backends are
+DRM/KMS for display, evdev for input, `O_DIRECT` for storage; bare metal
+substitutes its own. A split answer costs one more board-layer
+implementation, not a second architecture.
+
+It also matches the roadmap's existing shape rather than fighting it.
+Phase 4 already runs the machine on real hardware under KVM, so the ARM
+path arrives at a Linux host first regardless. The question this
+reframing raises is only whether ARM ever needs to *leave* it — and the
+Phase 4 measurements this ADR is deferred to will speak to throughput,
+not to whether the drivers can be written at all, which is the actual
+ARM constraint.
+
 ## Recommendation
 
 **Still open — deliberately not decided here.** Option B buys roughly a
