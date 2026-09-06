@@ -25,7 +25,9 @@
 
 extern crate alloc;
 
+mod fast_ram;
 mod present;
+mod storage;
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -558,7 +560,37 @@ fn boot_aros() {
             Err(_) => unreachable!("boxed_slice has exactly CHIP_RAM_SIZE elements"),
         };
 
-    let machine_bus = MachineBus::new(&mut chip_ram, AROS_ROM).with_ext_rom(AROS_EXT_ROM);
+    // Fast RAM: allocated from boot services, matching
+    // `machine-hosted`'s 256 MB default (`tools/amibake/m68k-machine.toml`'s
+    // declared machine shape) when boot services can spare it, falling
+    // back gracefully otherwise (`fast_ram` module doc comment).
+    let fast_ram = fast_ram::allocate();
+    print_line(&fast_ram.describe());
+
+    // Storage: scan every EFI_BLOCK_IO_PROTOCOL handle for the one
+    // positively carrying an Amiga Rigid Disk Block, and report exactly
+    // what was checked either way (`storage` module doc comment).
+    let mut rdb_scan = storage::find_rdb_disk();
+    for line in &rdb_scan.log {
+        print_line(line);
+    }
+
+    let mut machine_bus = MachineBus::new(&mut chip_ram, AROS_ROM).with_ext_rom(AROS_EXT_ROM);
+    if let Some(mem) = fast_ram.mem {
+        machine_bus = machine_bus.with_fast_ram(mem);
+    }
+    if let Some(device) = rdb_scan.device.as_mut() {
+        // Write-protected: this board has no CLI to opt in the way
+        // `machine-hosted --hostblk-writable` does, and the disk here
+        // was found by scanning rather than named by the operator, so
+        // the safer default carries over unchanged (`docs/storage.md`'s
+        // `--hostblk` read-only-by-default reasoning).
+        machine_bus = machine_bus.with_hostblk(0, device, true);
+        print_line("hostblk: unit 0 attached (read-only)");
+    } else {
+        print_line("hostblk: no drive attached");
+    }
+
     let mut bus = Bus(machine_bus);
 
     let mut cpu = CpuCore::new();

@@ -200,3 +200,158 @@ retiring Gayle: a destructive, concurrent devsoak run against the
 driver, independent of any single boot succeeding. See that file for the
 full account, including the one real driver bug (`NSDQR_SIZE`
 off-by-four) it caught that a self-written test never would have.
+
+## `board-qemu-q35`: real storage on the UEFI board
+
+The bare-metal boards had no storage at all until this increment.
+`board-qemu-q35` (`crates/board-qemu-q35/src/storage.rs`,
+`crates/board-qemu-q35/src/fast_ram.rs`) now provides `hostblk` with a
+real `BlockDevice` over UEFI's `EFI_BLOCK_IO_PROTOCOL`, and fast RAM
+allocated from boot services — the same shape `machine-hosted` gives
+`hostblk` (a `BlockDevice` plus fast RAM), sourced from firmware
+instead of a host file and a process heap.
+
+**Why Block I/O, not virtio-blk:** `board-qemu-q35` is *the UEFI
+board*, not the x86 board (ADR 0001) — it already builds and runs for
+`aarch64-unknown-uefi`, and `edk2-rk3588` gives a real ARM board
+(Rock 5B) the same `EFI_BLOCK_IO_PROTOCOL` surface over SD/eMMC/NVMe.
+virtio-blk would only ever serve QEMU.
+
+### The risk checked first: does AROS honour a DiagArea boot ROM?
+
+`hostblk`'s driver and RDB mounter ship in a DiagArea boot ROM
+(`m68k/hostblk-rom/`), proven only against Kickstart 3.2.2 before this
+increment. Nothing had ever exercised it under AROS, and if AROS
+ignored DiagArea boot ROMs the board could serve a disk no guest could
+ever read. This was checked with the existing hosted runner —
+redistributable AROS ROMs, no board code involved — before any UEFI
+code was written:
+
+```
+machine-hosted --rom assets/aros/aros-amiga-m68k-rom.bin \
+  --ext-rom assets/aros/aros-amiga-m68k-ext.bin \
+  --hostblk nondistribution/m68k-machine.hdf \
+  --max-frames 150 --max-instructions 0 --inspect
+```
+
+**AROS does honour it.** `--inspect`'s dump at the end of that run shows
+`hostblk.device` initialised, `DiagMarker` reading back `hostblk`'s own
+`VERSION` register (proof `DiagEntry` ran from the card's own DiagArea
+and could reach its registers), a mounted `MountList` boot node for
+`DH0` with the RDB's `DosEnvec` decoded correctly, `DosList` carrying
+both `DH0` and `SYS:`, and a live transfer descriptor in `hostblk`'s
+submission slot (`cmd 1 unit 0 len 3584 offset 0x817a00`) — an
+in-flight read, not just a discovery probe. This is the same evidence
+`docs/hostblk-soak.md`/this file's own Kickstart 3.2.2 boot already
+established for that OS; AROS gets exactly as far.
+
+A second, longer hosted run under otherwise identical settings (500
+frames instead of 150) reached only `hostblk.device`'s DiagArea
+registration (`romtaginit done`) before parking in AROS's own
+post-boot `STOP` idle (PC `$00FE8B88`) and advancing no further even
+given far more frames and instructions than the 150-frame run needed
+to reach a live DH0 mount. Both runs use the same ROMs, image, and CPU
+model; the difference tracks which AUTOCONFIG board (fast RAM or
+`hostblk`) configures first, which is itself unintentional and not
+something either the hosted CLI or this board's `main.rs` currently
+control. This looks like a pre-existing AROS boot-scheduling
+sensitivity independent of the UEFI board work, not a Block I/O
+defect — but it means "AROS mounts the RDB" is proven, not yet
+proven *reliable* run-to-run. Worth investigating before leaning on
+this board (or the hosted runner) for a repeatable AROS+`hostblk`
+regression test.
+
+### Choosing the right disk: scan for the `'RDSK'` signature, never guess
+
+UEFI hands back one `EFI_BLOCK_IO_PROTOCOL` handle per whole disk *and*
+one per logical partition on it, plus the ESP itself, with nothing in
+the protocol distinguishing "the disk to serve" from any other. Given
+this project's history of silent wrong-thing-selected failures
+(`docs/device-ledger.md`), `storage::find_rdb_disk` never guesses by
+handle order or size: it opens every `BlockIO` handle and scans each
+one's first 16 sectors — the documented Amiga RDB search range,
+matching `m68k/hostblk-rom/hostblk-diagrom.s`'s own mounter — for the
+`'RDSK'` signature. First positive match wins and is handed to
+`MachineBus::with_hostblk`; every handle checked, matched or not, is
+logged. Confirmed under real QEMU with an ESP (FAT, no RDB) and a
+second `-drive ...,if=virtio` disk holding `nondistribution/
+m68k-machine.hdf`:
+
+```
+storage: handle 0: whole disk, native block size 512 bytes, 1032192 512-byte sectors -- no 'RDSK' signature in the first 16 sectors -- not a candidate
+storage: handle 1: whole disk, no media present -- skipped
+storage: handle 2: could not open BlockIO (Error { status: INVALID_PARAMETER, data: () }) -- skipped
+storage: no Amiga RDB disk found on any EFI_BLOCK_IO_PROTOCOL handle -- continuing with no drive attached
+```
+
+(no disk attached: handle 0 is the ESP, correctly passed over; handle 1
+is an empty removable-media slot; handle 2 fails to open exclusively,
+plausibly a FAT filesystem sub-handle already claimed by
+`SimpleFileSystem` — all three logged and skipped, not silently
+ignored) versus, with the RDB image attached as a second drive:
+
+```
+storage: handle 0: whole disk, native block size 512 bytes, 18432 512-byte sectors -- 'RDSK' signature found at sector 0 -- serving this to hostblk
+hostblk: unit 0 attached (read-only)
+```
+
+The board then reaches the identical `hostblk.device` DiagArea
+registration (`GUEST | Diag board ... InitResident ... 'hostblk.device'`)
+the hosted risk check showed, confirming the register-level path (card
+discovered, DiagArea entered, registers reachable) works unchanged
+under real UEFI firmware. Whether the RDB mount itself completes under
+this specific harness before the board's own 200-frame/50M-instruction
+Phase 1 boot budget runs out was not confirmed in this run (see the
+scheduling-sensitivity note above — a from-scratch run with a much
+larger frame budget still only reached the same DiagArea-registration
+point before parking, matching the hosted runner's own less
+reliable outcome at higher frame counts). "The board finds the disk
+and hands it to `hostblk`, and `hostblk`'s driver runs and registers
+from the board's DiagArea" is the real, verified result; a completed
+boot from it is not yet.
+
+### Block size: our constraint, not an Amiga one
+
+`hostblk`'s wire protocol and `machine_core::block::SECTOR_BYTES` are
+both hard-coded to 512 bytes; the RDB itself and later Kickstarts
+handle other native block sizes fine via `rdb_BlockBytes`/
+`de_SizeBlock`. `storage::EfiBlockDevice` reports the media's real
+`block_size()` in every log line regardless of outcome, and adapts
+rather than refuses whenever it safely can: block size 512 is a direct
+passthrough (the only case seen under QEMU so far); a size that is a
+clean multiple of 512 (e.g. 4096-byte NVMe/SSD sectors) is handled by
+slicing 512-byte sectors out of the containing native block, with
+writes as read-modify-write over that block; a size that cleanly
+divides 512 composes a sector from several contiguous native blocks
+with no partial-byte splicing needed. Only a size that is neither — not
+a clean multiple or divisor of 512 — is refused, with the reported size
+named in the log, since translating that case would mean behaving
+differently on read vs. write boundaries.
+
+### Fast RAM
+
+`fast_ram::allocate` asks UEFI boot services for 256 MB (matching
+`machine-hosted --fast-ram-mb`'s default and
+`tools/amibake/m68k-machine.toml`'s declared machine shape), halving
+down to a 1 MB floor on `OUT_OF_RESOURCES`/`NOT_FOUND` and reporting
+exactly what it got. Under QEMU with `-m 512M` the full 256 MB
+allocation succeeds every time (`fast RAM: 256 MB allocated from boot
+services`); the fallback path itself is exercised only by construction
+(halving loop, unit-testable logic) rather than by an observed
+low-memory QEMU run in this increment.
+
+### ROM-from-ESP: left out of this increment
+
+Loading Kickstart from a file on the ESP via
+`EFI_SIMPLE_FILE_SYSTEM_PROTOCOL`, falling back to the embedded AROS
+ROM when absent, was in scope to consider. It is left out here: it is
+an independent concern from the storage path this increment's risk
+question was actually about (whether AROS honours a DiagArea boot
+ROM), it adds real surface (locating the ESP's own `BlockIO`/
+`SimpleFileSystem` handle, a licensed-file-shaped failure mode
+distinct from "no RDB disk found," and another way the board's Phase 1
+boot can fail to start at all) to a change that must not regress the
+x86 CI markers, and nothing in this increment's evidence needed it —
+the DiagArea risk check and the disk-selection work both run
+end-to-end against the embedded AROS ROM alone. Worth its own
+increment rather than folding in here.
