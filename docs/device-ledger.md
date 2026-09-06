@@ -54,6 +54,58 @@ further than the claim requires. It was authorised deliberately — §8.1
 was expanded to cover everything needed to run — and it worked. It is
 also the clearest example of why this ledger needs to exist.
 
+## What the DraCo actually did, and why we differ
+
+Proposal §3 cites the DraCo as this machine's precedent, so it is worth
+recording what it really provided — because its answers differ from ours
+in two places, and one of them corrects a claim above.
+
+Its boot ROM replaced or added, per the module list in EAB thread
+116582: `draco.resource` (memory), `dracommu.library` (MMU),
+`dracospecial` (the alert/guru handler), `dracosyscheck`,
+`retina.library` and `dracographics.library` (a patch over
+`graphics.library` to draw through Retina), `dracobootmenu`,
+`dracobootpic.resource`, `dracoscsi.device`, `dracobattclock.resource`
+and `battclock.resource`, `dracokeyboard.resource` (an AT PC keyboard),
+`dracomouse.resource` (a serial two-button mouse), `dracofdc.resource`
+and `dracodisk.device` (floppy through a SuperIO chip), `dracofinal`,
+and — the interesting pair — **its own `cia.resource` and
+`timer.device`**, documented there as "DraCos do not require cia chips
+to work. They are optional".
+
+**That corrects the floor claimed above.** The CIAs are not a floor
+because AmigaOS needs them; they are a floor because *we* insist on
+running an unmodified Kickstart. DraCo's boot ROM copies the ROM into
+RAM and patches it — `Enable()`/`Disable()` are patched to drive its own
+interrupt controller rather than Paula's `INTENA` — and having done
+that, it can supply its own `cia.resource` and `timer.device` and have
+no CIAs at all. Softkicking is the price. The floor above is real for
+this project, but it is a consequence of a choice, not a property of the
+operating system, and it should not be quoted as though it were the
+latter.
+
+**The second difference is the more instructive.** DraCo did not
+emulate the chipset it lacked. Its boot ROM installs an MMU-based trap
+on the custom register space and *alerts* rather than servicing it —
+`$7f030001` is "access to blitter", `$7f030002` "access to Amiga audio
+hardware", `$7f03000x` custom registers generally. Software that reaches
+for the chipset gets a guru, by design.
+
+This project does the opposite: it models the blitter to 1,245
+differential cases so that software reaching for it simply works. That
+is a deliberate difference of goal rather than a mistake in either
+direction — DraCo was a video workstation whose software was written for
+it, and this machine wants unmodified AmigaOS and its existing software
+to run. But it does mean **the DraCo is not the precedent for the
+emulation this ledger tracks**; it is the precedent for the *native
+devices* it lists, and for the idea that the display, storage and I/O
+paths need not run through Agnus, Denise and Paula at all.
+
+Worth noting the same thread shows an unpatched Kickstart spinning on
+`$dff006` (`VHPOSR`) waiting for the beam to move — so even the
+replace-everything approach cannot escape a free-running beam counter,
+which is exactly the "floor" argument above, correctly scoped.
+
 ## The rule for new devices
 
 **Native-first.** A new device is emulated only when bootstrapping
