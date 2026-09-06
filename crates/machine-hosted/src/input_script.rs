@@ -30,6 +30,30 @@
 //! - `BUTTONDOWN <button>` / `BUTTONUP <button>` -- push a button
 //!   transition ([`NativeInput::push_button`]). `<button>` is `LEFT`,
 //!   `RIGHT`, `MIDDLE` (case-insensitive) or a numeric button id.
+//! - `CHARDOWN <char>` / `CHARUP <char>` -- push a character transition
+//!   ([`NativeInput::push_char`]), mirroring `KEYDOWN`/`KEYUP`'s down/up
+//!   shape but naming *what was typed* rather than *which key moved* --
+//!   see `machine_core::input`'s "Character events" module docs and
+//!   `docs/input-protocol.md` §15. `<char>` is either a single literal
+//!   character (e.g. `a`, `@`) or a `0x`-prefixed Unicode code point,
+//!   checked against [`machine_core::input::latin1_from_char`] at parse
+//!   time -- a code point outside Latin-1 (`0x00`-`0xFF`) is a parse
+//!   error, the same posture every other hostile input on this line takes.
+//!   A literal space or other whitespace can only be written as a code
+//!   point (`0x20`), since the directive line is split on whitespace
+//!   first.
+//! - `TYPE "<string>"` -- the common-case convenience: expands at parse
+//!   time to a `CHARDOWN`/`CHARUP` pair for every character in the
+//!   double-quoted string, in order, so a script author does not have to
+//!   spell out sixteen directives to type "Hello, World!". `\"` and `\\`
+//!   are the only recognised escapes (plus `\n`/`\t`); every character in
+//!   the string is subject to the same Latin-1 check `CHARDOWN` uses, and
+//!   any failure is a parse-time error citing the offending character,
+//!   not a partially-typed string discovered mid-run. A single character
+//!   is exactly `TYPE "x"`, so there's no need for a third form -- kept as
+//!   `TYPE` rather than overloading `CHARDOWN`/`CHARUP` because a script
+//!   author typing text wants press-*and*-release per character, not a
+//!   choice to make for every letter.
 //! - `SLEEP <frames>` -- wait `<frames>` chipset frames unconditionally
 //!   before the next directive, identical to `serial_script.rs`'s
 //!   `SLEEP`.
@@ -56,7 +80,7 @@ use std::io;
 use std::path::Path;
 
 use machine_core::input::NativeInput;
-use machine_core::input::{button, MAX_BUTTON, MAX_RAW_KEYCODE};
+use machine_core::input::{button, latin1_from_char, MAX_BUTTON, MAX_RAW_KEYCODE};
 
 #[derive(Debug, Clone, Copy)]
 enum Directive {
@@ -65,6 +89,8 @@ enum Directive {
     Move(i32, i32),
     ButtonDown(u8),
     ButtonUp(u8),
+    CharDown(char),
+    CharUp(char),
     Sleep(u64),
 }
 
@@ -98,8 +124,8 @@ impl InputScript {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let directive = parse_line(line).map_err(|e| format!("line {}: {e}", lineno + 1))?;
-            remaining.push_back(directive);
+            let directives = parse_line(line).map_err(|e| format!("line {}: {e}", lineno + 1))?;
+            remaining.extend(directives);
         }
         Ok(Self {
             remaining,
@@ -143,6 +169,12 @@ impl InputScript {
                 Directive::ButtonUp(id) => {
                     input.push_button(id, false, 0);
                 }
+                Directive::CharDown(ch) => {
+                    input.push_char(ch, true);
+                }
+                Directive::CharUp(ch) => {
+                    input.push_char(ch, false);
+                }
                 Directive::Sleep(frames) => {
                     self.sleep_deadline = Some(frame.saturating_add(frames));
                 }
@@ -151,12 +183,12 @@ impl InputScript {
     }
 }
 
-fn parse_line(line: &str) -> Result<Directive, String> {
+fn parse_line(line: &str) -> Result<Vec<Directive>, String> {
     let (cmd, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
     let rest = rest.trim();
     match cmd {
-        "KEYDOWN" => Ok(Directive::KeyDown(parse_keycode(rest)?)),
-        "KEYUP" => Ok(Directive::KeyUp(parse_keycode(rest)?)),
+        "KEYDOWN" => Ok(vec![Directive::KeyDown(parse_keycode(rest)?)]),
+        "KEYUP" => Ok(vec![Directive::KeyUp(parse_keycode(rest)?)]),
         "MOVE" => {
             let mut parts = rest.split_whitespace();
             let x = parts
@@ -178,13 +210,16 @@ fn parse_line(line: &str) -> Result<Directive, String> {
             if y < i16::MIN as i32 || y > i16::MAX as i32 {
                 return Err(format!("MOVE: y {y} out of i16 range (InputEvent::ie_Y)"));
             }
-            Ok(Directive::Move(x, y))
+            Ok(vec![Directive::Move(x, y)])
         }
-        "BUTTONDOWN" => Ok(Directive::ButtonDown(parse_button(rest)?)),
-        "BUTTONUP" => Ok(Directive::ButtonUp(parse_button(rest)?)),
+        "BUTTONDOWN" => Ok(vec![Directive::ButtonDown(parse_button(rest)?)]),
+        "BUTTONUP" => Ok(vec![Directive::ButtonUp(parse_button(rest)?)]),
+        "CHARDOWN" => Ok(vec![Directive::CharDown(parse_char(rest)?)]),
+        "CHARUP" => Ok(vec![Directive::CharUp(parse_char(rest)?)]),
+        "TYPE" => parse_type(rest),
         "SLEEP" => rest
             .parse::<u64>()
-            .map(Directive::Sleep)
+            .map(|frames| vec![Directive::Sleep(frames)])
             .map_err(|e| format!("SLEEP: {e}")),
         other => Err(format!("unknown directive {other:?}")),
     }
@@ -218,6 +253,88 @@ fn parse_button(text: &str) -> Result<u8, String> {
         }
     };
     Ok(id)
+}
+
+/// `CHARDOWN`/`CHARUP`'s argument: either a single literal character, or a
+/// `0x`-prefixed Unicode code point (needed for whitespace or other
+/// characters this directive line's own whitespace-splitting can't carry
+/// literally). Checked against Latin-1 representability here, at parse
+/// time, rather than only at [`NativeInput::push_char`] -- the same
+/// "hostile input fails at parse time" posture [`parse_keycode`] takes.
+fn parse_char(text: &str) -> Result<char, String> {
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        let code = u32::from_str_radix(hex, 16).map_err(|e| format!("char: {e}"))?;
+        let ch = char::from_u32(code)
+            .ok_or_else(|| format!("char: {code:#x} is not a valid Unicode scalar value"))?;
+        return latin1_char_or_err(ch);
+    }
+    let mut chars = text.chars();
+    let ch = chars
+        .next()
+        .ok_or("char: expected a character or 0x<codepoint>")?;
+    if chars.next().is_some() {
+        return Err(format!(
+            "char: expected exactly one character, got {text:?} \
+             (use 0x<codepoint> for anything containing whitespace)"
+        ));
+    }
+    latin1_char_or_err(ch)
+}
+
+fn latin1_char_or_err(ch: char) -> Result<char, String> {
+    if latin1_from_char(ch).is_some() {
+        Ok(ch)
+    } else {
+        Err(format!(
+            "char {ch:?} (U+{:04X}) has no Latin-1 representation",
+            ch as u32
+        ))
+    }
+}
+
+/// `TYPE "<string>"`: expand a double-quoted string into a `CHARDOWN`/
+/// `CHARUP` pair per character, eagerly at parse time -- module docs'
+/// rationale for why this exists alongside `CHARDOWN`/`CHARUP` rather than
+/// leaving typing text to a run of single-character directives.
+fn parse_type(text: &str) -> Result<Vec<Directive>, String> {
+    let s = parse_quoted(text)?;
+    let mut out = Vec::with_capacity(s.chars().count() * 2);
+    for ch in s.chars() {
+        let ch = latin1_char_or_err(ch).map_err(|e| format!("TYPE: {e}"))?;
+        out.push(Directive::CharDown(ch));
+        out.push(Directive::CharUp(ch));
+    }
+    Ok(out)
+}
+
+/// A minimal double-quoted string literal: `\"` and `\\` are the only
+/// escapes needed to write a literal quote or backslash, plus `\n`/`\t`
+/// for the two whitespace characters most likely to be wanted; anything
+/// else after a backslash, an unescaped `"` before the closing quote, or a
+/// missing pair of quotes altogether, is a parse error rather than a
+/// guess at what was meant.
+fn parse_quoted(text: &str) -> Result<String, String> {
+    if text.len() < 2 || !text.starts_with('"') || !text.ends_with('"') {
+        return Err("TYPE: expected a double-quoted string, e.g. TYPE \"hello\"".to_string());
+    }
+    let inner = &text[1..text.len() - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Err("TYPE: unescaped '\"' inside the string".to_string()),
+            '\\' => match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => return Err(format!("TYPE: unknown escape \\{other}")),
+                None => return Err("TYPE: trailing backslash".to_string()),
+            },
+            _ => out.push(c),
+        }
+    }
+    Ok(out)
 }
 
 fn parse_numeric(text: &str) -> Result<u32, String> {
@@ -291,6 +408,81 @@ mod tests {
     }
 
     #[test]
+    fn chardown_and_charup_apply_immediately_and_move_on() {
+        let mut script = InputScript::parse("CHARDOWN @\nCHARUP @\n").unwrap();
+        let mut dev = NativeInput::new();
+        script.tick(0, &mut dev);
+        assert!(script.is_done());
+
+        use machine_core::input::ev;
+        let (ty, code, q, ..) = peek(&dev);
+        assert_eq!(ty, ev::CHAR_DOWN);
+        assert_eq!(code, b'@');
+        assert_eq!(q, 0, "character events carry no qualifier");
+        advance(&mut dev);
+        let (ty, code, ..) = peek(&dev);
+        assert_eq!(ty, ev::CHAR_UP);
+        assert_eq!(code, b'@');
+    }
+
+    #[test]
+    fn chardown_accepts_a_hex_codepoint_for_whitespace_and_other_chars() {
+        let script = InputScript::parse("CHARDOWN 0x20\n").unwrap();
+        assert_eq!(script.remaining.len(), 1);
+        let mut dev = NativeInput::new();
+        let mut script = script;
+        script.tick(0, &mut dev);
+        assert_eq!(dev.read(machine_core::input::reg::EVENT_CODE + 3), b' ');
+    }
+
+    #[test]
+    fn type_expands_to_a_chardown_charup_pair_per_character() {
+        let script = InputScript::parse("TYPE \"Hi!\"\n").unwrap();
+        assert_eq!(script.remaining.len(), 6, "3 characters * (down + up) each");
+        let mut dev = NativeInput::new();
+        let mut script = script;
+        script.tick(0, &mut dev);
+        assert!(script.is_done());
+
+        use machine_core::input::ev;
+        for expected in *b"HHii!!" {
+            let (ty, code, ..) = peek(&dev);
+            assert!(ty == ev::CHAR_DOWN || ty == ev::CHAR_UP);
+            assert_eq!(code, expected);
+            advance(&mut dev);
+        }
+    }
+
+    #[test]
+    fn type_preserves_character_order_including_press_then_release_per_char() {
+        let script = InputScript::parse("TYPE \"ab\"\n").unwrap();
+        let mut dev = NativeInput::new();
+        let mut script = script;
+        script.tick(0, &mut dev);
+
+        use machine_core::input::ev;
+        let expect = [
+            (ev::CHAR_DOWN, b'a'),
+            (ev::CHAR_UP, b'a'),
+            (ev::CHAR_DOWN, b'b'),
+            (ev::CHAR_UP, b'b'),
+        ];
+        for (ty, code) in expect {
+            let (got_ty, got_code, ..) = peek(&dev);
+            assert_eq!(got_ty, ty);
+            assert_eq!(got_code, code);
+            advance(&mut dev);
+        }
+    }
+
+    #[test]
+    fn type_supports_escaped_quote_and_backslash() {
+        let script = InputScript::parse("TYPE \"a\\\"b\\\\c\"\n").unwrap();
+        // "a\"b\\c" -> a " b \ c -> 5 characters
+        assert_eq!(script.remaining.len(), 10);
+    }
+
+    #[test]
     fn sleep_blocks_until_its_frame_count_elapses() {
         let mut script = InputScript::parse("SLEEP 3\nKEYDOWN 1\n").unwrap();
         let mut dev = NativeInput::new();
@@ -334,5 +526,70 @@ mod tests {
     fn an_unknown_button_id_is_a_parse_error() {
         assert!(InputScript::parse("BUTTONDOWN 99").is_err());
         assert!(InputScript::parse("BUTTONDOWN FROBNICATE").is_err());
+    }
+
+    #[test]
+    fn a_character_with_no_latin1_representation_is_a_parse_error() {
+        assert!(InputScript::parse("CHARDOWN 0x20AC").is_err(), "EURO SIGN");
+        assert!(
+            InputScript::parse("CHARDOWN 0x1F600").is_err(),
+            "an emoji code point"
+        );
+        assert!(InputScript::parse("CHARDOWN 0x100").is_err());
+        // The full legal range still works.
+        assert!(InputScript::parse("CHARDOWN 0xFF").is_ok());
+        assert!(InputScript::parse("CHARDOWN 0x00").is_ok());
+    }
+
+    #[test]
+    fn a_multi_character_chardown_argument_is_a_parse_error() {
+        assert!(InputScript::parse("CHARDOWN ab").is_err());
+    }
+
+    #[test]
+    fn an_empty_chardown_argument_is_a_parse_error() {
+        assert!(InputScript::parse("CHARDOWN").is_err());
+        assert!(InputScript::parse("CHARDOWN \n").is_err());
+    }
+
+    #[test]
+    fn an_invalid_hex_codepoint_for_chardown_is_a_parse_error() {
+        assert!(InputScript::parse("CHARDOWN 0xZZ").is_err());
+    }
+
+    #[test]
+    fn type_with_a_non_latin1_character_is_a_parse_error_citing_the_character() {
+        let err = match InputScript::parse("TYPE \"caf\u{e9}\u{20ac}\"") {
+            Ok(_) => panic!("expected a parse error for a non-Latin-1 character"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("TYPE"),
+            "error should identify the directive: {err}"
+        );
+    }
+
+    #[test]
+    fn type_without_matching_quotes_is_a_parse_error() {
+        assert!(InputScript::parse("TYPE hello").is_err());
+        assert!(InputScript::parse("TYPE \"unterminated").is_err());
+        assert!(
+            InputScript::parse("TYPE \"\"").is_ok(),
+            "an empty string types nothing"
+        );
+    }
+
+    #[test]
+    fn type_rejects_an_unescaped_quote_or_trailing_backslash() {
+        assert!(InputScript::parse("TYPE \"a\"b\"").is_err());
+        assert!(
+            InputScript::parse("TYPE \"a\\\"").is_err(),
+            "trailing backslash"
+        );
+    }
+
+    #[test]
+    fn type_rejects_an_unknown_escape_sequence() {
+        assert!(InputScript::parse("TYPE \"\\q\"").is_err());
     }
 }

@@ -165,7 +165,7 @@
 //! | Offset | Register | Width | Access | Notes |
 //! |---|---|---|---|---|
 //! | `0x00` | [`reg::EVENT_TYPE`] | byte | R | head event's type ([`ev`]), `0` ([`ev::NONE`]) if the queue is empty |
-//! | `0x04` | [`reg::EVENT_CODE`] | byte | R | raw key code or button id; `0` for pointer motion |
+//! | `0x04` | [`reg::EVENT_CODE`] | byte | R | raw key code, button id, or Latin-1 character byte ([`ev::CHAR_DOWN`]/[`ev::CHAR_UP`], see "Character events"); `0` for pointer motion |
 //! | `0x08` | [`reg::EVENT_QUALIFIER`] | u32 | R | qualifier mask, low 16 bits meaningful (`IEQUALIFIER_*`) |
 //! | `0x0C` | [`reg::EVENT_X`] | u32 | R | absolute X, sign-extended from the `i16` a driver hands to `ie_X` |
 //! | `0x10` | [`reg::EVENT_Y`] | u32 | R | absolute Y, same shape |
@@ -176,6 +176,36 @@
 //! | `0x24` | [`reg::INT_ENABLE`] | byte | RW | `1` lets [`reg::INT_STATUS`] reach INT2; `0` (reset value) masks it |
 //! | `0x28` | [`reg::CAPACITY`] | u32 | R | queue depth in events -- **read this, do not hardcode it**, same reasoning as `hostblk::reg::SUBMIT_CAPACITY` |
 //! | `0x2C` | [`reg::VERSION`] | u32 | R | protocol version; `1` for this document |
+//!
+//! # Character events: what `docs/input-protocol.md` §15 asked for
+//!
+//! [`ev::CHAR_DOWN`]/[`ev::CHAR_UP`] exist because this card's raw
+//! [`ev::KEY_DOWN`]/[`ev::KEY_UP`] events carry *physical key positions*,
+//! and turning "the user typed `@`" into one requires knowing the guest's
+//! *active keymap* -- something this host-side card cannot know and
+//! should not have to (§15's framing, recorded there before this event
+//! type existed). `~/src/amirfb`'s solution, cited in full in §15, is
+//! `keymap.library`'s `MapANSI()`: it inverts a character into the
+//! rawkey-plus-qualifier combination that produces it under whatever
+//! keymap is active, so the *driver* does the conversion and it
+//! self-adapts to the guest's keymap for free. That means this card only
+//! has to be able to carry a character at all -- it does not, and must
+//! not, try to resolve one to a rawkey itself.
+//!
+//! [`latin1_from_char`]'s own doc comment covers the encoding choice and
+//! what an unrepresentable character does (rejected, not substituted).
+//! [`NativeInput::push_char`] covers press/release and the overflow
+//! posture.
+//!
+//! **What this increment does *not* do, stated plainly (the brief's own
+//! instruction): the driver side does not exist yet.**
+//! `m68k/input-rom/input-diagrom.s` has no code that drains
+//! [`ev::CHAR_DOWN`]/[`ev::CHAR_UP`], let alone one that calls
+//! `MapANSI()` -- that is explicitly the next driver increment's work,
+//! same as §7's held-qualifier bookkeeping already is. This module and
+//! `crate::input_script` (in `machine-hosted`) only make a character event
+//! *possible to produce and queue*; nothing on the guest side can consume
+//! one today.
 //!
 //! # Interrupt model: a latch, not a level -- and why that differs from `hostblk`
 //!
@@ -244,17 +274,25 @@
 //!   slot per movement -- which is also why a key/button flood can never
 //!   be crowded out by motion the way it could with a single undifferentiated
 //!   queue.
-//! - **A key/button push that finds the queue full evicts the queued
-//!   motion entry first**, if there is one
+//! - **A key/button/character push that finds the queue full evicts the
+//!   queued motion entry first**, if there is one
 //!   ([`NativeInput::push_discrete`]): freeing a slot by discarding
 //!   already-stale, about-to-be-superseded position data costs nothing
 //!   the guest can observe, and it is strictly better than losing a
-//!   key-up.
-//! - **Only once the queue is full of key/button events with no motion
-//!   entry left to evict** does this module fall back to `hostblk`'s
-//!   posture: drop the incoming event and count it in
+//!   key-up. [`ev::CHAR_DOWN`]/[`ev::CHAR_UP`] go through this exact same
+//!   path -- [`NativeInput::push_char`] calls the same
+//!   [`push_discrete`](Self::push_discrete) that
+//!   [`push_key`](Self::push_key)/[`push_button`](Self::push_button) do,
+//!   so a character event is
+//!   protected from eviction and can itself evict motion, never the
+//!   reverse.
+//! - **Only once the queue is full of key/button/character events with no
+//!   motion entry left to evict** does this module fall back to
+//!   `hostblk`'s posture: drop the incoming event and count it in
 //!   [`reg::EVENT_OVERFLOW`] ([`NativeInput::overflow`]). This is the
-//!   genuinely bad case -- it can drop a key-up -- but it now requires a
+//!   genuinely bad case -- it can drop a key-up (or a character release,
+//!   which leaves a key logically stuck down exactly the same way) -- but
+//!   it now requires a
 //!   driver that has stopped draining the queue entirely for
 //!   [`QUEUE_CAPACITY`] consecutive discrete events with the host still
 //!   producing more, which is already a broken driver by other measures
@@ -315,6 +353,10 @@
 //! - [`NativeInput::push_pointer_motion`] rejects `x`/`y` outside
 //!   `i16::MIN..=i16::MAX` the same way, per the header finding above
 //!   (`ie_X`/`ie_Y` are `WORD`).
+//! - [`NativeInput::push_char`] rejects a `char` with no Latin-1
+//!   representation the same way ([`latin1_from_char`]'s doc comment) --
+//!   never a panic, never a queued character a driver's `MapANSI()` could
+//!   not have produced.
 //!
 //! `machine-hosted`'s input-script parser (`crate::input_script`, not
 //! this module) is the other half of "a bogus event type fails cleanly":
@@ -430,6 +472,50 @@ pub mod button {
 /// The highest button id [`NativeInput::push_button`] accepts.
 pub const MAX_BUTTON: u8 = button::MIDDLE;
 
+/// Convert a Unicode scalar value to the Latin-1 (ISO-8859-1) byte
+/// [`ev::CHAR_DOWN`]/[`ev::CHAR_UP`] carry in [`reg::EVENT_CODE`], or
+/// `None` if `ch` has no such representation.
+///
+/// # Why Latin-1
+///
+/// Three reasons converge on it rather than, say, UTF-8 or a wider code
+/// unit:
+///
+/// - **It is AmigaOS's own convention.** `console.device`/`diskfont.library`
+///   text and `keymap.library`'s own `KeyMap` tables are built around the
+///   ISO-8859-1 8-bit character set (RKRM Devices, "console.device"; RKRM
+///   Libraries, "keymap.library") -- a byte this card hands a driver is
+///   already the same byte the driver's own `MapANSI()` call expects as
+///   input, no intermediate translation needed.
+/// - **It matches `amirfb`'s own solution** (`docs/input-protocol.md` §15):
+///   `~/src/amirfb` drives its `MapANSI()`-based typing from X11 keysyms,
+///   and for the printable range X11 keysyms `0x20`-`0xFF` are defined to
+///   equal the Latin-1 code point directly (X11 `keysymdef.h`'s own
+///   comment: "identical to the Latin-1 sets"). Choosing Latin-1 here
+///   means a future host-side input source that already speaks X11
+///   keysyms (as `amirfb`'s VNC server does) needs no lookup table either,
+///   only a range check.
+/// - **One byte keeps [`reg::EVENT_CODE`] and `QueuedEvent`'s shape
+///   unchanged.** A wider encoding (UTF-8, `char`'s own 32 bits) would
+///   need either multiple queue slots per character or a new, wider
+///   register this `#![no_std]`/no-alloc, fixed-capacity card has no room
+///   to add without changing every other event's shape too.
+///
+/// # What happens to a value with no Latin-1 representation
+///
+/// [`NativeInput::push_char`] rejects it -- returns `false`, queues
+/// nothing, same "hostile input fails cleanly" posture as an out-of-range
+/// key code or coordinate (module docs, "Hostile input"). There is no
+/// silent substitution (e.g. `?` or `\u{FFFD}`): a driver that received a
+/// substitute character would type the wrong thing with no indication
+/// anything was lost, which is worse than the host script/caller finding
+/// out immediately that the character it asked for cannot cross this
+/// card's wire format.
+pub fn latin1_from_char(ch: char) -> Option<u8> {
+    let code = ch as u32;
+    (code <= 0xFF).then_some(code as u8)
+}
+
 /// [`reg::EVENT_TYPE`] values.
 pub mod ev {
     /// The queue is empty; [`super::reg::EVENT_CODE`]/`EVENT_QUALIFIER`/
@@ -442,6 +528,20 @@ pub mod ev {
     pub const POINTER_MOTION: u8 = 3;
     pub const BUTTON_DOWN: u8 = 4;
     pub const BUTTON_UP: u8 = 5;
+    /// A character, Latin-1 encoded in [`super::reg::EVENT_CODE`] -- see
+    /// the module docs' "Character events" section and
+    /// [`super::latin1_from_char`]. Distinct from [`KEY_DOWN`]/[`KEY_UP`]:
+    /// this event names *what the user typed*, not *which physical key
+    /// moved*, and only a driver's `MapANSI()` can turn one into the
+    /// other, since that translation depends on the guest's active
+    /// keymap. `EVENT_QUALIFIER` is always `0` for this event type -- see
+    /// the module docs.
+    pub const CHAR_DOWN: u8 = 6;
+    /// The release matching a [`CHAR_DOWN`], carrying the same Latin-1
+    /// byte. See the module docs' "Character events" section for why
+    /// press and release are both modelled rather than a single
+    /// instantaneous keystroke.
+    pub const CHAR_UP: u8 = 7;
 }
 
 /// Register offsets within this card's AUTOCONFIG window. See the module
@@ -660,6 +760,40 @@ impl NativeInput {
             ty,
             code: button,
             qualifier,
+            x: 0,
+            y: 0,
+        })
+    }
+
+    /// Queue a character transition. `ch` is encoded as Latin-1
+    /// ([`latin1_from_char`]); a character with no Latin-1 representation
+    /// is rejected by returning `false` and touching nothing else, the
+    /// same "Hostile input" posture as [`push_key`](Self::push_key)/
+    /// [`push_button`](Self::push_button).
+    ///
+    /// This is a **press or a release, not an instantaneous keystroke**
+    /// (module docs, "Character events"): call it once with `down: true`
+    /// and once with `down: false` to express a full keystroke, mirroring
+    /// [`push_key`](Self::push_key)'s down/up pair. A driver's `MapANSI()`
+    /// increment needs both halves to hold the qualifiers a character
+    /// requires for the key's whole duration rather than tapping them
+    /// (`docs/input-protocol.md` §15's `amirfb` retrospective).
+    ///
+    /// Treated as a discrete event by the overflow policy -- protected
+    /// from eviction by queued motion, and itself allowed to evict queued
+    /// motion under pressure -- exactly like a key or button event ("Overflow
+    /// policy" below): a dropped character release would leave a key
+    /// logically stuck down in the guest forever, the same failure a
+    /// dropped [`ev::KEY_UP`] would cause.
+    pub fn push_char(&mut self, ch: char, down: bool) -> bool {
+        let Some(byte) = latin1_from_char(ch) else {
+            return false;
+        };
+        let ty = if down { ev::CHAR_DOWN } else { ev::CHAR_UP };
+        self.push_discrete(QueuedEvent {
+            ty,
+            code: byte,
+            qualifier: 0,
             x: 0,
             y: 0,
         })
@@ -982,6 +1116,132 @@ mod tests {
         assert!(dev.push_pointer_motion(30, 30, 0));
         assert_eq!(read_u32(&dev, reg::EVENT_COUNT), 1);
         assert_eq!(read_u32(&dev, reg::EVENT_X), 30);
+    }
+
+    // ---- character events ---------------------------------------------------
+
+    #[test]
+    fn char_down_then_up_round_trips_through_the_queue_in_order() {
+        let mut dev = NativeInput::new();
+        assert!(dev.push_char('@', true));
+        assert!(dev.push_char('@', false));
+
+        assert_eq!(read_u32(&dev, reg::EVENT_COUNT), 2);
+        assert_eq!(dev.read(reg::EVENT_TYPE + 3), ev::CHAR_DOWN);
+        assert_eq!(dev.read(reg::EVENT_CODE + 3), b'@');
+        assert_eq!(
+            read_u32(&dev, reg::EVENT_QUALIFIER),
+            0,
+            "character events carry no qualifier -- a driver's MapANSI() computes it"
+        );
+        advance(&mut dev);
+
+        assert_eq!(dev.read(reg::EVENT_TYPE + 3), ev::CHAR_UP);
+        assert_eq!(dev.read(reg::EVENT_CODE + 3), b'@');
+        advance(&mut dev);
+
+        assert_eq!(dev.read(reg::EVENT_TYPE + 3), ev::NONE);
+        assert_eq!(read_u32(&dev, reg::EVENT_COUNT), 0);
+    }
+
+    #[test]
+    fn char_down_and_char_up_are_distinct_events_not_a_synthesised_tap() {
+        // A press with no matching release must still be observable as a
+        // press sitting alone in the queue -- if this collapsed into a
+        // single instantaneous keystroke there would be nothing left for
+        // a driver to hold qualifiers across (docs/input-protocol.md §15).
+        let mut dev = NativeInput::new();
+        assert!(dev.push_char('x', true));
+        assert_eq!(read_u32(&dev, reg::EVENT_COUNT), 1);
+        assert_eq!(dev.read(reg::EVENT_TYPE + 3), ev::CHAR_DOWN);
+    }
+
+    #[test]
+    fn latin1_boundary_characters_round_trip() {
+        let mut dev = NativeInput::new();
+        assert!(
+            dev.push_char('\u{0}', true),
+            "control char 0x00 is valid Latin-1"
+        );
+        assert_eq!(dev.read(reg::EVENT_CODE + 3), 0x00);
+        advance(&mut dev);
+        assert!(
+            dev.push_char('\u{FF}', true),
+            "0xFF (y-diaeresis) is the top of Latin-1"
+        );
+        assert_eq!(dev.read(reg::EVENT_CODE + 3), 0xFF);
+    }
+
+    #[test]
+    fn a_character_outside_latin1_is_rejected_cleanly() {
+        let mut dev = NativeInput::new();
+        assert!(
+            !dev.push_char('\u{100}', true),
+            "first code point past Latin-1's range"
+        );
+        assert!(
+            !dev.push_char('\u{20AC}', true),
+            "EURO SIGN, not in Latin-1"
+        );
+        assert!(
+            !dev.push_char('\u{1F600}', true),
+            "an emoji, nowhere near Latin-1"
+        );
+        assert_eq!(read_u32(&dev, reg::EVENT_COUNT), 0);
+        assert_eq!(latin1_from_char('\u{100}'), None);
+        assert_eq!(latin1_from_char('\u{FF}'), Some(0xFF));
+    }
+
+    #[test]
+    fn a_character_push_that_finds_the_queue_full_evicts_pending_motion() {
+        let mut dev = NativeInput::new();
+        for i in 0..(QUEUE_CAPACITY as u8 - 1) {
+            assert!(dev.push_key(i, true, 0));
+        }
+        assert!(dev.push_pointer_motion(5, 5, 0));
+        assert_eq!(read_u32(&dev, reg::EVENT_COUNT), QUEUE_CAPACITY as u32);
+
+        // A character event must get in by evicting the motion entry,
+        // exactly like a key or button push -- it is a discrete event too.
+        assert!(dev.push_char('a', true));
+        assert_eq!(read_u32(&dev, reg::EVENT_OVERFLOW), 0);
+        assert_eq!(read_u32(&dev, reg::EVENT_COUNT), QUEUE_CAPACITY as u32);
+    }
+
+    #[test]
+    fn a_queue_full_of_discrete_events_with_no_motion_drops_and_counts_a_character() {
+        let mut dev = NativeInput::new();
+        for i in 0..QUEUE_CAPACITY as u8 {
+            assert!(dev.push_key(i, true, 0));
+        }
+        assert!(
+            !dev.push_char('a', true),
+            "a genuinely full discrete queue must reject a character too"
+        );
+        assert_eq!(read_u32(&dev, reg::EVENT_OVERFLOW), 1);
+    }
+
+    #[test]
+    fn a_character_never_jumps_ahead_of_an_already_queued_motion() {
+        // Same reordering hazard the pointer-motion/button test above
+        // guards against, checked for the character event type too: a
+        // character push must not disturb a queued motion's position by
+        // coalescing into it (only POINTER_MOTION coalesces into
+        // POINTER_MOTION).
+        let mut dev = NativeInput::new();
+        dev.push_pointer_motion(100, 100, 0);
+        dev.push_char('a', true);
+        dev.push_pointer_motion(200, 200, 0);
+
+        assert_eq!(read_u32(&dev, reg::EVENT_TYPE), ev::POINTER_MOTION as u32);
+        assert_eq!(read_u32(&dev, reg::EVENT_X), 100, "click position lost");
+        advance(&mut dev);
+
+        assert_eq!(read_u32(&dev, reg::EVENT_TYPE), ev::CHAR_DOWN as u32);
+        advance(&mut dev);
+
+        assert_eq!(read_u32(&dev, reg::EVENT_TYPE), ev::POINTER_MOTION as u32);
+        assert_eq!(read_u32(&dev, reg::EVENT_X), 200);
     }
 
     // ---- overflow policy --------------------------------------------------

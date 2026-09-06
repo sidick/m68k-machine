@@ -74,9 +74,9 @@ no allocator): a fixed-capacity ring of 16 entries
 
 | Field | Width | Notes |
 |---|---|---|
-| type | byte | [`ev::KEY_DOWN`]/`KEY_UP`/`POINTER_MOTION`/`BUTTON_DOWN`/`BUTTON_UP`, or `NONE` (`0`) when the queue is empty |
-| code | byte | raw Amiga key code (`0x00`-`0x7F`) or button id (`0`=left, `1`=right, `2`=middle); `0` for pointer motion |
-| qualifier | u16 | a caller-supplied modifier mask, passed through verbatim -- see §7 for what a driver must do with it, since this card does **not** compute it |
+| type | byte | [`ev::KEY_DOWN`]/`KEY_UP`/`POINTER_MOTION`/`BUTTON_DOWN`/`BUTTON_UP`/`CHAR_DOWN`/`CHAR_UP`, or `NONE` (`0`) when the queue is empty |
+| code | byte | raw Amiga key code (`0x00`-`0x7F`), button id (`0`=left, `1`=right, `2`=middle), or a Latin-1 character byte for `CHAR_DOWN`/`CHAR_UP` (§15); `0` for pointer motion |
+| qualifier | u16 | a caller-supplied modifier mask, passed through verbatim -- see §7 for what a driver must do with it, since this card does **not** compute it. Always `0` for `CHAR_DOWN`/`CHAR_UP`: a character carries no qualifier of its own, since a driver's `MapANSI()` is what derives one (§15) |
 | x, y | i16 each | absolute pointer position, meaningful only for `POINTER_MOTION` |
 
 ## 5. Register map
@@ -88,7 +88,7 @@ this machine. Anything not listed reads `0` and discards writes.
 | Offset | Register | Width | Access | Notes |
 |---|---|---|---|---|
 | `0x00` | `EVENT_TYPE` | byte | R | head event's type, `0` if the queue is empty |
-| `0x04` | `EVENT_CODE` | byte | R | raw key code or button id; `0` for pointer motion |
+| `0x04` | `EVENT_CODE` | byte | R | raw key code, button id, or Latin-1 character byte (`CHAR_DOWN`/`CHAR_UP`, §15); `0` for pointer motion |
 | `0x08` | `EVENT_QUALIFIER` | u32 | R | qualifier mask, low 16 bits meaningful |
 | `0x0C` | `EVENT_X` | u32 | R | absolute X, sign-extended from an `i16` |
 | `0x10` | `EVENT_Y` | u32 | R | absolute Y, same shape |
@@ -286,14 +286,20 @@ This card acts on that asymmetry structurally:
   appending a second one. At most one is ever in flight, so a flood of
   mouse movement between two driver polls costs one queue slot, not one
   per movement.
-- **A key/button push that finds the queue full evicts the queued motion
-  entry first**, if there is one: freeing a slot by discarding
-  already-stale, about-to-be-superseded position data costs nothing the
-  guest can observe, and is strictly better than losing a key-up.
-- **Only once the queue is full of key/button events with no motion
-  entry left to evict** does this card fall back to `hostblk`'s posture:
-  drop the incoming event and count it in `EVENT_OVERFLOW`. This is the
-  genuinely bad case -- it can drop a key-up -- but it now requires a
+- **A key/button/character push that finds the queue full evicts the
+  queued motion entry first**, if there is one: freeing a slot by
+  discarding already-stale, about-to-be-superseded position data costs
+  nothing the guest can observe, and is strictly better than losing a
+  key-up. `CHAR_DOWN`/`CHAR_UP` (§15) are discrete events exactly like a
+  key or button transition and go through this identical path -- a
+  character event is protected from eviction by queued motion and can
+  itself evict motion, never the reverse.
+- **Only once the queue is full of key/button/character events with no
+  motion entry left to evict** does this card fall back to `hostblk`'s
+  posture: drop the incoming event and count it in `EVENT_OVERFLOW`. This
+  is the genuinely bad case -- it can drop a key-up, or equally a
+  character release, which leaves a key logically stuck down in the guest
+  exactly the same way -- but it now requires a
   driver that has stopped draining the queue entirely for
   `QUEUE_CAPACITY` (16) consecutive discrete events with the host still
   producing more, which is already a broken driver by other measures. A
@@ -351,11 +357,21 @@ existing `--serial-script`. Directives, one per line:
 - `MOVE <x> <y>` -- signed decimal, `i16::MIN..=i16::MAX`.
 - `BUTTONDOWN <button>` / `BUTTONUP <button>` -- `LEFT`/`RIGHT`/`MIDDLE`
   (case-insensitive) or a numeric id.
+- `CHARDOWN <char>` / `CHARUP <char>` -- push a `CHAR_DOWN`/`CHAR_UP`
+  event (§15). `<char>` is a single literal character or a `0x`-prefixed
+  Unicode code point, checked against the card's Latin-1 encoding at
+  parse time; a literal space or other whitespace needs the code-point
+  form since the directive line is itself split on whitespace.
+- `TYPE "<string>"` -- expands at parse time to a `CHARDOWN`/`CHARUP`
+  pair per character of a double-quoted string, in order -- the common
+  case of typing text without spelling out two directives per character.
+  `\"`/`\\`/`\n`/`\t` are the only recognised escapes.
 - `SLEEP <frames>` -- wait unconditionally before the next directive.
 
-An out-of-range key code, button id, or coordinate is a **parse-time**
-error (the script fails to load at all), not a silently dropped event --
-the same posture `serial_script.rs` takes for an unrecognised directive.
+An out-of-range key code, button id, coordinate, or a character with no
+Latin-1 representation, is a **parse-time** error (the script fails to
+load at all), not a silently dropped event -- the same posture
+`serial_script.rs` takes for an unrecognised directive.
 Every directive except `SLEEP` fires immediately and moves on; there is
 no `WAIT`-on-guest-output equivalent (`serial_script.rs`'s `WAIT`) yet,
 because no driver exists to produce a guest reaction to wait for (§12).
@@ -377,6 +393,10 @@ what this section used to list as missing. What's left:
 - No `IESUBCLASS_TABLET`/`NEWTABLET` support -- this card only ever
   carries pixel coordinates (§6), so the driver only ever builds
   `IESUBCLASS_PIXEL`.
+- `CHAR_DOWN`/`CHAR_UP` (§15) are new in this increment and carry no
+  driver consumer at all yet -- no code in `input-diagrom.s` drains them
+  or calls `MapANSI()`. The card and `--input-script` side are done; the
+  `MapANSI()`-based driver is explicitly future work, not attempted here.
 - Key-down/key-up and button-down/button-up were exercised as a
   guest-stability smoke test (the driver task survives them, keeps
   draining, and the machine keeps booting) but **not** independently
@@ -540,18 +560,21 @@ must come from a `struct Resident`'s `rt_Init`, which is what both this
 ROM and `hostblk`'s do. A future ROM wanting code to run at configuration
 time cannot get it this way.
 
-## 15. Typing characters: what AmiRFB solved that this card has not
+## 15. Typing characters: what AmiRFB solved, and what this card now carries
 
 `~/src/amirfb` (BSD 2-Clause, the project owner's) injects input into a
 live AmigaOS from a VNC client, and its `src/amiga/rfb_server.c` solves
-the keyboard problem in a way this card's current design cannot. Worth
-recording before the next driver increment repeats the mistake.
+the keyboard problem this section originally recorded as a gap in this
+card's design. It is a gap no longer: `CHAR_DOWN`/`CHAR_UP` now exist for
+exactly the reason this section lays out. The reasoning below is kept
+verbatim (it is *why* the feature exists), with a closing note on what is
+now built versus what a driver still has to do with it.
 
-**The problem.** This card carries *raw Amiga keycodes*. That is fine for
-a scripted test which can hardcode them, and wrong for anything else: raw
-keycodes are **physical key positions**, so turning "the user typed `@`"
-into one requires knowing the guest's *active keymap*, which the host
-cannot know and should not have to.
+**The problem.** This card's other event types carry *raw Amiga
+keycodes*. That is fine for a scripted test which can hardcode them, and
+wrong for anything else: raw keycodes are **physical key positions**, so
+turning "the user typed `@`" into one requires knowing the guest's
+*active keymap*, which the host cannot know and should not have to.
 
 **The solution, and it is not a lookup table.** `keymap.library`'s
 `MapANSI()` inverts a character into the rawkey-plus-qualifier
@@ -568,11 +591,6 @@ AmiRFB layers it:
    small fixed table, because those *are* keymap-independent by
    construction, being physical positions with no character.
 
-**Consequence for this card:** the event queue should carry a
-*character* event type alongside the raw-keycode one, and the driver
-should invert it with `MapANSI()`. Sending only raw keycodes pushes an
-impossible problem onto the host.
-
 **And qualifiers must be reference-counted.** Two held keys can both
 want Shift, so a key-up may not release it. AmiRFB presses the qualifiers
 a key needs, holds them, treats auto-repeat as re-sending only the main
@@ -586,3 +604,66 @@ this project's ROM does for keys with no character. That is corroboration
 from a second implementation, not a header citation — `Include_H` still
 ships no `rawkeycodes.h`, so the caveat in
 `m68k/input-rom/input-diagrom.s` stands unchanged.
+
+### What this card now does
+
+`ev::CHAR_DOWN`/`ev::CHAR_UP` (§4-§5) carry a **Latin-1 (ISO-8859-1)
+byte** in `EVENT_CODE`. Latin-1 rather than UTF-8 or a wider code unit,
+for three reasons:
+
+- It is AmigaOS's own convention — `console.device`/`diskfont.library`
+  text and `keymap.library`'s own `KeyMap` tables are already built
+  around ISO-8859-1, so the byte this card hands a driver is already the
+  byte the driver's own `MapANSI()` call expects, no translation needed.
+- It matches AmiRFB's own solution: AmiRFB drives `MapANSI()` from X11
+  keysyms, and X11 keysyms `0x20`-`0xFF` are defined to equal the Latin-1
+  code point directly (`keysymdef.h`'s own comment: "identical to the
+  Latin-1 sets"). A future host-side input source that already speaks
+  X11 keysyms needs only a range check, not a lookup table, to feed this
+  card.
+- One byte keeps `EVENT_CODE` and the fixed-capacity, no-alloc queue
+  entry's shape unchanged — a wider encoding would need either multiple
+  queue slots per character or a new, wider register.
+
+A Unicode character with no Latin-1 representation (anything above
+U+00FF) is **rejected, not substituted**: `NativeInput::push_char`
+returns `false` and queues nothing, and `--input-script`'s `CHARDOWN`/
+`CHARUP`/`TYPE` reject it at **parse time**, the same "hostile input
+fails cleanly" posture §11's other rejections already take. There is no
+silent substitute character (`?`, `\u{FFFD}`) — a driver that received
+one would type the wrong thing with no indication anything was lost.
+
+**Down and up, not a synthesised tap.** `CHAR_DOWN` and `CHAR_UP` are
+separate, independently queueable events, mirroring `KEY_DOWN`/`KEY_UP`'s
+shape rather than collapsing a character into one instantaneous
+keystroke. This is what lets a driver implement the "press the qualifiers
+a character needs, hold them, treat repeat as re-sending only the main
+rawkey, release on key-up" scheme AmiRFB uses (above) faithfully, instead
+of being handed an event shape that already assumes a tap. A character
+event is a **discrete** event for the overflow policy (§9), protected
+from eviction by queued motion and able to evict motion itself, exactly
+like a key or button event — a dropped `CHAR_UP` would leave a key
+logically stuck down in the guest forever, the same failure a dropped
+`KEY_UP` causes.
+
+`--input-script` gained three directives to produce them: `CHARDOWN
+<char>` / `CHARUP <char>` (§10) for the down/up pair directly, and `TYPE
+"<string>"`, which expands at parse time to a `CHARDOWN`/`CHARUP` pair
+per character — typing a string being the common case a script author
+actually wants, rather than spelling out two directives per letter.
+
+### What a driver still has to do
+
+Nothing on the guest side consumes these events yet.
+`m68k/input-rom/input-diagrom.s` has no code that drains `CHAR_DOWN`/
+`CHAR_UP`, let alone one that calls `MapANSI()` — that is the next driver
+increment's work, same as §7's held-qualifier bookkeeping and §11's other
+open items already are. What this increment built is only the
+*possibility*: an event type that carries a character, plumbed through
+the queue, the register file, and a script directive to produce one. The
+driver increment's job, once it exists, is to drain `CHAR_DOWN`/
+`CHAR_UP`, call `MapANSI()` to invert the Latin-1 byte into a
+rawkey-plus-qualifier combination under the guest's active keymap, and
+apply AmiRFB's press/hold/repeat/release-with-refcounted-qualifiers
+scheme described above when building the resulting `IECLASS_RAWKEY`
+`InputEvent`s.
