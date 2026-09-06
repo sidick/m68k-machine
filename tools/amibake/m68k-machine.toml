@@ -1,31 +1,29 @@
-# Boot HDF for the m68k Machine's Gayle IDE bring-up device.
+# Boot HDF for this machine's `hostblk` storage card.
 #
 # Machine block mirrors what this machine actually presents to the guest:
 # a 68040 with FPU (proposal §6.2, and what Exec reports as AttnFlags
-# $804F), 2 MB of chip RAM (§6.1) and no fast RAM yet. No RTG: P96 is
-# Phase 3, and until then the stop-gap planar renderer (§8.1) is the
-# display.
+# $804F), 2 MB of chip RAM (§6.1), and 256 MB of fast RAM behind a
+# Zorro III AUTOCONFIG memory board (`fastram.rs`), which is why `z3`
+# rather than `fast` — that is literally how the guest is offered it.
+# 256 MB is `--fast-ram-mb`'s default and proposal §13's intended guest
+# footprint.
 #
 # mmulibs supplies 68040.library. Without it the base's own
 # Startup-Sequence nags every boot for a missing CPU support library,
 # which on a machine presenting a 68040 is exactly the gap §6.2 warns
 # about.
 #
-# Both outputs are wanted. The `hdf` is what this machine's Gayle IDE
-# port serves — and Copperline models the same built-in Gayle IDE
-# (`attach = "ide-master"`, documented as "Built-in Gayle / A4000 IDE
-# Master"), so the identical image boots on both and the oracle can be
-# used against our IDE implementation rather than only our chipset.
-# The `dir` output is what amibake's copperline emitter currently
-# requires; Copperline supports host directories too, so it is a second
-# way to boot the same tree.
+# The test-harness packages below are not needed to boot; they exist so
+# the image can be driven and soaked without being hand-patched with
+# `xdftool` afterwards, which is what it used to need and what made it
+# useless as a CI fixture.
 #
 # The built outputs contain licensed AmigaOS 3.2.2 and must never be
 # committed — see .gitignore. Build them locally with:
 #
 #   ~/src/amibake/.venv/bin/amibake build tools/amibake/m68k-machine.toml
 base     = "os3.2.2"
-machine  = { cpu = "68040", fpu = true, ram = "chip:2M", rtg = true }
+machine  = { cpu = "68040", fpu = true, ram = "chip:2M,z3:256M", rtg = true }
 packages = [
   # P96 with the Graffity board driver: Graffity.card over the shared
   # CirrusGD542X.chip, plus DEVS:Monitors/Picasso96, which is what makes
@@ -38,6 +36,30 @@ packages = [
   # precisely what this machine is (proposal §3).
   { name = "picasso96-3", card = "graffity", fake-native-modes = true },
   "mmulibs",
+
+  # Test harness. All three install to SYS:C/, so they are on the path
+  # and need no absolute paths in a startup fragment or a shell.
+  #
+  # amipilot: object-level GUI automation. AmiPilotServer speaks a byte
+  # stream over serial.device, which `machine-hosted --serial-tcp`
+  # bridges to a socket, so the host Python client can find windows and
+  # gadgets by identity and assert semantically rather than by counting
+  # pixels (docs/input-protocol.md, docs/serial-debugging.md).
+  #
+  # devsoak: the block-driver acceptance gate for `hostblk`
+  # (docs/hostblk-soak.md, docs/hostblk-protocol.md §13). Its quirks
+  # database installs beside it, which matters — devsoak looks for it in
+  # the current directory then PROGDIR:, and PROGDIR: for C:devsoak is
+  # C:.
+  #
+  # devtest: cdhooper's companion prober. devsoak's own README frames
+  # the split — devtest probes what a driver accepts and sweeps whole
+  # devices, devsoak holds a fixed range to prove content correctness
+  # under sustained concurrent load. Worth having both aimed at
+  # hostblk rather than only the one that already passes.
+  "amipilot",
+  "devsoak",
+  "devtest",
 ]
 output   = ["hdf", "dir"]
 emit     = ["copperline"]
