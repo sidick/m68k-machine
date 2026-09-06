@@ -1,9 +1,17 @@
 # ADR 0002 — How RTG reaches a display we did not choose
 
-**Status:** open — proposed, not decided. Recorded now because Phase 3
-has just made the emulated-silicon path work end to end, which is what
-makes the alternative worth stating precisely; and because one of its
-consequences bears directly on ADR 0001, which is still open.
+**Status:** accepted 2026-09-06 — **option C**: build the virtual board
+of option B as this machine's native display path, and keep option A's
+Cirrus as the zero-install compatibility tier. A third possibility that
+surfaced later, presenting a `uaegfx`-compatible interface so an existing
+driver would bind, is **rejected**; see "The uaegfx exemplar is a dead
+end" below. The "Unverified" section is now resolved and kept only as the
+record of what was once open.
+
+Originally recorded as open, because Phase 3 had just made the
+emulated-silicon path work end to end, which is what made the
+alternative worth stating precisely; and because one of its consequences
+bears on ADR 0001, which remains open.
 
 **Context:** proposal §8.2; roadmap Phases 3, 5; ADR 0001;
 `device-ledger.md`, which records the Cirrus card's status as scaffolding
@@ -174,27 +182,77 @@ Better still, advertise only modes the host can actually set, so P96
 never asks for an impossible one. Scaling and letterboxing are the
 safety net for when that list turns out to be wrong.
 
-## Unverified
+## Resolved: what was unverified, and what the answers were
 
-Load-bearing claims that should be checked before this ADR is acted on,
-flagged rather than asserted:
+All four were closed by material this ADR did not know about when it was
+written — `~/src/p96-experiment` (the project owner's own clean-room
+study of the P96 ABI, with CC-BY 4.0 SDK facts) and `~/src/amirfb` (BSD
+2-Clause, also the owner's: **a working Picasso96 virtual card driver**
+that serves a live Workbench over VNC).
 
-- **That P96 falls back to CPU rendering when a board advertises no
-  acceleration.** Option B rests on this entirely. It matches the
-  documented driver model and the existence of software fallbacks, but
-  has not been demonstrated here.
-- **The exact `BoardInfo` callback set and ABI.** The shape of the
-  model is established; the specific entry points named in discussion
-  (`SetGC`, `SetPanning`, `SetColorArray`, `CalculateBytesPerRow`,
-  `CalculateMemory`, `GetCompatibleFormats`, `WaitVerticalSync`) are
-  indicative and should be checked against the P96 developer
-  documentation in the archive.
-- **GOP behaviour after `ExitBootServices`.** Widely relied upon, but
-  worth confirming on the actual x86 target rather than assumed.
-- **Redistribution.** A `.card` written here is this project's own
-  work, but it still needs the user's licensed P96 `.library` on the
-  guest. Writing our own driver does not make P96 redistributable, and
-  nothing here changes what `nondistribution/README.md` records.
+- **"That P96 falls back to CPU rendering when a board advertises no
+  acceleration."** Confirmed, and the mechanism is not a negotiation at
+  all. Every accelerable operation has a `*Default` twin; the core
+  installs its own CPU renderer into each and points the main slot at it
+  *before the driver runs*, so a driver accelerates by overwriting slots
+  rather than by advertising. Decline everything and it simply draws
+  through the core. Verified live rather than only documented: AmiRFB's
+  card touches no render vectors and works against real Picasso96
+  (`rtg.library` 40.3945).
+- **The exact `BoardInfo` callback set.** Resolved, and this ADR's
+  indicative list was less than half of it. The real minimum is two
+  library entry points (`FindCard`, `InitCard`), **fourteen** mandatory
+  vectors — `SetGC`, `SetPanning`, `SetSwitch`, `SetDisplay`,
+  `SetColorArray`, `SetDAC`, `CalculateBytesPerRow`, `CalculateMemory`,
+  `GetCompatibleFormats`, `ResolvePixelClock`, `GetPixelClock`,
+  `SetClock`, `SetMemoryMode`, `WaitVerticalSync` — and about twenty
+  capability fields. Most are trivial for a virtual board. Zero render,
+  sprite or planar-mask vectors are required.
+- **GOP behaviour after `ExitBootServices`.** Still genuinely open, and
+  still a Phase 5 question rather than one this decision depends on.
+- **Redistribution.** Unchanged for our own `.card`, and now decisive
+  against the alternative below.
+
+Three costs this ADR missed, worth carrying forward:
+
+- **Vector signatures are versioned.** `SetPanning` and
+  `CalculateBytesPerRow` grew arguments at P96 3.3.1+, `AllocCardMem` at
+  3.5.0, so a `.card` targets the version actually installed.
+- **`BoardType` values are assigned by iComp**, and what stock
+  `rtg.library` does with an unassigned one is unknown.
+- **The pointer is not free.** With no hardware sprite the core soft-
+  renders it, which needs `SoftSpriteFlags` set for our formats — and
+  Intuition routes button events by pointer position, so a pointerless
+  RTG screen receives no clicks at all.
+
+## The uaegfx exemplar is a dead end
+
+This ADR named "the `uaegfx` model" as the pattern to follow. The
+*pattern* — a virtual board with its own driver — stands. The
+**exemplar does not**, on three independent grounds, any one of which
+would be sufficient.
+
+- **Licence.** `uaegfx.card` is GPLv2+ and, worse, is not a
+  redistributable file at all: it is a six-vector library synthesised by
+  the emulator's own boot ROM. There is no way for a user to obtain it
+  without running WinUAE or Amiberry, and this project could not ship it
+  if there were.
+- **It is not a register interface.** This ADR imagined "a linear
+  framebuffer plus a small register or mailbox interface". In reality
+  the card's vectors are line-A trap stubs whose work happens host-side,
+  so compatibility would mean synthesising a UAE-style boot ROM,
+  adding an A-line trap hook to the CPU core, and implementing the host
+  side of the whole vector table — **including the acceleration the card
+  does populate**. It does not even avoid the Cirrus-BitBLT class of
+  work; it re-buys it in a different costume.
+- **The only complete specification is GPL-3 source.** Reading WinUAE or
+  Amiberry to implement the host half, then re-expressing it as MIT, is
+  exactly the clean-room hazard this project cannot afford.
+
+There is also a difference in kind, not just in cost. `uaegfx` is a
+paravirtual escape hatch into UAE's emulator core, so adopting it would
+mean emulating *Amiberry* — strictly further from "a display path
+designed for this machine" than emulating a Cirrus is.
 
 ## Decision triggers
 
