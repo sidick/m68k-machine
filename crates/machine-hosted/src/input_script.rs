@@ -46,7 +46,9 @@
 //!   time to a `CHARDOWN`/`CHARUP` pair for every character in the
 //!   double-quoted string, in order, so a script author does not have to
 //!   spell out sixteen directives to type "Hello, World!". `\"` and `\\`
-//!   are the only recognised escapes (plus `\n`/`\t`); every character in
+//!   are the only recognised escapes (plus `\n`/`\t`, where `\n` emits
+//!   **CR** (`0x0D`) because that is what Return is on this platform --
+//!   see `parse_type`); every character in
 //!   the string is subject to the same Latin-1 check `CHARDOWN` uses, and
 //!   any failure is a parse-time error citing the offending character,
 //!   not a partially-typed string discovered mid-run. A single character
@@ -142,6 +144,21 @@ impl InputScript {
     /// chipset frame, the same cadence `SerialScript::tick` uses --
     /// input events don't need per-instruction granularity any more than
     /// serial bytes do.
+    ///
+    /// The queue is finite ([`machine_core::input::QUEUE_CAPACITY`]) and
+    /// the guest drains it on its own schedule, so a script that pushes
+    /// without limit overruns it. Every `push_*` reports that by
+    /// returning `false`; this honours the refusal by putting the
+    /// directive back and retrying next frame, which is the only reason
+    /// a `TYPE` longer than half the queue arrives intact.
+    ///
+    /// It used to ignore those return values, and the result was the
+    /// worst kind of failure: `TYPE "System/Wanderer/Wanderer"` typed
+    /// exactly `System/W` into the guest and reported success. Eight
+    /// characters, because `TYPE` expands to a down/up *pair* each and
+    /// the queue holds sixteen events -- a number that looks like a
+    /// plausible answer rather than a truncation, which is what made it
+    /// survive as long as it did.
     pub fn tick(&mut self, frame: u64, input: &mut NativeInput) {
         loop {
             if let Some(deadline) = self.sleep_deadline {
@@ -153,31 +170,24 @@ impl InputScript {
             let Some(directive) = self.remaining.pop_front() else {
                 return;
             };
-            match directive {
-                Directive::KeyDown(code) => {
-                    input.push_key(code, true, 0);
-                }
-                Directive::KeyUp(code) => {
-                    input.push_key(code, false, 0);
-                }
-                Directive::Move(x, y) => {
-                    input.push_pointer_motion(x, y, 0);
-                }
-                Directive::ButtonDown(id) => {
-                    input.push_button(id, true, 0);
-                }
-                Directive::ButtonUp(id) => {
-                    input.push_button(id, false, 0);
-                }
-                Directive::CharDown(ch) => {
-                    input.push_char(ch, true);
-                }
-                Directive::CharUp(ch) => {
-                    input.push_char(ch, false);
-                }
+            let accepted = match directive {
+                Directive::KeyDown(code) => input.push_key(code, true, 0),
+                Directive::KeyUp(code) => input.push_key(code, false, 0),
+                Directive::Move(x, y) => input.push_pointer_motion(x, y, 0),
+                Directive::ButtonDown(id) => input.push_button(id, true, 0),
+                Directive::ButtonUp(id) => input.push_button(id, false, 0),
+                Directive::CharDown(ch) => input.push_char(ch, true),
+                Directive::CharUp(ch) => input.push_char(ch, false),
                 Directive::Sleep(frames) => {
                     self.sleep_deadline = Some(frame.saturating_add(frames));
+                    true
                 }
+            };
+            if !accepted {
+                // Full. Un-pop and let the guest drain a frame's worth;
+                // the directive is retried, never skipped.
+                self.remaining.push_front(directive);
+                return;
             }
         }
     }
@@ -326,7 +336,15 @@ fn parse_quoted(text: &str) -> Result<String, String> {
             '\\' => match chars.next() {
                 Some('"') => out.push('"'),
                 Some('\\') => out.push('\\'),
-                Some('n') => out.push('\n'),
+                // Deliberately CR, not LF. A script author writes
+                // `\n` to mean "press Return", and Return on this
+                // platform is CR (0x0D) -- the Amiga console submits a
+                // line on CR and treats LF as a bare cursor-down. Emitting
+                // LF here looks like it works (the cursor moves to the
+                // next line) while never submitting anything, which cost
+                // an afternoon of chasing a "hang" that was really a
+                // command that had simply never been entered.
+                Some('n') => out.push('\r'),
                 Some('t') => out.push('\t'),
                 Some(other) => return Err(format!("TYPE: unknown escape \\{other}")),
                 None => return Err("TYPE: trailing backslash".to_string()),
@@ -371,6 +389,94 @@ mod tests {
     fn advance(input: &mut NativeInput) {
         use machine_core::input::reg;
         input.write(reg::EVENT_ADVANCE + 3, 0);
+    }
+
+    /// A `TYPE` longer than the queue must arrive whole.
+    ///
+    /// This is a regression test for a real truncation: driving AROS,
+    /// `TYPE "System/Wanderer/Wanderer\n"` put exactly `System/W` on the
+    /// guest's command line and the run reported success. `tick` pushed
+    /// every directive in one frame and threw away each `push_*`'s
+    /// `false`, so the queue's sixteenth event was the last one that
+    /// existed -- eight characters, since `TYPE` expands to a down/up
+    /// pair each.
+    ///
+    /// The assertion is deliberately on the *whole* delivered sequence
+    /// rather than on a count: a length check would have passed just as
+    /// happily on eight characters delivered twice, and what actually
+    /// matters is that the guest sees each character once and in order.
+    #[test]
+    fn type_longer_than_the_queue_is_delivered_whole_and_in_order() {
+        use machine_core::input::{ev, QUEUE_CAPACITY};
+
+        const TEXT: &str = "System/Wanderer/Wanderer";
+        assert!(
+            TEXT.len() * 2 > QUEUE_CAPACITY,
+            "test is only meaningful if the script overruns the queue"
+        );
+
+        let mut script = InputScript::parse(&format!("TYPE \"{TEXT}\"\n")).unwrap();
+        let mut dev = NativeInput::new();
+
+        // Each iteration is one frame: the script pushes what fits, then
+        // the guest drains it -- which is exactly the interleaving the
+        // old code assumed it could skip.
+        let mut got = Vec::new();
+        for frame in 0..1000 {
+            script.tick(frame, &mut dev);
+            loop {
+                let (ty, code, ..) = peek(&dev);
+                if ty == ev::NONE {
+                    break;
+                }
+                got.push((ty, code));
+                advance(&mut dev);
+            }
+            if script.is_done() {
+                break;
+            }
+        }
+        assert!(script.is_done(), "script never drained");
+
+        let want: Vec<(u8, u8)> = TEXT
+            .bytes()
+            .flat_map(|b| [(ev::CHAR_DOWN, b), (ev::CHAR_UP, b)])
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// `\n` must reach the guest as CR, the key that submits a line.
+    ///
+    /// LF renders identically in a console -- the cursor drops to the
+    /// next line either way -- so getting this wrong produces a script
+    /// that appears to type its commands and silently never runs any of
+    /// them.
+    #[test]
+    fn type_newline_is_carriage_return_not_line_feed() {
+        use machine_core::input::ev;
+
+        let mut script = InputScript::parse("TYPE \"a\\n\"\n").unwrap();
+        let mut dev = NativeInput::new();
+        script.tick(0, &mut dev);
+
+        let mut got = Vec::new();
+        loop {
+            let (ty, code, ..) = peek(&dev);
+            if ty == ev::NONE {
+                break;
+            }
+            got.push((ty, code));
+            advance(&mut dev);
+        }
+        assert_eq!(
+            got,
+            vec![
+                (ev::CHAR_DOWN, b'a'),
+                (ev::CHAR_UP, b'a'),
+                (ev::CHAR_DOWN, 0x0D),
+                (ev::CHAR_UP, 0x0D),
+            ]
+        );
     }
 
     #[test]

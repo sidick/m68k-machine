@@ -1,0 +1,52 @@
+# AROS-native image: the CI-friendly counterpart to m68k-machine.toml.
+#
+# m68k-machine.toml builds an AmigaOS 3.2.2 system, which cannot be
+# committed, cannot be published, and cannot run in CI -- the Kickstart
+# ROM is Cloanto's and the Workbench media is licensed. That is fine for
+# local development and useless as a gate.
+#
+# This image is the opposite: every byte of it is redistributable. The
+# `aros68k` base is fetched from an AROS nightly's boot-iso and needs no
+# user-supplied assets at all, and the ROM pair it runs against is
+# already vendored in this repo at `assets/aros/`. So a board that boots
+# this is booting something CI can build from nothing.
+#
+# It also exists because AROS will not boot the 3.2.2 image, and the
+# reason is not a defect: AROS targets AmigaOS 3.1 compatibility and 3.2
+# has diverged, so a 3.2.2 Startup-Sequence reaches for an `ENV:` that
+# AROS's 3.1-era conventions never set up (see `docs/storage.md`). The
+# fix is to pair AROS with AROS's own userland rather than to build a
+# 3.1 Workbench to feed it: Wanderer is AROS's Workbench equivalent and
+# comes with the base, so there is nothing to assemble by hand and
+# nothing licensed in the result.
+#
+# STATUS: builds cleanly, boots to an AROS Shell, and does NOT yet reach
+# Wanderer -- no name inside the filesystem resolves, because the image
+# must be DOS\7 (AROS ships >30-character filenames) and the ROM
+# mounting it appears not to implement long names. See `docs/storage.md`,
+# "Booting AROS from an AROS-built image". `dir` is in `output` because
+# being able to read the built tree from the host is what separated "our
+# driver is broken" from "the names are unreadable".
+#
+# No packages. picasso96-3 is AmigaOS software and AROS brings its own
+# display side, so RTG here waits on our `.card` driver rather than on
+# anything installed into the image. `rtg` is deliberately absent from
+# `machine` for the same reason -- this image boots on the chipset.
+#
+# Build:
+#
+#   ~/src/amibake/.venv/bin/amibake build tools/amibake/aros.toml \
+#     --recipes ~/src/amibake/recipes --assets ~/src/amibake/assets --out <dir>
+#
+# Run (the ROM pair is this repo's, not amibake's -- the recipe
+# populates SYS: only, since AROS normally softkicks and loading its ROM
+# directly as Kickstart is the emulation equivalent):
+#
+#   cargo run -p machine-hosted -- \
+#     --rom assets/aros/aros-amiga-m68k-rom.bin \
+#     --ext-rom assets/aros/aros-amiga-m68k-ext.bin \
+#     --hostblk <dir>/aros.hdf --hostblk-writable
+base     = "aros68k"
+machine  = { cpu = "68040", fpu = true, ram = "chip:2M,z3:256M" }
+packages = []
+output   = ["hdf", "dir"]

@@ -413,3 +413,48 @@ Also worth noting for anyone reading `--inspect` against AROS: its
 mounted. AROS's `dos.library` is 50.80 and the walk assumes Kickstart's
 layout, so that particular line is unreliable against AROS -- the
 screenshot and the `hostblk` slot state are the evidence to trust.
+
+## Booting AROS from an AROS-built image
+
+Pairing AROS with AROS's own userland is the right idea and does not yet
+work, for a reason worth writing down before anyone repeats the
+afternoon that found it.
+
+`tools/amibake/aros.toml` builds the `aros68k` base -- an AROS nightly's
+boot-iso, redistributable end to end, needing no licensed media. The
+image it produces is well-formed: `xdftool` lists a `SYS` volume with a
+full `C/`, `Libs/`, `System/Wanderer/Wanderer`, everything expected.
+
+Booted against the vendored ROM pair over `hostblk`, AROS gets a long
+way. It configures both boards, runs our DiagArea, initialises
+`hostblk.device`, mounts `DH0`, opens a Shell, and reaches a `1>`
+prompt. `CD SYS:` succeeds and internal commands run. But **no name
+inside the filesystem resolves**: `Dir` is "object not found", so is
+`SYS:System/Wanderer/Wanderer`, and the Startup-Sequence therefore makes
+none of its assigns (`--inspect`'s DosList shows only the ROM defaults --
+`C`, `L`, `S`, `DEVS`, `LIBS`, `FONTS`, `ENVARC` -- with `T:`, `CLIPS:`
+and `WANDERER:` all absent). That is why the boot lands on a bare Shell
+rather than on Wanderer: the startup script aborts on its first external
+command.
+
+The volume mounts and file lookups fail, which points at the on-disk
+name layout rather than at our block driver -- the driver's reads are
+demonstrably being served (`--inspect` catches completed reads deep into
+the partition, and the AmigaOS 3.2.2 image on the same driver boots
+fully). The partition is `DOS\7`, `ffs+intl+longname`, and the ROM
+mounting it appears not to implement long filenames.
+
+The obvious fix is not available: rebuilding as plain `ffs-intl` fails
+in the *builder*, because AROS ships filenames past FFS's 30-character
+limit (`Dustismo Roman Bold Italic.font`). The distribution requires
+long names, so the image cannot avoid `DOS\7`.
+
+That leaves the likely real answer as an RDB **filesystem header**
+(`FSHD`) block carrying a `DOS\7`-capable handler, so the OS loads a
+filesystem from disk instead of falling back to the ROM's. AmiBake does
+not write FSHD blocks today. Worth confirming before building anything:
+this is a diagnosis from the outside, not yet a proven mechanism.
+
+None of this is a storage defect on our side, and none of it blocks the
+boards -- but it does mean the CI-friendly AROS image is not ready to be
+a gate yet.
