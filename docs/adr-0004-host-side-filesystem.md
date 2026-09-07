@@ -115,7 +115,8 @@ would have no coherent API. `amiga-ffs` follows:
   it — and as borrowable MIT reference for the classic variants — and it moved faster than the original "workspace member
   first, own repo when stable" plan: `amiga-rdb` lives in its own repo
   from day one (https://github.com/sidick/amiga-rdb-rs), and as of
-  2026-09-07 is **published on crates.io** (0.2.0, read side complete) —
+  2026-09-07 is **published on crates.io** (0.3.0 the same day: the
+  crate's full plan complete — read, create, and in-place mutation) —
   so this project consumes it by semver version, the cleaner pin, with
   git-rev pinning kept only for pre-release work between publishes.
 - All eight DOS\0-DOS\7 variants readable from the start. The AROS
