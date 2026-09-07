@@ -93,9 +93,13 @@ would have no coherent API. `amiga-ffs` follows:
 - `no_std` + `alloc`, `machine-core` discipline — nothing in FFS needs
   `std`, and the bare-metal boards should not be locked out for no
   reason.
-- MIT/Apache-2.0 dual, workspace member first, own repo when stable.
-  There is no permissively-licensed writable FFS in Rust; amitools is
-  GPL-2, pfs3aio is BSD-4 68k C. The reuse claim is real.
+- MIT/Apache-2.0 dual. There is no permissively-licensed writable FFS
+  in Rust; amitools is GPL-2, pfs3aio is BSD-4 68k C. The reuse claim
+  is real — and it moved faster than the original "workspace member
+  first, own repo when stable" plan: `amiga-rdb` lives in its own repo
+  from day one (https://github.com/sidick/amiga-rdb-rs), so this
+  project consumes it the way it consumes the m68k fork — pinned by
+  rev, never by branch.
 - All eight DOS\0-DOS\7 variants readable from the start. The AROS
   image dead-end (`docs/storage.md`) was a DOS\7 volume nothing in the
   guest ROM could read; a DOS\3-only crate rebuilds that wall.
