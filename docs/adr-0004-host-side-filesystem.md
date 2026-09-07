@@ -55,9 +55,26 @@ both are permanent native devices — one is "a disk", the other is
 
 ## The filesystem crates
 
-**One filesystem family per crate.** FFS and PFS3 share nothing on
-disk; a crate that pretended otherwise would have no coherent API.
-`amiga-ffs` comes first:
+**One filesystem family per crate — and RDB is not a filesystem, so it
+gets its own.** `amiga-rdb` handles the layer beside the filesystems:
+RDB, PART, FSHD and LSEG blocks, checksums, DosEnvecs. In: a
+`BlockSource` for the whole disk. Out: partitions as extents plus
+metadata, and filesystem-driver payloads. Composition with a filesystem
+crate is a small adapter — a partition becomes a `BlockSource` that
+offsets LBAs into the parent — and neither crate depends on the other;
+consumers stack them. This is what lets an external consumer handle
+both bare HDFs (one crate) and the far more common RDB-wrapped ones
+(both). It also has a customer inside this project before any external
+one: FSHD/LSEG *writing* is where the AROS DOS\7 fix lives if the
+answer is shipping a long-name filesystem in the RDB, and a host-side
+Rust reading of these structures is a third independent implementation
+(after the boot ROM's 68k mounter and amitools) for the differential
+suite. Small and completely specified, with AmiPart as an MIT reference
+for exactly this layer — it comes first, before `amiga-ffs`, which
+wants it anyway to reach the partitions inside real fixtures.
+
+FFS and PFS3 share nothing on disk; a crate that pretended otherwise
+would have no coherent API. `amiga-ffs` follows:
 
 - Pure on-disk format logic. No DosPacket types, no transport, no
   machine-core dependency — blocks in, directories and files out.
