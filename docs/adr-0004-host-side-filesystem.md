@@ -132,7 +132,16 @@ no licensed image can.
   real reference, and a legitimate future `amiga-pfs3` crate. But it
   forfeits interchange with everything amibake builds today, and it is
   a larger implementation. It becomes attractive when FFS-format
-  metadata rates are the measured ceiling, not before.
+  metadata rates are the measured ceiling, not before. *Noted
+  2026-09-07:* [libpfs3](https://crates.io/crates/libpfs3) exists —
+  pure Rust PFS3 read/write/format/check, **LGPL-3.0-or-later**. Never
+  copy from it (same firewall as the GPL oracles); linking it into our
+  MIT/Apache binaries is legal but statically-linked-Rust-awkward. If
+  the PFS3 day comes, first option is plugging it in as an optional
+  transport backend — the card doesn't care what answers packets — and
+  writing a permissive implementation only if the LGPL linking cost
+  beats the implementation cost. Unconditionally, it is a second
+  differential oracle beside pfs3aio.
 - **Our own format.** Maximum freedom, zero interchange, all-new
   tooling, and nothing above requires it.
 
