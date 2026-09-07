@@ -99,14 +99,20 @@ would have no coherent API. `amiga-ffs` follows:
   [affs-read](https://crates.io/crates/affs-read) exists — MIT, no_std,
   **read-only** OFS/FFS/INTL/DIRCACHE over a block trait, fuzz-tested,
   actively maintained, no linked repo (code via the crates.io tarball).
-  The writable claim stands, but the read milestone should be re-scoped
-  against it before writing a from-scratch read side: MIT means depend
-  on it, borrow from it, or absorb it are all open options. Two checks
-  first: does it read DOS\6/\7 long filenames (undocumented; our
-  motivating case; minutes to test against the AROS fixture), and what
-  the tarball's code quality is. Independent of that outcome it is a
-  third differential oracle, and the first permissive one — when
-  outputs disagree we can look inside it — and it moved faster than the original "workspace member
+  The writable claim stands, and the re-scoping check was run the same
+  day, settling it: pointed at the DOS\7 AROS fixture (composed through
+  `amiga-rdb`'s `PartitionSource` — first external proof of that seam),
+  affs-read **accepts the volume and silently returns empty names for
+  every entry** — the long-name layout stores names elsewhere in the
+  block, and it reads the classic offset without noticing. On DOS\3 it
+  is flawless. So: not the read engine (silent misparse on our
+  motivating case, no linked repo to fix upstream, and its device trait
+  is weaker on every axis our `BlockSource` chose deliberately — `&self`
+  forcing interior mutability, `Result<(), ()>` discarding error
+  information, `u32` LBAs, 512 baked into the signature). `amiga-ffs`'s
+  read side stays a build. affs-read stays valuable as the first
+  *permissive* differential oracle — when outputs disagree we can read
+  it — and as borrowable MIT reference for the classic variants — and it moved faster than the original "workspace member
   first, own repo when stable" plan: `amiga-rdb` lives in its own repo
   from day one (https://github.com/sidick/amiga-rdb-rs), so this
   project consumes it the way it consumes the m68k fork — pinned by
