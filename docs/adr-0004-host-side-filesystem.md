@@ -95,7 +95,18 @@ would have no coherent API. `amiga-ffs` follows:
   reason.
 - MIT/Apache-2.0 dual. There is no permissively-licensed writable FFS
   in Rust; amitools is GPL-2, pfs3aio is BSD-4 68k C. The reuse claim
-  is real — and it moved faster than the original "workspace member
+  is real. *Noted 2026-09-07:*
+  [affs-read](https://crates.io/crates/affs-read) exists — MIT, no_std,
+  **read-only** OFS/FFS/INTL/DIRCACHE over a block trait, fuzz-tested,
+  actively maintained, no linked repo (code via the crates.io tarball).
+  The writable claim stands, but the read milestone should be re-scoped
+  against it before writing a from-scratch read side: MIT means depend
+  on it, borrow from it, or absorb it are all open options. Two checks
+  first: does it read DOS\6/\7 long filenames (undocumented; our
+  motivating case; minutes to test against the AROS fixture), and what
+  the tarball's code quality is. Independent of that outcome it is a
+  third differential oracle, and the first permissive one — when
+  outputs disagree we can look inside it — and it moved faster than the original "workspace member
   first, own repo when stable" plan: `amiga-rdb` lives in its own repo
   from day one (https://github.com/sidick/amiga-rdb-rs), so this
   project consumes it the way it consumes the m68k fork — pinned by
