@@ -449,11 +449,26 @@ in the *builder*, because AROS ships filenames past FFS's 30-character
 limit (`Dustismo Roman Bold Italic.font`). The distribution requires
 long names, so the image cannot avoid `DOS\7`.
 
-That leaves the likely real answer as an RDB **filesystem header**
-(`FSHD`) block carrying a `DOS\7`-capable handler, so the OS loads a
-filesystem from disk instead of falling back to the ROM's. AmiBake does
-not write FSHD blocks today. Worth confirming before building anything:
-this is a diagnosis from the outside, not yet a proven mechanism.
+**Mechanism confirmed (2026-09-08), from AROS's own source.** AROS's
+`afs.handler` (`rom/filesys/afs/volumes.c`) masks the dostype's low
+byte away (`& 0xFFFFFF00`), accepts anything in the `DOS` family (plus
+`muFS` — the only other family it mounts), stores the flags byte, and
+has no long-filename layout anywhere in its name machinery
+(`getHashKey` truncates at `MAX_NAME_LENGTH`). So it *mounts* a
+`DOS\7` volume as classic FFS, reads the volume name — which sits at
+the classic offset in both layouts — and then resolves no directory
+entry, because LNFS stores names elsewhere in the block. Mount
+succeeds, `SYS` appears, every lookup is "object not found": exactly
+what was observed, and exactly the silent misparse the `affs-read`
+crate was caught in against the same fixture. Two independent
+implementations, one failure shape.
+
+This also rules out the FSHD route for this case — the misparse is in
+AROS's own handler, not in a missing loadable filesystem. The real fix
+is an image AROS's handler actually understands: **`DOS\3` with
+names ≤ 30 characters**, which for the `aros68k` recipe means
+excluding or renaming the handful of long-named font files that made
+the `ffs-intl` build refuse.
 
 None of this is a storage defect on our side, and none of it blocks the
 boards -- but it does mean the CI-friendly AROS image is not ready to be
