@@ -114,9 +114,10 @@ would have no coherent API. `amiga-ffs` follows:
   *permissive* differential oracle — when outputs disagree we can read
   it — and as borrowable MIT reference for the classic variants — and it moved faster than the original "workspace member
   first, own repo when stable" plan: `amiga-rdb` lives in its own repo
-  from day one (https://github.com/sidick/amiga-rdb-rs), so this
-  project consumes it the way it consumes the m68k fork — pinned by
-  rev, never by branch.
+  from day one (https://github.com/sidick/amiga-rdb-rs), and as of
+  2026-09-07 is **published on crates.io** (0.2.0, read side complete) —
+  so this project consumes it by semver version, the cleaner pin, with
+  git-rev pinning kept only for pre-release work between publishes.
 - All eight DOS\0-DOS\7 variants readable from the start. The AROS
   image dead-end (`docs/storage.md`) was a DOS\7 volume nothing in the
   guest ROM could read; a DOS\3-only crate rebuilds that wall.
