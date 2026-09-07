@@ -9,7 +9,15 @@ matrix, the measurements that motivated this);
 [AmiPart](https://github.com/ChuckyGang/AmiPart) (MIT — a C RDB
 partition editor with filesystem-driver block support that builds both
 as a native AmigaOS tool and as a Linux CLI over hdf files: a readable
-reference for the RDB/FSHD layer, and same-code-many-hosts proven in C).
+reference for the RDB/FSHD layer, and same-code-many-hosts proven in
+C. Its permissive licensing means `amiga-rdb` can *translate* its
+working C — `rdb.c`, `rdbbe.h`'s big-endian handling — rather than
+clean-room from the spec, and its reach goes beyond RDB: `ffsresize`/
+`pfsresize`/`sfsresize` cannot exist without real knowledge of each
+filesystem's internals, so it is a permissive reference for parts of
+`amiga-ffs` too); NetBSD (BSD — carries RDB structures in its disk
+subsystem and `adosfs`, a read-only AmigaDOS filesystem in C: a second
+translatable reference for the read path, independent of AmiPart).
 
 ---
 
