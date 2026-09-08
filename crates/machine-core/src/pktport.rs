@@ -152,7 +152,7 @@
 //! - **This card must never panic on any descriptor content**, mirroring
 //!   `hostblk`'s and `input`'s own rule verbatim (§7's last bullet).
 
-use crate::autoconfig::{BoardSpec, ERT_ZORROII};
+use crate::autoconfig::{BoardSpec, ERTF_DIAGVALID, ERT_ZORROII};
 
 /// One filesystem service behind the `pktport` card (protocol doc §8).
 /// `machine-hosted` implements this over the published `amiga-rdb` +
@@ -190,10 +190,29 @@ pub const PRODUCT: u8 = 5;
 /// The Zorro II AUTOCONFIG window: 64 KB, the smallest available size code
 /// — protocol doc §1: "Small on purpose: no data crosses the register
 /// window." This card's register file (§3) uses only its first `0x1C`
-/// bytes; everything past that, up to the end of this window, is
-/// unimplemented board space ([`Pktport::read`]'s `_` arm), the same
-/// posture `mirage.rs`/`hostblk.rs` take for their own unused tails.
+/// bytes; everything past that, up to [`ROM_BASE`] where [`DIAG_ROM`]
+/// starts, is unimplemented board space ([`Pktport::read`]'s `_` arm),
+/// the same posture `mirage.rs`/`hostblk.rs` take for their own unused
+/// tails.
 pub const WINDOW_BYTES: u32 = 0x0001_0000;
+
+/// This card's DiagArea boot ROM (`m68k/pktport-rom/pktport-diagrom.s`),
+/// assembled to a flat binary by `../../scripts/build-pktport-rom.sh` and
+/// committed here — the same vendored-binary pattern
+/// [`crate::hostblk::DIAG_ROM`]/[`crate::input::DIAG_ROM`] use, so
+/// `cargo build`/`cargo test` need no m68k toolchain. Docs/pktport-
+/// protocol.md §1 documents this ROM's own internal layout (DiagArea +
+/// `RtInit` code, then a 4-byte length word, then the guest handler's
+/// flat code blob `RtInit` copies out at boot).
+pub const DIAG_ROM: &[u8] = include_bytes!("../../../assets/pktport-rom/pktport-diagrom.bin");
+
+/// Where [`DIAG_ROM`] is mapped within this board's own AUTOCONFIG
+/// window, once configured — the value [`BoardSpec::init_diag_vec`]
+/// advertises. Same offset and same independent-namespace reasoning as
+/// `hostblk::ROM_BASE`/`input::ROM_BASE` (each card's own ROM starts at
+/// its own board-relative `0x1000`, never a machine-wide address —
+/// `hostblk-diagrom.s`'s own file header makes the same point).
+pub const ROM_BASE: u32 = 0x1000;
 
 /// The protocol version [`reg::VERSION`] reports (protocol doc §3: "Check
 /// it, refuse what you don't know.").
@@ -312,17 +331,21 @@ impl<'a> Pktport<'a> {
     }
 
     /// The `BoardSpec` this card registers on the AUTOCONFIG chain: one
-    /// Zorro II board, 64 KB, no DiagArea -- this increment carries no
-    /// boot ROM, the same "host side and register interface first" shape
-    /// `hostblk`'s and `input`'s own first increments took.
+    /// Zorro II board, 64 KB, with a DiagArea (`ERTF_DIAGVALID`) pointing
+    /// at [`DIAG_ROM`] — this increment's whole point: a machine with
+    /// this card and `--pktvol` gets a working `PKT0:` from cold boot,
+    /// with no `L:pktport-handler` file and no Mountlist entry
+    /// (`m68k/pktport-rom/pktport-diagrom.s`'s own header). Same shape
+    /// `hostblk::Hostblk::board_spec`/`input::Input::board_spec` already
+    /// use for their own boot ROMs.
     pub fn board_spec() -> BoardSpec {
         BoardSpec {
-            board_type: ERT_ZORROII | 0x01, // size code 1 = 64 KB
+            board_type: ERT_ZORROII | ERTF_DIAGVALID | 0x01, // size code 1 = 64 KB
             product: PRODUCT,
             flags: 0,
             manufacturer: MANUFACTURER,
             serial: 0,
-            init_diag_vec: 0,
+            init_diag_vec: ROM_BASE as u16, // fits: ROM_BASE (0x1000) << u16::MAX
             size_bytes: WINDOW_BYTES,
         }
     }
@@ -445,6 +468,9 @@ impl<'a> Pktport<'a> {
             o if in_slot(o, reg::INT_STATUS) => low_byte(o, reg::INT_STATUS, self.int_status),
             o if in_slot(o, reg::INT_ENABLE) => low_byte(o, reg::INT_ENABLE, self.int_enable),
             o if in_slot(o, reg::VOL_COUNT) => byte_of(VOLUME_COUNT, o - reg::VOL_COUNT),
+            o if (ROM_BASE..ROM_BASE + DIAG_ROM.len() as u32).contains(&o) => {
+                DIAG_ROM[(o - ROM_BASE) as usize]
+            }
             _ => 0,
         }
     }
@@ -929,8 +955,152 @@ mod tests {
         let mut backend = StubBackend::new();
         let dev = Pktport::new(&mut backend);
         assert_eq!(dev.read(reg::VOL_COUNT + 4), 0, "one past VOL_COUNT's slot");
-        assert_eq!(dev.read(0x1000), 0, "deep in the unimplemented window");
+        assert_eq!(
+            dev.read(ROM_BASE + DIAG_ROM.len() as u32),
+            0,
+            "past the end of the ROM, still inside the window"
+        );
         assert_eq!(dev.read(reg::REQ_PTR + 3), 0, "REQ_PTR is write-only");
         assert_eq!(dev.read(reg::DOORBELL + 3), 0, "DOORBELL is write-only");
+    }
+
+    // ---- DiagArea boot ROM (m68k/pktport-rom/pktport-diagrom.s) -----------
+    //
+    // Mirrors hostblk.rs's/input.rs's own diag-serving tests -- same
+    // structure, same reasoning: prove the ROM is reachable byte-for-byte
+    // through the board window, at the offset `BoardSpec::init_diag_vec`
+    // actually advertises, and that its own DiagArea header is internally
+    // consistent with what expansion.library will do with it.
+
+    #[test]
+    fn board_spec_carries_a_diagarea_pointing_at_rom_base() {
+        let spec = Pktport::board_spec();
+        assert_eq!(
+            spec.board_type & ERTF_DIAGVALID,
+            ERTF_DIAGVALID,
+            "must advertise ERTF_DIAGVALID for expansion.library to look at init_diag_vec at all"
+        );
+        assert_eq!(
+            spec.init_diag_vec, ROM_BASE as u16,
+            "init_diag_vec is the board-relative byte address to find the DiagArea -- must point at ROM_BASE"
+        );
+    }
+
+    #[test]
+    fn diag_rom_is_served_byte_for_byte_at_rom_base() {
+        let mut backend = StubBackend::new();
+        let dev = Pktport::new(&mut backend);
+        for (i, &expected) in DIAG_ROM.iter().enumerate() {
+            assert_eq!(
+                dev.read(ROM_BASE + i as u32),
+                expected,
+                "byte {i} of DIAG_ROM must be served verbatim through the board window"
+            );
+        }
+    }
+
+    #[test]
+    fn diag_rom_header_matches_the_documented_diagarea_layout() {
+        // Pulls the same fields expansion.library itself would out of
+        // DIAG_ROM the same way hostblk.rs's/input.rs's own equivalent
+        // tests do -- libraries/configregs.h's struct DiagArea, 14 bytes:
+        // da_Config, da_Flags, da_Size, da_DiagPoint, da_BootPoint,
+        // da_Name, da_Reserved01, da_Reserved02.
+        let rom = DIAG_ROM;
+        assert!(
+            rom.len() >= 14,
+            "DIAG_ROM must hold at least the DiagArea header"
+        );
+
+        const DAC_WORDWIDE: u8 = 0x80;
+        const DAC_CONFIGTIME: u8 = 0x10;
+        assert_eq!(
+            rom[0],
+            DAC_WORDWIDE | DAC_CONFIGTIME,
+            "da_Config must carry DAC_CONFIGTIME -- both sibling ROMs' own \
+             header lore: without it, nothing here would even run at cold-start"
+        );
+        assert_eq!(rom[1], 0, "da_Flags: none defined, must be 0");
+
+        let da_size = u16::from_be_bytes([rom[2], rom[3]]);
+        let da_diag_point = u16::from_be_bytes([rom[4], rom[5]]);
+        let da_boot_point = u16::from_be_bytes([rom[6], rom[7]]);
+        let da_name = u16::from_be_bytes([rom[8], rom[9]]);
+        let da_reserved01 = u16::from_be_bytes([rom[10], rom[11]]);
+        let da_reserved02 = u16::from_be_bytes([rom[12], rom[13]]);
+
+        assert!(
+            (da_size as usize) <= rom.len(),
+            "da_Size (bytes copied into RAM) must not claim more than this ROM holds"
+        );
+        assert_ne!(
+            da_diag_point, 0,
+            "a zero da_DiagPoint means 'no diagnostic code'"
+        );
+        assert!(
+            (da_diag_point as usize) < da_size as usize,
+            "da_DiagPoint must fall inside the copied region"
+        );
+        assert_ne!(
+            da_boot_point, 0,
+            "must be non-zero purely to make expansion.library copy the DiagArea at all \
+             (pktport-diagrom.s's own header, citing input-diagrom.s's discovery) -- \
+             even though this card is never a real BootNode"
+        );
+        assert!(
+            (da_boot_point as usize) < da_size as usize,
+            "da_BootPoint must fall inside the copied region"
+        );
+        assert_eq!(da_name, 0, "no da_Name identifier string in this increment");
+        assert_eq!(da_reserved01, 0);
+        assert_eq!(da_reserved02, 0);
+    }
+
+    #[test]
+    fn diag_rom_carries_the_handler_blob_after_its_own_code() {
+        // docs/pktport-protocol.md section 1 / pktport-diagrom.s's own
+        // header: the ROM's own code region ends with a 4-byte
+        // big-endian blob length (BlobLenWord), immediately followed by
+        // that many bytes of the handler's flat -Fbin code, byte-for-
+        // byte. Anchored via CARGO_MANIFEST_DIR (this project's own
+        // fixture-path lore), not CWD, against the same committed
+        // pktport-handler.bin scripts/build-pktport-rom.sh itself
+        // appends -- this test fails loudly if the two ever drift apart
+        // (a rebuilt ROM with a stale handler blob, or vice versa).
+        let handler_bin_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../m68k/pktport-handler/pktport-handler.bin"
+        );
+        let handler_blob = std::fs::read(handler_bin_path).unwrap_or_else(|e| {
+            panic!("{handler_bin_path} must exist (run scripts/build-pktport-handler.sh): {e}")
+        });
+        assert!(
+            !handler_blob.is_empty(),
+            "the handler blob must not be empty"
+        );
+
+        let rom = DIAG_ROM;
+        assert!(
+            rom.len() >= handler_blob.len() + 4,
+            "DIAG_ROM must hold at least BlobLenWord plus the whole handler blob"
+        );
+        let blob_start = rom.len() - handler_blob.len();
+        assert_eq!(
+            &rom[blob_start..],
+            &handler_blob[..],
+            "the ROM's trailing bytes must be pktport-handler.bin, byte-for-byte"
+        );
+
+        let len_field_offset = blob_start - 4;
+        let declared_len = u32::from_be_bytes(
+            rom[len_field_offset..len_field_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            declared_len as usize,
+            handler_blob.len(),
+            "BlobLenWord must equal the handler blob's real length"
+        );
     }
 }

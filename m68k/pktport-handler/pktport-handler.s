@@ -9,49 +9,90 @@
 *
 * MIT License. Copyright (c) 2026 the m68k Machine project. See ../LICENSE.
 *
-* Mount as a standard handler entry (dos/filehandler.h's DeviceNode shape,
-* AmigaDOS's "Mount" convention -- amigados-rkrm's handlers-filesystems
-* chapter, "Starting a Handler"). Exact Mountlist stanza this file expects
-* to be started from (DEVS:Mountlist.pktport in this project's own e2e
-* script, scripts/pktport-e2e.sh):
-*
-*   PKT0:    Handler   = L:pktport-handler
-*            GlobVec   = -1
-*            StackSize = 8192
-*            Startup   = 0
+* Autoloaded from the pktport card's own DiagArea boot ROM
+* (m68k/pktport-rom/pktport-diagrom.s) as of this increment: no
+* L:pktport-handler file and no Mountlist entry are required any more --
+* the ROM copies this program's assembled code blob out of its own
+* AUTOCONFIG window, wraps it in a hand-built one-segment BCPL seglist,
+* and hands it to AmigaDOS as a DeviceNode named "PKT0" with dn_Task = 0,
+* so DOS starts this process itself, lazily, the first time a client
+* touches PKT0: (exactly the same "GlobVec = -1, StackSize = 8192,
+* Startup = 0" shape the old Mountlist stanza used to spell out by hand
+* -- pktport-diagrom.s's own header cites this). The old Mountlist-driven
+* path (`Mount PKT0: from DEVS:Mountlist.pktport`, scripts/
+* pktport-e2e.sh) still works unmodified and starts the very same program
+* the very same way -- amigados-rkrm's handlers-filesystems chapter's
+* "Starting a Handler" convention neither knows nor cares whether the
+* DeviceNode that named it came from a Mountlist line or a boot ROM.
 *
 * GlobVec = -1 selects the plain C/assembler handler-startup path (not
 * BCPL): the startup packet is sent to this process's own pr_MsgPort,
 * never delivered in a register (amigados-rkrm's handlers-filesystems
 * chapter, "Starting a Handler" -- confirmed against the chapter's own
-* worked example, which this file's Start: routine follows). The
-* Mountlist keyword is GLOBVEC (case-insensitive), not "GlobalVec" --
-* the latter is the *C struct field name* (dol_GlobVec/dn_GlobalVec,
-* dos/dosextens.h) the keyword sets, and a real AmigaOS Mount command
-* rejects the field name itself with "'GlobalVec' is not a valid
-* keyword" (a mistake this file's own e2e run made once and fixed --
-* scripts/pktport-e2e.sh's own history). Startup = 0 means dp_Arg2 (the
-* FileSysStartupMsg BPTR real filesystems get) carries nothing this
-* handler needs -- it never inspects it; every configuration fact it
-* needs (protocol version, board base, capacity) comes from the card's
-* own registers via expansion.library, per this project's
+* worked example, which this file's Start: routine follows). Startup = 0
+* means dp_Arg2 (the FileSysStartupMsg BPTR real filesystems get) carries
+* nothing this handler needs -- it never inspects it; every configuration
+* fact it needs (protocol version, board base, capacity) comes from the
+* card's own registers via expansion.library, per this project's
 * no-hardcoded-addresses rule.
 *
-* Build: vasm -Fhunkexe (see ../../scripts/build-pktport-handler.sh) -- a
-* genuine relocatable AmigaDOS load-file, unlike hostblk-diagrom.s's flat
-* -Fbin ROM image. That distinction matters for how this file addresses
-* its own data: hostblk-diagrom.s uses lea LABEL(pc),aN everywhere because
-* its DiagArea gets *copied* to a RAM address chosen at boot time and its
-* AUTOCONFIG-window code executes *in place* with no loader involved at
-* all -- PC-relative addressing is the only thing that survives either
-* situation. A vasm -Fhunkexe file is different: AmigaDOS's LoadSeg()
-* relocates every absolute long reference to this file's own labels at
-* load time (the hunk format carries relocation records for exactly this
-* purpose), so plain absolute addressing of this file's own data labels
-* (G_DESC, G_BOARDBASE, ...) is correct and is what ordinary hand-written
-* AmigaDOS assembly programs do. No PC-relative addressing appears
-* anywhere in this file, deliberately -- it would work but adds nothing a
-* loaded, relocated hunk executable needs.
+* ---- Position independence: PC-relative code, register-relative state ----
+*
+* Build: ../../scripts/build-pktport-handler.sh assembles this exact
+* source TWICE, to two different outputs that must both be correct from
+* the same bytes of logic:
+*
+*   - `vasm -Fhunkexe`: a genuine relocatable AmigaDOS load-file, exactly
+*     as before -- still installable at L:pktport-handler and still
+*     LoadSeg()'d by AmigaDOS the ordinary way when nothing else has
+*     already loaded it (dn_Handler's own fallback, dos/filehandler.h:
+*     "filename to loadseg (if seglist is null)").
+*   - `vasm -Fbin`: a flat, headerless code blob -- what
+*     pktport-diagrom.s actually embeds and hand-loads via its own
+*     fabricated seglist (that file's own header explains why -Fbin
+*     rather than extracting a hunk executable's CODE hunk: one build
+*     step, and correctness here comes from this file's own PIC
+*     discipline, not from anything hunk-format-specific).
+*
+* A single source cannot rely on LoadSeg()'s relocation records to fix up
+* absolute references any more, because the -Fbin build has none at all
+* -- it is copied verbatim into whatever AllocMem address
+* pktport-diagrom.s's RtInit happens to get, with no loader involved.
+* So, unlike this file's pre-PIC-rework revision (which explicitly
+* documented *not* needing PC-relative addressing, precisely because it
+* only ever shipped as a relocated hunk executable), this file now uses
+* PC-relative addressing for every reference to its own code/read-only
+* data (the one remaining case, `lea ExpName(pc),a1`) and, for every
+* piece of *mutable* state, addresses it register-relative off a4
+* instead of ever taking that state's own address as an absolute
+* constant. Both forms are position-independent by construction, so both
+* build modes execute correctly from wherever they end up loaded --
+* -Fhunkexe's own relocation records still apply and are harmless (they
+* would only matter for an absolute reference, and this file no longer
+* has any), while -Fbin's total absence of them is no longer a problem
+* because nothing here needed them in the first place.
+*
+* ---- The state block: one AllocMem'd block, addressed off a4 ----
+*
+* Every mutable value this handler needs across its own lifetime (the
+* previous revision's G_PROC/G_EXPBASE/G_BOARDBASE/G_CAPACITY/G_DESC/
+* G_NAMEBUF1/G_NAMEBUF2/G_DOSLIST_BPTR, each a bare absolute DATA-section
+* longword) now lives in one `ST_SIZE`-byte block Start AllocMem's near
+* the top of its own run and addresses for the rest of this process's
+* life as `ST_FIELD(a4)` (the `ST_*` equ block, just above the Actions
+* table below, documents every field and the register convention in
+* full). This removes an entire bug class this project has already paid
+* for once: this file's own history (recorded here until this rework,
+* now superseded) was a `lea G_NAMEBUF1,a1` vs `move.l G_NAMEBUF1,a1`
+* mistake that shipped because G_NAMEBUF1 was a bare absolute symbol
+* mutable global state could be addressed *by* (lea, taking its address)
+* just as easily as *through* (move.l, reading its current value) --
+* nothing about the syntax distinguished a live pointer from the
+* variable holding one. With state addressed only as `ST_FIELD(a4)`,
+* that whole confusion has nowhere left to occur: `ST_FIELD(a4)` is
+* always "the current contents of field FIELD in the state block", full
+* stop, and there is no longer a bare symbol spelling "the state block's
+* own address" for a stray `lea` to reach for instead.
 *
 * NO SPACES inside dc.w/dc.l label-difference expressions -- this
 * project's own vasm pitfall (hostblk-diagrom.s's header, confirmed
@@ -295,6 +336,50 @@ DESC_SIZE       equ     $40
 * itself.
 NAMEBUF_SIZE    equ     256
 
+* ============================================================================
+* This handler's persistent state block (this file's header, "one
+* AllocMem'd state block, register-relative"): every field the previous
+* revision of this file kept in absolute G_* DATA-section variables now
+* lives here instead, addressed `ST_FIELD(a4)`. a4 is dedicated for the
+* entire life of this process, from just after Start allocates this block
+* until the process exits (never -- request_loop's own header): no
+* subroutine below this point may use a4 for anything else, mirroring the
+* discipline handle_packet's own header already documents for d2/d5-d7/
+* a2-a6 ("preserved unless a routine's own header says otherwise"). This
+* is checked by construction, not by convention alone: every subroutine
+* between clear_desc_args and free_lock_wire already only clobbers
+* d0/d1/a0/a1 (their own header comments), so none of them could touch
+* a4 even before this rework -- the only two places that ever assigned a4
+* for something else (Start's own transient Message* and request_loop's
+* per-iteration Message*) are both moved onto a3 below, which is free for
+* the whole rest of this file's life once Start finishes with it (see
+* Start's own comments).
+* ============================================================================
+ST_PROC         equ     0       ; our struct Process* (== Task*)
+ST_EXPBASE      equ     4       ; expansion.library base (opened once at
+                                ; startup, never closed -- hostblk-diagrom.
+                                ; s's own RtInit documents the same choice
+                                ; and the same reasoning: it's a core
+                                ; system library for the life of the
+                                ; machine regardless)
+ST_BOARDBASE    equ     8       ; the pktport card's AUTOCONFIG base
+ST_CAPACITY     equ     12      ; CAPACITY as read at startup (diagnostic
+                                ; only -- this handler never submits more
+                                ; than one request at a time regardless)
+ST_DESC         equ     16      ; the one 64-byte request descriptor
+ST_NAMEBUF1     equ     20      ; name-normalisation scratch buffer
+                                ; (NAMEBUF_SIZE bytes) -- strip_colon_prefix
+ST_NAMEBUF2     equ     24      ; second scratch buffer, for
+                                ; ACTION_RENAME_OBJECT's two names
+ST_DOSLIST_BPTR equ     28      ; this mount's own DosList/DeviceNode
+                                ; entry, as the BPTR DOS itself handed us
+                                ; in the startup packet's dp_Arg3 (not
+                                ; shifted to a real address, unlike a3
+                                ; during Start -- fl_Volume wants the raw
+                                ; BPTR). Used by alloc_filelock_or_fail;
+                                ; see its own comment.
+ST_SIZE         equ     32
+
 * Actions (docs/pktport-protocol.md section 5's table; identical values
 * to crates/machine-hosted/src/pktvol.rs's own `action` module).
 ACT_LOCATE_OBJECT      equ     8
@@ -342,40 +427,63 @@ Start:
                                           ; kept live for the rest of this
                                           ; program's life -- never reused
                                           ; as scratch anywhere below
-        move.l  a5,G_PROC
 
         ; Receive the handler startup packet (amigados-rkrm's handlers-
         ; filesystems chapter, "Starting a Handler"): this is a plain
         ; assembler entry point, not the BCPL "fake startup" wrapper, so
         ; DOS never hands it to us in a register -- WaitPort/GetMsg it
         ; ourselves, exactly as that chapter's own worked example does.
+        ; The Message* itself is only needed transiently, right here, to
+        ; reach the DosPacket it carries -- a0 (plain scratch) is enough,
+        ; unlike request_loop's own per-iteration Message* below, which
+        ; has to survive across a possible ReplyMsg call and so gets a3.
         lea     PR_MSGPORT(a5),a0
         jsr     _LVOWaitPort(a6)
         lea     PR_MSGPORT(a5),a0
         jsr     _LVOGetMsg(a6)
-        move.l  d0,a4                    ; a4 = Message*
-        move.l  LN_NAME(a4),a2           ; a2 = the startup DosPacket*,
+        move.l  d0,a0                    ; a0 = Message* (transient)
+        move.l  LN_NAME(a0),a2           ; a2 = the startup DosPacket*,
                                           ; kept live for the rest of Start
 
         ; dp_Arg3 is a BPTR to the DosList/DeviceNode entry that named us
         ; (amigados-rkrm's own "Handler Startup Packet" table) -- convert
-        ; the BPTR to a real address once, up front.
-        move.l  DP_ARG3(a2),d0
-        move.l  d0,G_DOSLIST_BPTR         ; kept as a *BPTR* (unshifted) --
-                                          ; see its own comment for why
+        ; the BPTR to a real address once, up front. Both the raw BPTR
+        ; (d6, this file's own header explains why fl_Volume wants it
+        ; unshifted) and the DeviceNode* (a3) must survive the state
+        ; block's own AllocMem call just below, so neither goes into the
+        ; state block until a4 exists to address it with.
+        move.l  DP_ARG3(a2),d6           ; d6 = raw BPTR, kept live
+        move.l  d6,d0
         lsl.l   #2,d0
         move.l  d0,a3                    ; a3 = DeviceNode*, kept live for
                                           ; the rest of Start
 
+        ; This handler's persistent state block (this file's header) --
+        ; allocated before anything else touches it, so every field below
+        ; is written straight into ST_FIELD(a4) with nothing left in a
+        ; transient register a moment longer than the DeviceNode*/BPTR
+        ; pair above, which have nowhere else to live until this exists.
+        move.l  #ST_SIZE,d0
+        move.l  #(MEMF_PUBLIC+MEMF_CLEAR),d1
+        jsr     _LVOAllocMem(a6)
+        tst.l   d0
+        beq     startup_fail_no_state
+        move.l  d0,a4                    ; a4 = state block, permanent for
+                                          ; the rest of this process's life
+                                          ; (this file's header)
+
+        move.l  a5,ST_PROC(a4)
+        move.l  d6,ST_DOSLIST_BPTR(a4)
+
         ; Find the card. Never a hardcoded address (project rule; the
         ; board base comes from cd_BoardAddr) -- open expansion.library
         ; and walk its ConfigDev chain for our manufacturer/product pair.
-        lea     ExpName,a1
+        lea     ExpName(pc),a1
         moveq   #0,d0
         jsr     _LVOOpenLibrary(a6)
         tst.l   d0
         beq     startup_fail_no_card
-        move.l  d0,G_EXPBASE
+        move.l  d0,ST_EXPBASE(a4)
         move.l  d0,a6                    ; a6 = ExpansionBase for this call
 
         suba.l  a0,a0                    ; oldConfigDev = NULL: start the
@@ -389,7 +497,7 @@ Start:
 
         move.l  d0,a0                    ; a0 = ConfigDev*
         move.l  CD_BOARDADDR(a0),d0
-        move.l  d0,G_BOARDBASE
+        move.l  d0,ST_BOARDBASE(a4)
 
         ; Read VERSION; refuse what we don't know (protocol doc section
         ; 3: "Check it, refuse what you don't know.").
@@ -403,9 +511,9 @@ Start:
         ; it reads here (this file's header explains why that's still
         ; correct for a CAPACITY of 1); the value is kept only so a future
         ; --inspect-style tool has somewhere to read it from.
-        move.l  G_BOARDBASE,a0
+        move.l  ST_BOARDBASE(a4),a0
         move.l  (PKT_CAPACITY)(a0),d0
-        move.l  d0,G_CAPACITY
+        move.l  d0,ST_CAPACITY(a4)
 
         ; One 64-byte descriptor, MEMF_PUBLIC|MEMF_CLEAR. AllocMem's own
         ; documented minimum alignment (8 bytes on every stock Amiga
@@ -417,7 +525,7 @@ Start:
         jsr     _LVOAllocMem(a6)
         tst.l   d0
         beq     startup_fail_no_mem
-        move.l  d0,G_DESC
+        move.l  d0,ST_DESC(a4)
 
         ; Two name-normalisation scratch buffers (this file's header,
         ; "ambiguities... name arguments arrive still carrying this
@@ -431,7 +539,7 @@ Start:
         jsr     _LVOAllocMem(a6)
         tst.l   d0
         beq     startup_fail_no_mem
-        move.l  d0,G_NAMEBUF1
+        move.l  d0,ST_NAMEBUF1(a4)
 
         move.l  #NAMEBUF_SIZE,d0
         move.l  #(MEMF_PUBLIC+MEMF_CLEAR),d1
@@ -439,7 +547,7 @@ Start:
         jsr     _LVOAllocMem(a6)
         tst.l   d0
         beq     startup_fail_no_mem
-        move.l  d0,G_NAMEBUF2
+        move.l  d0,ST_NAMEBUF2(a4)
 
         ; Success: route every future packet DOS sends for this mount to
         ; our own port (dn_Task, protocol-independent AmigaDOS
@@ -468,10 +576,30 @@ startup_fail_no_mem:
         move.l  #ERR_NO_FREE_STORE,d1
 startup_fail_common:
         ; dn_Task was never set on this path, so DOS never routes another
-        ; packet here -- nothing to clean up beyond replying the startup
-        ; packet with failure, per amigados-rkrm's own handler-startup
-        ; contract ("If startup failed... release all resources acquired
-        ; so far and terminate").
+        ; packet here. The state block itself (ST_SIZE bytes) is freed --
+        ; this file's own new allocation, so this file's own job to
+        ; release it; whatever it had already recorded (ST_DESC/
+        ; ST_NAMEBUF1/ST_NAMEBUF2, if this path was reached after they
+        ; were allocated) is deliberately NOT chased and freed here,
+        ; unchanged from this routine's pre-PIC-rework posture ("no
+        ; cleanup beyond replying the startup packet with failure" --
+        ; startup failure is a one-shot, at-boot event, not a case this
+        ; project's review conventions have asked to be made leak-free).
+        move.l  4.w,a6
+        move.l  a4,a0
+        move.l  #ST_SIZE,d0
+        jsr     _LVOFreeMem(a6)
+        bra     startup_fail_reply
+
+startup_fail_no_state:
+        ; The state block itself never came into being -- nothing to
+        ; free, a3/d6 (DeviceNode*/raw BPTR) are simply abandoned with
+        ; nothing pointing at them from this process's side.
+        move.l  #ERR_NO_FREE_STORE,d1
+startup_fail_reply:
+        ; Per amigados-rkrm's own handler-startup contract ("If startup
+        ; failed... release all resources acquired so far and
+        ; terminate").
         move.l  #DOSFALSE,DP_RES1(a2)
         move.l  d1,DP_RES2(a2)
         move.l  DP_PORT(a2),a0
@@ -490,30 +618,37 @@ startup_fail_common:
 * exactly like hostblk.device's own dev_expunge ("this device... refuses
 * to go away").
 *-----------------------------------------------------------------------------
+* Message* lives in a3 for the duration of one loop iteration here (NOT
+* a4 -- a4 is this process's permanent state-block pointer for its whole
+* life, this file's header), since it must survive a possible ReplyMsg
+* call in the "not a packet" branch below. a3 is otherwise unused for the
+* rest of this file's life once Start finishes with it (Start's own
+* comments), so this is the same "dedicate an idle register, document
+* it" choice a4 itself got.
 request_loop:
         move.l  4.w,a6
-        move.l  G_PROC,a0
+        move.l  ST_PROC(a4),a0
         lea     PR_MSGPORT(a0),a0
         jsr     _LVOWaitPort(a6)
 rl_drain:
         move.l  4.w,a6
-        move.l  G_PROC,a0
+        move.l  ST_PROC(a4),a0
         lea     PR_MSGPORT(a0),a0
         jsr     _LVOGetMsg(a6)
         tst.l   d0
         beq     request_loop            ; nothing left queued -- block again
-        move.l  d0,a4
-        tst.l   LN_NAME(a4)
+        move.l  d0,a3
+        tst.l   LN_NAME(a3)
         bne.s   rl_is_packet
         ; Not a DosPacket -- an ordinary Exec message arrived at this
         ; port. Reply it untouched rather than drop it (this file's own
         ; hard rule): whatever sent it is blocked waiting for a reply.
-        move.l  a4,a1
+        move.l  a3,a1
         move.l  4.w,a6
         jsr     _LVOReplyMsg(a6)
         bra.s   rl_drain
 rl_is_packet:
-        move.l  LN_NAME(a4),a2
+        move.l  LN_NAME(a3),a2
         bsr     handle_packet
         move.l  DP_PORT(a2),a0
         move.l  DP_LINK(a2),a1
@@ -605,16 +740,16 @@ handle_packet:
 
 hp_locate_object:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_LOCATE_OBJECT,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG1(a0)
         move.l  DP_ARG2(a2),d0
-        move.l  G_NAMEBUF1,a1
+        move.l  ST_NAMEBUF1(a4),a1
         bsr     strip_colon_prefix
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG2(a0)                ; name BSTR, prefix-stripped
         move.l  DP_ARG3(a2),DESC_ARG3(a0)      ; mode, verbatim
         bsr     submit_and_wait
@@ -627,11 +762,11 @@ hp_locate_object:
 
 hp_copy_dir:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_COPY_DIR,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG1(a0)
         bsr     submit_and_wait
         move.l  #SHARED_LOCK,d1                ; no mode arg on the wire --
@@ -643,11 +778,11 @@ hp_copy_dir:
 
 hp_parent:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_PARENT,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG1(a0)
         bsr     submit_and_wait
         move.l  #SHARED_LOCK,d1                ; real AmigaDOS's own
@@ -662,16 +797,16 @@ hp_parent:
 
 hp_create_dir:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_CREATE_DIR,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG1(a0)
         move.l  DP_ARG2(a2),d0
-        move.l  G_NAMEBUF1,a1
+        move.l  ST_NAMEBUF1(a4),a1
         bsr     strip_colon_prefix
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG2(a0)                ; name BSTR, prefix-stripped
         bsr     submit_and_wait
         move.l  #SHARED_LOCK,d1
@@ -688,7 +823,7 @@ hp_free_lock:
         move.l  d5,d0
         bsr     xlate_lock
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_FREE_LOCK,DESC_ACTION(a0)
         move.l  d0,DESC_ARG1(a0)
         bsr     submit_and_wait                ; result deliberately ignored
@@ -710,15 +845,15 @@ hp_free_lock:
 
 hp_same_lock:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_SAME_LOCK,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG1(a0)
         move.l  DP_ARG2(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG2(a0)
         bsr     submit_and_wait
         move.l  d3,DP_RES1(a2)
@@ -730,11 +865,11 @@ hp_same_lock:
 
 hp_examine_object:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_EXAMINE_OBJECT,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG1(a0)
         move.l  DP_ARG2(a2),DESC_ARG2(a0)
         bsr     submit_and_wait
@@ -744,11 +879,11 @@ hp_examine_object:
 
 hp_examine_next:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_EXAMINE_NEXT,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG1(a0)
         move.l  DP_ARG2(a2),DESC_ARG2(a0)
         bsr     submit_and_wait
@@ -762,11 +897,11 @@ hp_examine_next:
 
 hp_info:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_INFO,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG1(a0)
         move.l  DP_ARG2(a2),DESC_ARG2(a0)
         bsr     submit_and_wait
@@ -776,7 +911,7 @@ hp_info:
 
 hp_disk_info:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_DISK_INFO,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),DESC_ARG1(a0)
         bsr     submit_and_wait
@@ -792,48 +927,48 @@ hp_disk_info:
 
 hp_findinput:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_FINDINPUT,DESC_ACTION(a0)
         move.l  DP_ARG2(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG2(a0)
         move.l  DP_ARG3(a2),d0
-        move.l  G_NAMEBUF1,a1
+        move.l  ST_NAMEBUF1(a4),a1
         bsr     strip_colon_prefix
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG3(a0)                ; name BSTR, prefix-stripped
         bsr     submit_and_wait
         bra     hp_find_finish
 
 hp_findoutput:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_FINDOUTPUT,DESC_ACTION(a0)
         move.l  DP_ARG2(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG2(a0)
         move.l  DP_ARG3(a2),d0
-        move.l  G_NAMEBUF1,a1
+        move.l  ST_NAMEBUF1(a4),a1
         bsr     strip_colon_prefix
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG3(a0)
         bsr     submit_and_wait
         bra     hp_find_finish
 
 hp_findupdate:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_FINDUPDATE,DESC_ACTION(a0)
         move.l  DP_ARG2(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG2(a0)
         move.l  DP_ARG3(a2),d0
-        move.l  G_NAMEBUF1,a1
+        move.l  ST_NAMEBUF1(a4),a1
         bsr     strip_colon_prefix
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG3(a0)
         bsr     submit_and_wait
         ; fall through
@@ -875,7 +1010,7 @@ hp_find_finish:
 
 hp_end:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_END,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),DESC_ARG1(a0)      ; fh_Arg1, already verbatim
         bsr     submit_and_wait
@@ -885,7 +1020,7 @@ hp_end:
 
 hp_read:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_READ,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),DESC_ARG1(a0)      ; fh_Arg1, already verbatim
         move.l  DP_ARG2(a2),DESC_ARG2(a0)      ; buffer APTR, verbatim
@@ -897,7 +1032,7 @@ hp_read:
 
 hp_write:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_WRITE,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),DESC_ARG1(a0)      ; fh_Arg1, already verbatim
         move.l  DP_ARG2(a2),DESC_ARG2(a0)
@@ -909,7 +1044,7 @@ hp_write:
 
 hp_seek:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_SEEK,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),DESC_ARG1(a0)      ; fh_Arg1, already verbatim
         move.l  DP_ARG2(a2),DESC_ARG2(a0)      ; position, verbatim
@@ -921,7 +1056,7 @@ hp_seek:
 
 hp_set_file_size:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_SET_FILE_SIZE,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),DESC_ARG1(a0)      ; fh_Arg1, already verbatim
         move.l  DP_ARG2(a2),DESC_ARG2(a0)      ; offset, verbatim
@@ -936,16 +1071,16 @@ hp_set_file_size:
 
 hp_delete_object:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_DELETE_OBJECT,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG1(a0)
         move.l  DP_ARG2(a2),d0
-        move.l  G_NAMEBUF1,a1
+        move.l  ST_NAMEBUF1(a4),a1
         bsr     strip_colon_prefix
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG2(a0)
         bsr     submit_and_wait
         move.l  d3,DP_RES1(a2)
@@ -954,25 +1089,25 @@ hp_delete_object:
 
 hp_rename_object:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_RENAME_OBJECT,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG1(a0)
         move.l  DP_ARG2(a2),d0                 ; source name
-        move.l  G_NAMEBUF1,a1
+        move.l  ST_NAMEBUF1(a4),a1
         bsr     strip_colon_prefix
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG2(a0)
         move.l  DP_ARG3(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG3(a0)
         move.l  DP_ARG4(a2),d0                 ; dest name -- NAMEBUF2, not
-        move.l  G_NAMEBUF2,a1                  ; NAMEBUF1: both names are
+        move.l  ST_NAMEBUF2(a4),a1                  ; NAMEBUF1: both names are
         bsr     strip_colon_prefix             ; live in the same request
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG4(a0)
         bsr     submit_and_wait
         move.l  d3,DP_RES1(a2)
@@ -985,17 +1120,17 @@ hp_rename_object:
 
 hp_set_protect:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_SET_PROTECT,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),DESC_ARG1(a0)
         move.l  DP_ARG2(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG2(a0)
         move.l  DP_ARG3(a2),d0
-        move.l  G_NAMEBUF1,a1
+        move.l  ST_NAMEBUF1(a4),a1
         bsr     strip_colon_prefix
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG3(a0)                ; name BSTR, prefix-stripped
         move.l  DP_ARG4(a2),DESC_ARG4(a0)      ; protection mask, verbatim
         bsr     submit_and_wait
@@ -1005,17 +1140,17 @@ hp_set_protect:
 
 hp_set_comment:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_SET_COMMENT,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),DESC_ARG1(a0)
         move.l  DP_ARG2(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG2(a0)
         move.l  DP_ARG3(a2),d0
-        move.l  G_NAMEBUF1,a1
+        move.l  ST_NAMEBUF1(a4),a1
         bsr     strip_colon_prefix
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG3(a0)                ; name BSTR, prefix-stripped
         move.l  DP_ARG4(a2),DESC_ARG4(a0)      ; comment BSTR, verbatim
                                                 ; (not a path -- never
@@ -1027,17 +1162,17 @@ hp_set_comment:
 
 hp_set_date:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_SET_DATE,DESC_ACTION(a0)
         move.l  DP_ARG1(a2),DESC_ARG1(a0)
         move.l  DP_ARG2(a2),d0
         bsr     xlate_lock
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG2(a0)
         move.l  DP_ARG3(a2),d0
-        move.l  G_NAMEBUF1,a1
+        move.l  ST_NAMEBUF1(a4),a1
         bsr     strip_colon_prefix
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  d0,DESC_ARG3(a0)                ; name BSTR, prefix-stripped
         move.l  DP_ARG4(a2),DESC_ARG4(a0)      ; DateStamp APTR (a real
                                                 ; address already, not a
@@ -1053,7 +1188,7 @@ hp_set_date:
 
 hp_is_filesystem:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_IS_FILESYSTEM,DESC_ACTION(a0)
         bsr     submit_and_wait
         move.l  d3,DP_RES1(a2)
@@ -1062,7 +1197,7 @@ hp_is_filesystem:
 
 hp_flush:
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_FLUSH,DESC_ACTION(a0)
         bsr     submit_and_wait
         move.l  d3,DP_RES1(a2)
@@ -1085,7 +1220,7 @@ hp_flush:
 * before each submit"), so nothing here needs to touch it.
 *-----------------------------------------------------------------------------
 clear_desc_args:
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         moveq   #0,d0
         move.l  d0,DESC_ACTION(a0)
         move.l  d0,DESC_ARG1(a0)
@@ -1098,7 +1233,7 @@ clear_desc_args:
         rts
 
 *-----------------------------------------------------------------------------
-* submit_and_wait -- submit the descriptor already built at G_DESC and
+* submit_and_wait -- submit the descriptor already built at ST_DESC(a4) and
 * poll for completion (docs/pktport-protocol.md section 2: STATUS is
 * written after RES1/RES2, so RES1/RES2 are trustworthy the instant
 * STATUS reads 1 -- this file's header explains why a plain busy-poll is
@@ -1106,12 +1241,12 @@ clear_desc_args:
 * RES1, d4 = wire RES2. Clobbers d0/a0/a1.
 *-----------------------------------------------------------------------------
 submit_and_wait:
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         clr.l   DESC_STATUS(a0)                ; clear STATUS before each
                                                 ; submit (protocol doc
                                                 ; section 2's own
                                                 ; requirement)
-        move.l  G_BOARDBASE,a1
+        move.l  ST_BOARDBASE(a4),a1
         move.l  a0,d0
         move.l  d0,(PKT_REQ_PTR)(a1)           ; one move.l writes every
                                                 ; byte lane -- this file's
@@ -1124,7 +1259,7 @@ submit_and_wait:
                                                 ; convention every native
                                                 ; card on this bus uses
 .poll:
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         tst.l   DESC_STATUS(a0)
         beq.s   .poll
         move.l  DESC_RES1(a0),d3
@@ -1151,7 +1286,7 @@ xlate_lock:
 * to and including its first ':' (this file's header, "ambiguities...
 * name arguments arrive still carrying this mount's own prefix"). Input:
 * d0 = BPTR to the source BSTR (or 0), a1 = a NAMEBUF_SIZE-byte scratch
-* buffer (G_NAMEBUF1 or G_NAMEBUF2). Output: d0 = the BPTR to forward on
+* buffer (ST_NAMEBUF1(a4) or ST_NAMEBUF2(a4)). Output: d0 = the BPTR to forward on
 * the wire -- unchanged if the name is 0, empty, or contains no ':', or
 * a1's own BPTR (with a freshly written length byte and copied suffix)
 * if a ':' was found. Clobbers d1/d2/a0.
@@ -1276,10 +1411,10 @@ alloc_filelock_or_fail:
 .ok:
         move.l  d0,a0                          ; a0 = new FileLock*
         move.l  d2,FL_KEY(a0)
-        move.l  G_PROC,a1
+        move.l  ST_PROC(a4),a1
         lea     PR_MSGPORT(a1),a1
         move.l  a1,FL_TASK(a0)
-        move.l  G_DOSLIST_BPTR,FL_VOLUME(a0)   ; this file's own header,
+        move.l  ST_DOSLIST_BPTR(a4),FL_VOLUME(a0)   ; this file's own header,
                                                  ; "ambiguities... resolved
                                                  ; on its own": fl_Volume =
                                                  ; 0 (protocol doc section
@@ -1313,7 +1448,7 @@ alloc_filelock_or_fail:
 free_lock_wire:
         move.l  d0,d1
         bsr     clear_desc_args
-        move.l  G_DESC,a0
+        move.l  ST_DESC(a4),a0
         move.l  #ACT_FREE_LOCK,DESC_ACTION(a0)
         move.l  d1,DESC_ARG1(a0)
         bsr     submit_and_wait
@@ -1326,33 +1461,3 @@ free_lock_wire:
 ExpName:
         dc.b    "expansion.library",0
         even
-
-* This handler's persistent state. A -Fhunkexe BSS-style zero-initialised
-* block would serve equally well, but these are few enough and small
-* enough that plain dc.l 0 initialisers (living in the DATA hunk) keep
-* this file to the one-hunk-of-everything shape vasm produces by default
-* with no explicit SECTION directives, matching this project's existing
-* single-file assembly sources.
-G_PROC:         dc.l    0       ; our struct Process* (== Task*)
-G_EXPBASE:      dc.l    0       ; expansion.library base (opened once at
-                                ; startup, never closed -- hostblk-diagrom.
-                                ; s's own RtInit documents the same choice
-                                ; and the same reasoning: it's a core
-                                ; system library for the life of the
-                                ; machine regardless)
-G_BOARDBASE:    dc.l    0       ; the pktport card's AUTOCONFIG base
-G_CAPACITY:     dc.l    0       ; CAPACITY as read at startup (diagnostic
-                                ; only -- this handler never submits more
-                                ; than one request at a time regardless)
-G_DESC:         dc.l    0       ; the one 64-byte request descriptor
-G_NAMEBUF1:     dc.l    0       ; name-normalisation scratch buffer
-                                ; (NAMEBUF_SIZE bytes) -- strip_colon_prefix
-G_NAMEBUF2:     dc.l    0       ; second scratch buffer, for
-                                ; ACTION_RENAME_OBJECT's two names
-G_DOSLIST_BPTR: dc.l    0       ; this mount's own DosList/DeviceNode
-                                ; entry, as the BPTR DOS itself handed us
-                                ; in the startup packet's dp_Arg3 (not
-                                ; shifted to a real address, unlike a3
-                                ; during Start -- fl_Volume wants the raw
-                                ; BPTR). Used by alloc_filelock_or_fail;
-                                ; see its own comment.

@@ -19,7 +19,76 @@ Zorro II, 64 KB register window, `MANUFACTURER 0x07DB`, `PRODUCT 5`.
 Small on purpose: no data crosses the register window. Names, buffers
 and `FileInfoBlock`s are read and written directly in guest RAM through
 `GuestMemory`, exactly as `hostblk` moves sector data — the window
-carries only registers.
+carries only registers, plus (as of this increment) a DiagArea ROM.
+
+### DiagArea boot ROM and autoload
+
+This card carries a DiagArea (`ERTF_DIAGVALID`), served through the
+board window at `init_diag_vec` = `0x1000` (`crates/machine-core/src/
+pktport.rs`'s `ROM_BASE`, the same board-relative offset `hostblk`'s and
+`input`'s own ROMs use) exactly as those cards' register maps and ROM
+windows already coexist: registers occupy `0x00`-`0x1C`, the ROM starts
+at `0x1000`, and everything between reads as unimplemented board space.
+
+The ROM image (`m68k/pktport-rom/pktport-diagrom.s`, assembled to
+`assets/pktport-rom/pktport-diagrom.bin` by `scripts/
+build-pktport-rom.sh`) is laid out as:
+
+1. The DiagArea header, `DiagEntry`/`BootStub`, and the `struct
+   Resident` copied region (`libraries/configregs.h`'s usual DiagArea
+   copy semantics — see the ROM source's own header for the full
+   citation trail).
+2. `RtInit` and its subroutines, executing in place off the board's own
+   AUTOCONFIG window (never copied).
+3. A 4-byte big-endian length word (`BlobLenWord`), the ROM's last
+   symbol.
+4. That many bytes of `m68k/pktport-handler/pktport-handler.s`'s own
+   flat `-Fbin` build — a position-independent code blob, byte-for-byte
+   identical in logic to the relocatable `-Fhunkexe` build still
+   installable at `L:pktport-handler` (`pktport-handler.s`'s own header,
+   "Position independence").
+
+At boot, `RtInit` copies that blob out of the ROM window into a freshly
+`AllocMem`'d block, wraps it in a hand-built one-segment BCPL seglist,
+and constructs a `struct DeviceNode` naming `PKT0` with `dn_SegList`
+pointing at that seglist and `dn_Task = 0` — so AmigaDOS starts the
+handler process itself, lazily, the first time a client actually
+touches `PKT0:`. `RtInit` then calls `AddBootNode` with a **NULL**
+`ConfigDev`, which `expansion.library`'s own documented convention
+("Pass a NULL ConfigDev pointer to create a non-bootable node") makes a
+non-bootable DOS node: `PKT0:` exists and auto-mounts, but nothing about
+this increment makes the machine bootable *from* it (§9).
+
+A machine with this card and `--pktvol` therefore gets a working
+`PKT0:` from cold boot, with no `L:pktport-handler` file and no
+Mountlist entry required at all — confirmed against a real Kickstart
+3.2.2 boot by `scripts/pktport-rom-e2e.sh`: `Dir PKT0:` and
+`Echo hello >PKT0:marker` both work straight from a cold-booted Shell
+prompt, with nothing installed on the boot image, and the write is
+independently confirmed from the host side.
+
+The old Mountlist-driven install path (`scripts/pktport-e2e.sh`) still
+works unmodified too, starting the exact same handler program the exact
+same way — with one observed interaction, run and confirmed rather than
+assumed: because this ROM's own `AddBootNode` call runs during DOS's own
+early boot sequence, `PKT0:` already exists by the time
+`Startup-Sequence` (or an interactive user) later runs
+`Mount PKT0: from DEVS:Mountlist.pktport`. Real `dos.library` 47.30
+handles this exactly the way its own documented `AddDosEntry` conflict
+behaviour promises — gracefully, not by crashing or corrupting anything:
+the `Mount` command prints `ERROR: Device 'PKT0:' is already mounted`
+and the Shell returns to a fresh prompt, after which `Dir PKT0:` and
+`Echo ... >PKT0:marker` proceed normally against the ROM's own
+already-running handler process. `scripts/pktport-e2e.sh` was left
+exactly as it was (still `Mount`s "PKT0:", not renamed to "PKT1:") so
+this interaction stays visible rather than being engineered away; both
+scripts still finish with the same decisive host-side proof passing.
+(The reverse direction — this ROM's own `AddBootNode` call finding an
+*already-existing* `PKT0` at the point it runs — is architecturally
+handled the same way, per this section's own "yields" paragraph above,
+but was not separately exercised: nothing in this project's boot
+sequence currently makes another `PKT0` provider run before this ROM's
+own `RtInit` does.)
 
 ## 2. The request descriptor
 
@@ -197,8 +266,21 @@ calls `execute` at tick time, never from the doorbell write.
 
 Multiple volumes per card, a request queue deeper than 1, ExAll,
 notification (`ACTION_ADD_NOTIFY`), record locks, `ACTION_MAKE_LINK` /
-`ACTION_READ_LINK`, 64-bit packets, the host-directory backend
-(ADR 0004 backend 2 — same card, later), and the DiagArea boot path
-(mounted-first per ADR 0004; the stub arrives via the boot volume).
+`ACTION_READ_LINK`, 64-bit packets, and the host-directory backend
+(ADR 0004 backend 2 — same card, later).
 Each is an additive extension: new actions, new registers, or a deeper
 queue, all discoverable via `VERSION`/`CAPACITY`.
+
+**Booting *from* `PKT0:` is still future work.** §1 describes this
+increment's DiagArea/autoload path in full: it auto-*mounts* `PKT0:` at
+boot (no `L:` file, no Mountlist entry), but it does not make the
+volume bootable. The ROM's own `AddBootNode` call passes a NULL
+`ConfigDev`, which `expansion.library` documents as producing a
+non-bootable node deliberately — there is no `da_BootPoint`-driven
+autoboot attempt from this card, no boot-priority handling, and no
+`BootNode` carrying this card's real `ConfigDev`. A future increment
+that wants `PKT0:` itself to be a bootable volume is an additive change
+to the same ROM (a real `ConfigDev` argument to `AddBootNode`, boot
+priority, and everything RDB-partitioned boot devices like `hostblk`
+already do) — nothing in this increment's wire protocol or register map
+needs to change to add it.
