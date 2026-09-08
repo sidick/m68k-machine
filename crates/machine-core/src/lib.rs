@@ -55,6 +55,7 @@ pub mod graffity;
 pub mod hostblk;
 pub mod input;
 pub mod mirage;
+pub mod pktport;
 pub mod render;
 pub mod rom;
 pub mod rtgboard;
@@ -68,6 +69,7 @@ use graffity::Graffity;
 use hostblk::Hostblk;
 use input::NativeInput;
 use mirage::Mirage;
+use pktport::Pktport;
 use rtgboard::{ModeDescriptor, RtgBoard};
 
 /// Size in bytes of the chip RAM region, `$000000`-`$1FFFFF` (2 MB).
@@ -234,6 +236,19 @@ pub struct MachineBus<'a> {
     /// shape as [`Self::mirage_board`]/[`Self::hostblk_board`].
     input_board: Option<usize>,
 
+    /// The `pktport` DosPacket transport card (ADR 0004, [`pktport`]),
+    /// when the board layer has attached one via [`Self::with_pktport`].
+    /// Absent by default -- with no call to `with_pktport`, neither its
+    /// AUTOCONFIG board nor this field's routing branch exist, so a
+    /// machine with no `pktport` attached is completely unaffected, the
+    /// same guarantee [`Self::hostblk`]/[`Self::mirage`]/[`Self::input`]
+    /// already give.
+    pktport: Option<Pktport<'a>>,
+    /// AUTOCONFIG chain index `pktport`'s single board landed at, once
+    /// [`Self::with_pktport`] has registered it -- the same seam shape
+    /// as [`Self::mirage_board`]/[`Self::hostblk_board`].
+    pktport_board: Option<usize>,
+
     /// The native RTG display board ([`rtgboard`], ADR 0002), when the
     /// board layer has attached one via [`Self::with_rtgboard`]. Absent
     /// by default -- with no call to `with_rtgboard`, neither its
@@ -323,6 +338,8 @@ impl<'a> MachineBus<'a> {
             fast_ram_board: None,
             input: None,
             input_board: None,
+            pktport: None,
+            pktport_board: None,
             rtg: None,
             rtg_board: None,
             overlay: true,
@@ -436,6 +453,19 @@ impl<'a> MachineBus<'a> {
             self.input_board = self.autoconfig.add_board(NativeInput::board_spec());
             self.input = Some(NativeInput::new());
         }
+        self
+    }
+
+    /// Attach the `pktport` DosPacket transport card (ADR 0004, [`pktport`])
+    /// over a caller-owned [`pktport::PacketBackend`] -- borrowed, like
+    /// every other card's backing store on this bus (this crate has no
+    /// allocator). Registers `pktport`'s single Zorro II AUTOCONFIG board.
+    /// Absent a call to this, the chain and every address this card would
+    /// occupy are untouched -- the same "nothing changes unless attached"
+    /// guarantee [`Self::with_hostblk`]/[`Self::with_input`] already give.
+    pub fn with_pktport(mut self, backend: &'a mut dyn pktport::PacketBackend) -> Self {
+        self.pktport_board = self.autoconfig.add_board(Pktport::board_spec());
+        self.pktport = Some(Pktport::new(backend));
         self
     }
 
@@ -579,6 +609,28 @@ impl<'a> MachineBus<'a> {
         self.autoconfig.placement(self.input_board?).map(|p| p.base)
     }
 
+    /// Borrow the attached `pktport` card, if [`Self::with_pktport`] was
+    /// called.
+    pub fn pktport(&self) -> Option<&Pktport<'a>> {
+        self.pktport.as_ref()
+    }
+
+    /// Mutable access to the attached `pktport` card, see
+    /// [`Self::pktport`].
+    pub fn pktport_mut(&mut self) -> Option<&mut Pktport<'a>> {
+        self.pktport.as_mut()
+    }
+
+    /// Where AUTOCONFIG placed `pktport`'s single Zorro II board, once
+    /// `expansion.library` has configured it -- `None` before
+    /// [`Self::with_pktport`] was called or before the guest has
+    /// configured it. See [`Self::hostblk_board_base`], the same shape.
+    pub fn pktport_board_base(&self) -> Option<u32> {
+        self.autoconfig
+            .placement(self.pktport_board?)
+            .map(|p| p.base)
+    }
+
     /// Borrow the attached RTG display board, if [`Self::with_rtgboard`]
     /// was called -- e.g. for a screenshot path to walk its currently
     /// applied mode via [`rtgboard::RtgBoard::current_mode`]/
@@ -671,6 +723,21 @@ impl<'a> MachineBus<'a> {
             h.tick(self);
             let pending = h.irq_pending();
             self.hostblk = Some(h);
+            if pending {
+                self.chipset.raise_int(chipset::intbit::PORTS);
+            }
+        }
+
+        // `pktport`'s engine advances the same way, one request per call:
+        // see `pktport`'s module docs, "One outstanding request" -- with
+        // capacity 1 there is never more than a single request to
+        // service, but the shape (lift out of the `Option` for a
+        // `&mut dyn GuestMemory` view of the whole bus, put it straight
+        // back) is identical to `hostblk`'s, for the identical reason.
+        if let Some(mut p) = self.pktport.take() {
+            p.tick(self);
+            let pending = p.irq_pending();
+            self.pktport = Some(p);
             if pending {
                 self.chipset.raise_int(chipset::intbit::PORTS);
             }
@@ -812,6 +879,17 @@ impl<'a> MachineBus<'a> {
                 }
                 None => OPEN_BUS_BYTE,
             }
+        } else if let Some(offset) = self.pktport_target(address) {
+            match &self.pktport {
+                // `pktport::Pktport::read` never asserts an interrupt as a
+                // side effect of reading -- every register it exposes is
+                // a pure query (`VERSION`/`CAPACITY`/`VOL_COUNT`, and
+                // `INT_STATUS` itself only changes via `tick` or a write),
+                // so there is no read-path interrupt check to mirror
+                // here, the same reasoning `hostblk`'s own read arm gives.
+                Some(dev) => dev.read(offset),
+                None => OPEN_BUS_BYTE,
+            }
         } else if let Some(offset) = self.rtg_target(address) {
             match &self.rtg {
                 // No interrupt to check here -- `rtgboard`'s module docs,
@@ -864,6 +942,21 @@ impl<'a> MachineBus<'a> {
     /// other board. See [`Self::mirage_target`], the same shape.
     fn hostblk_target(&self, address: u32) -> Option<u32> {
         let idx = self.hostblk_board?;
+        if self.autoconfig.board_at(address) != Some(idx) {
+            return None;
+        }
+        let base = self.autoconfig.placement(idx)?.base;
+        Some(address - base)
+    }
+
+    /// Whether `address` falls inside `pktport`'s configured AUTOCONFIG
+    /// window, and if so, the board-relative offset -- the input to
+    /// [`pktport::Pktport::read`]/[`pktport::Pktport::write`]. `None`
+    /// whenever no card is attached ([`Self::pktport_board`] is `None`
+    /// until [`Self::with_pktport`] runs) or the address belongs to some
+    /// other board. See [`Self::hostblk_target`], the same shape.
+    fn pktport_target(&self, address: u32) -> Option<u32> {
+        let idx = self.pktport_board?;
         if self.autoconfig.board_at(address) != Some(idx) {
             return None;
         }
@@ -1087,6 +1180,19 @@ impl<'a> MachineBus<'a> {
                 // `hostblk`'s doorbell arm above, kept only for future-
                 // proofing) -- see `input` module docs, "Interrupt
                 // model".
+                if dev.irq_pending() {
+                    self.chipset.raise_int(chipset::intbit::PORTS);
+                }
+            }
+        } else if let Some(offset) = self.pktport_target(address) {
+            if let Some(dev) = &mut self.pktport {
+                dev.write(offset, value);
+                // `DOORBELL`/`INT_STATUS`/`INT_ENABLE` are exactly the
+                // registers that can change `irq_pending()`'s answer
+                // (`DOORBELL` never synchronously today -- `pktport`'s
+                // module docs, "Deferred completion" -- but kept
+                // unconditional for the same future-proofing reason
+                // `hostblk`'s own doorbell arm gives).
                 if dev.irq_pending() {
                     self.chipset.raise_int(chipset::intbit::PORTS);
                 }
