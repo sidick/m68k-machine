@@ -413,6 +413,9 @@ ACT_SET_COMMENT        equ     28
 ACT_SET_DATE           equ     34
 ACT_IS_FILESYSTEM      equ     1027
 ACT_FLUSH              equ     27
+ACT_INHIBIT            equ     31      ; dos/dosextens.h -- Arg1: BOOL
+ACT_FORMAT             equ     1020    ; dos/dosextens.h -- Arg1: volume
+                                        ; name BSTR, Arg2: dostype
 
 *=============================================================================
 * Start -- the program's entry point (the very first byte of this
@@ -726,6 +729,10 @@ handle_packet:
         beq     hp_is_filesystem
         cmp.l   #ACT_FLUSH,d0
         beq     hp_flush
+        cmp.l   #ACT_INHIBIT,d0
+        beq     hp_inhibit
+        cmp.l   #ACT_FORMAT,d0
+        beq     hp_format
 
         ; Not one of docs/pktport-protocol.md section 5's actions: answer
         ; locally, never forward it (the backend would answer 209 anyway,
@@ -1199,6 +1206,35 @@ hp_flush:
         bsr     clear_desc_args
         move.l  ST_DESC(a4),a0
         move.l  #ACT_FLUSH,DESC_ACTION(a0)
+        bsr     submit_and_wait
+        move.l  d3,DP_RES1(a2)
+        move.l  d4,DP_RES2(a2)
+        rts
+
+* ---- ACTION_INHIBIT/ACTION_FORMAT (docs/pktport-protocol.md section 5's
+* ACTION_INHIBIT/FORMAT addendum): forwarded verbatim, dp_Arg1/dp_Arg2
+* copied straight onto the wire with neither lock translation (there is
+* no lock in either packet's argument list) nor strip_colon_prefix
+* (ACTION_FORMAT's Arg1 is a bare volume-name BSTR, not a path -- a
+* leading colon is not part of dos.library's own convention for it, so
+* there is nothing to strip). -------------------------------------------
+
+hp_inhibit:
+        bsr     clear_desc_args
+        move.l  ST_DESC(a4),a0
+        move.l  #ACT_INHIBIT,DESC_ACTION(a0)
+        move.l  DP_ARG1(a2),DESC_ARG1(a0)      ; BOOL, verbatim
+        bsr     submit_and_wait
+        move.l  d3,DP_RES1(a2)
+        move.l  d4,DP_RES2(a2)
+        rts
+
+hp_format:
+        bsr     clear_desc_args
+        move.l  ST_DESC(a4),a0
+        move.l  #ACT_FORMAT,DESC_ACTION(a0)
+        move.l  DP_ARG1(a2),DESC_ARG1(a0)      ; volume-name BSTR, verbatim
+        move.l  DP_ARG2(a2),DESC_ARG2(a0)      ; dostype, verbatim
         bsr     submit_and_wait
         move.l  d3,DP_RES1(a2)
         move.l  d4,DP_RES2(a2)

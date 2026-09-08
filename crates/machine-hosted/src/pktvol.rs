@@ -84,8 +84,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use amiga_ffs::{
-    AllocError, Allocator, DateStamp, EntryKind, Error as FfsError, MetaUpdate, Metadata,
-    MutateError, Mutator, Variant, Volume, DEFAULT_RESERVED, ST_ROOT,
+    format as ffs_format, AllocError, Allocator, DateStamp, EntryKind, Error as FfsError,
+    FormatError, FormatOptions, MetaUpdate, Metadata, MutateError, Mutator, Variant, Volume,
+    DEFAULT_RESERVED, ST_ROOT,
 };
 use amiga_rdb::{Rdb, RdbError};
 
@@ -105,6 +106,14 @@ mod action {
     pub const COPY_DIR: u32 = 19;
     pub const PARENT: u32 = 29;
     pub const SAME_LOCK: u32 = 40;
+    /// `dos/dosextens.h` -- Arg1: `BOOL` (nonzero = inhibit). Flushes and
+    /// invalidates every open handle when inhibiting; remounts from the
+    /// medium when un-inhibiting (docs/pktport-protocol.md §5).
+    pub const INHIBIT: u32 = 31;
+    /// `dos/dosextens.h` -- Arg1: volume-name BSTR, Arg2: dostype. Legal
+    /// only while `INHIBIT`ed; re-initializes the medium via
+    /// `amiga-ffs::format` (QUICK format only -- see §5).
+    pub const FORMAT: u32 = 1020;
     pub const EXAMINE_OBJECT: u32 = 23;
     pub const EXAMINE_NEXT: u32 = 24;
     pub const INFO: u32 = 26;
@@ -342,6 +351,33 @@ pub struct PktVolume {
     handles: HashMap<u32, Handle>,
     next_handle: u32,
     writable: bool,
+    /// Where the underlying image lives on the host -- kept so `INHIBIT`
+    /// `FALSE` can reopen a fresh [`FileMedium`] and remount from
+    /// scratch (`amiga-ffs`'s `Volume`/`Mutator` cache the variant,
+    /// parsed root and bitmap at open time; there is no supported way to
+    /// re-derive all of that in place after `ACTION_FORMAT` may have
+    /// changed the variant itself, so a full remount is the only
+    /// correct move -- see the module doc's ACTION_INHIBIT/FORMAT
+    /// section).
+    path: std::path::PathBuf,
+    /// The partition's start block within the image file (0 for a bare
+    /// RDB-less volume), captured at open time -- `ACTION_FORMAT` never
+    /// moves or resizes the partition, only reinitializes what is inside
+    /// it, so this stays valid across a format/remount cycle.
+    base_lba: u64,
+    /// Blocks in the partition (the filesystem's own extent) -- the
+    /// `block_count` a remount and a reformat both need.
+    len_blocks: u64,
+    /// Blocks reserved at the front, from the RDB's `de_Reserved` (or
+    /// [`DEFAULT_RESERVED`] for a bare volume) -- carried across
+    /// format/remount exactly like `len_blocks`.
+    reserved: u64,
+    block_size: usize,
+    /// Set by `ACTION_INHIBIT(TRUE)`, cleared by a successful
+    /// `ACTION_INHIBIT(FALSE)`. While set, every action except
+    /// `INHIBIT`, `FORMAT`, `IS_FILESYSTEM` and `DISK_INFO` refuses with
+    /// `ERROR_NOT_A_DOS_DISK` (225) -- see the module doc.
+    inhibited: bool,
 }
 
 impl PktVolume {
@@ -429,7 +465,57 @@ impl PktVolume {
             handles: HashMap::new(),
             next_handle: 1,
             writable,
+            path: path.to_path_buf(),
+            base_lba,
+            len_blocks,
+            reserved,
+            block_size: BLOCK_SIZE,
+            inhibited: false,
         })
+    }
+
+    /// Open a fresh [`FileMedium`] at this volume's own path/geometry --
+    /// `ACTION_INHIBIT(FALSE)`'s remount step, and nothing else: reusing
+    /// the medium already inside `self.backing` is not an option, since
+    /// that medium is trapped behind `amiga-ffs`'s owning `Volume`/
+    /// `Mutator` with no public way to hand it back out, and even if it
+    /// were reachable its cached variant/root/bitmap would still be
+    /// stale after `ACTION_FORMAT`.
+    fn open_medium(&self) -> io::Result<FileMedium> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(self.writable)
+            .open(&self.path)?;
+        Ok(FileMedium {
+            file,
+            block_size: self.block_size,
+            base_lba: self.base_lba,
+            len_blocks: Some(self.len_blocks),
+        })
+    }
+
+    /// `ACTION_INHIBIT(FALSE)`'s remount: reopen the image from disk and
+    /// rebuild `self.backing` from scratch, dropping every open handle
+    /// (they name structures the old, now-discarded `Volume`/`Mutator`
+    /// owned).
+    ///
+    /// `expect` is `None` -- "believe the disk" -- rather than whatever
+    /// variant this volume opened as, deliberately: `ACTION_FORMAT` may
+    /// have just written a different `DOS\x` dostype into the boot
+    /// block, and re-asserting the old variant here would make every
+    /// post-format remount fail with a manufactured `VariantMismatch`.
+    fn remount(&mut self) -> Result<(), u32> {
+        let medium = self.open_medium().map_err(|_| err::OBJECT_NOT_FOUND)?;
+        let mut vol = Volume::open_with(medium, None, self.len_blocks, self.reserved)
+            .map_err(|e| map_read_error(&e))?;
+        self.backing = if self.writable {
+            Backing::Writable(Mutator::open(vol).map_err(|e| map_mutate_error(&e))?)
+        } else {
+            let alloc = Allocator::load(&mut vol).map_err(|e| map_alloc_error(&e))?;
+            Backing::ReadOnly { vol, alloc }
+        };
+        self.handles.clear();
+        Ok(())
     }
 
     fn volume(&mut self) -> &mut Volume<FileMedium> {
@@ -615,6 +701,30 @@ fn map_mutate_error<E>(e: &MutateError<E>) -> u32 {
     }
 }
 
+/// Map `amiga_ffs::FormatError` onto §6's codes for `ACTION_FORMAT`.
+/// None of these have a dedicated §6 code (§6's table is about ordinary
+/// filesystem operations, and formatting is not one); the closest
+/// available meanings: `NameEmpty`/`NameTooLong`/`NameInvalidByte` ->
+/// 210 (invalid name), the same code the read/mutate paths use for
+/// their own name problems. `BadBlockSize`/`BadReserved`/
+/// `VolumeTooSmall`/`VolumeTooLarge`/`SinkTooSmall` are all "this
+/// geometry cannot be formatted at all" -> 225 (not a DOS disk this
+/// crate can produce), `map_read_error`'s own reasoning for geometry
+/// this crate refuses to trust, applied to the write side. `Io` is a
+/// transport failure -> 205, every other mapper's catch-all.
+fn map_format_error<E>(e: &FormatError<E>) -> u32 {
+    use FormatError::*;
+    match e {
+        NameEmpty | NameTooLong { .. } | NameInvalidByte { .. } => err::INVALID_COMPONENT_NAME,
+        BadBlockSize(_)
+        | BadReserved { .. }
+        | VolumeTooSmall { .. }
+        | VolumeTooLarge { .. }
+        | SinkTooSmall { .. } => err::NOT_A_DOS_DISK,
+        Io(_) => err::OBJECT_NOT_FOUND,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Guest memory helpers (§7)
 // ---------------------------------------------------------------------------
@@ -740,6 +850,17 @@ impl PktVolume {
         mem: &mut dyn GuestMemory,
     ) -> (u32, u32) {
         match action {
+            // Legal at all times, inhibited or not -- the only four
+            // exempt actions per §5's ACTION_INHIBIT/FORMAT section.
+            action::INHIBIT => self.inhibit_action(args),
+            action::FORMAT => self.format_action(args, mem),
+            action::IS_FILESYSTEM => (DOSTRUE, 0),
+            action::DISK_INFO => self.disk_info(args, mem),
+            // Everything else refuses outright while inhibited: the
+            // handles a lock/file action would resolve may name
+            // structures from a `Volume`/`Mutator` that is about to be
+            // (or already has been) discarded from under them.
+            _ if self.inhibited => (DOSFALSE, err::NOT_A_DOS_DISK),
             action::LOCATE_OBJECT => self.locate_object(args, mem),
             action::FREE_LOCK => self.free_lock(args),
             action::COPY_DIR => self.copy_dir(args),
@@ -748,7 +869,6 @@ impl PktVolume {
             action::EXAMINE_OBJECT => self.examine_object(args, mem),
             action::EXAMINE_NEXT => self.examine_next(args, mem),
             action::INFO => self.info(args, mem),
-            action::DISK_INFO => self.disk_info(args, mem),
             action::FINDINPUT => self.find_input(args, mem),
             action::FINDOUTPUT => self.find_output(args, mem),
             action::FINDUPDATE => self.find_update(args, mem),
@@ -763,7 +883,6 @@ impl PktVolume {
             action::SET_PROTECT => self.set_protect(args, mem),
             action::SET_COMMENT => self.set_comment(args, mem),
             action::SET_DATE => self.set_date(args, mem),
-            action::IS_FILESYSTEM => (DOSTRUE, 0),
             action::FLUSH => self.flush(),
             _ => (DOSFALSE, err::ACTION_NOT_KNOWN),
         }
@@ -1422,6 +1541,104 @@ impl PktVolume {
         }
         (DOSTRUE, 0)
     }
+
+    /// `ACTION_INHIBIT`, Arg1 nonzero = inhibit, zero = un-inhibit --
+    /// AmigaDOS's own convention is a plain `BOOL`, not the `DOSTRUE`/
+    /// `DOSFALSE` result convention, so any nonzero value counts.
+    ///
+    /// Inhibiting: flushes to durable storage, drops every open handle
+    /// (they name structures about to be invalidated by the `FORMAT`
+    /// this is almost always in service of), and enters the inhibited
+    /// state. Refused with `ERROR_WRITE_PROTECTED` (214) on a read-only
+    /// volume -- there is no format this backend could perform after
+    /// inhibiting it anyway, and refusing here is the "sensible" refusal
+    /// the read-only INHIBIT-for-format flow needs, before a caller ever
+    /// reaches `ACTION_FORMAT`'s own (redundant, defence-in-depth) check.
+    /// Idempotent: inhibiting an already-inhibited volume just succeeds.
+    ///
+    /// Un-inhibiting: remounts (see [`Self::remount`]) and leaves the
+    /// inhibited state on success. Idempotent the same way: un-inhibiting
+    /// a volume that was never inhibited succeeds without remounting.
+    fn inhibit_action(&mut self, args: [u32; 7]) -> (u32, u32) {
+        let want_inhibit = args[0] != 0;
+        if want_inhibit {
+            if self.inhibited {
+                return (DOSTRUE, 0);
+            }
+            if !self.writable {
+                return (DOSFALSE, err::WRITE_PROTECTED);
+            }
+            let _ = self.flush();
+            self.handles.clear();
+            self.inhibited = true;
+            (DOSTRUE, 0)
+        } else {
+            if !self.inhibited {
+                return (DOSTRUE, 0);
+            }
+            match self.remount() {
+                Ok(()) => {
+                    self.inhibited = false;
+                    (DOSTRUE, 0)
+                }
+                Err(code) => (DOSFALSE, code),
+            }
+        }
+    }
+
+    /// `ACTION_FORMAT`, Arg1 = volume-name BSTR, Arg2 = dostype. Legal
+    /// only while `ACTION_INHIBIT(TRUE)`'d -- otherwise
+    /// `ERROR_OBJECT_IN_USE` (202), matching real AmigaDOS handlers that
+    /// refuse a low-level format on a mounted, un-inhibited volume.
+    ///
+    /// Only QUICK format is meaningful here: there is no block device
+    /// under this handler for a full low-level pass to write to (see
+    /// docs/pktport-protocol.md §5's ACTION_INHIBIT/FORMAT section) --
+    /// `amiga-ffs::format` *is* the QUICK-format operation, laying down
+    /// a fresh empty filesystem without touching anything below the
+    /// filesystem layer, which is exactly right since there is nothing
+    /// below it to touch.
+    ///
+    /// Reformats in place through the medium the current (still open)
+    /// `Mutator` already holds -- no remount here; that is
+    /// `ACTION_INHIBIT(FALSE)`'s job, matching real `C:Format`'s
+    /// INHIBIT(TRUE) -> FORMAT -> INHIBIT(FALSE) sequence.
+    fn format_action(&mut self, args: [u32; 7], mem: &mut dyn GuestMemory) -> (u32, u32) {
+        if !self.inhibited {
+            return (DOSFALSE, err::OBJECT_IN_USE);
+        }
+        if !self.writable {
+            return (DOSFALSE, err::WRITE_PROTECTED);
+        }
+        let name = match read_bstr(mem, args[0]) {
+            Some(n) if !n.is_empty() => n,
+            _ => return (DOSFALSE, err::INVALID_COMPONENT_NAME),
+        };
+        let dostype = args[1];
+        let variant = match Variant::from_dostype(dostype) {
+            Some(v) => v,
+            // A dostype this crate cannot format (not a DOS\0-DOS\7
+            // member `amiga-ffs::Variant` recognises) -> "not a DOS
+            // disk", the same code the read side uses for a dostype it
+            // cannot mount.
+            None => return (DOSFALSE, err::NOT_A_DOS_DISK),
+        };
+        let opts = FormatOptions::new(variant, self.len_blocks, &name).reserved(self.reserved);
+        let mutator = match self.mutator_mut() {
+            Some(m) => m,
+            // Unreachable in practice: `self.writable` was just checked
+            // and `Backing::Writable` is exactly what `self.writable`
+            // means. Kept as a real refusal rather than an `expect`,
+            // since panicking a filesystem backend on any input shape is
+            // exactly what §7's hostility rules forbid.
+            None => return (DOSFALSE, err::WRITE_PROTECTED),
+        };
+        let medium = mutator.volume().source_mut();
+        match ffs_format(medium, &opts) {
+            Ok(_) => (DOSTRUE, 0),
+            Err(e) => (DOSFALSE, map_format_error(&e)),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2005,6 +2222,123 @@ mod tests {
             let len = mem.0[fib + 8] as usize;
             assert!(len > 0, "root EXAMINE_NEXT returned an empty name");
         }
+    }
+
+    // -- ACTION_INHIBIT / ACTION_FORMAT (docs/pktport-protocol.md §5) --
+
+    #[test]
+    fn inhibit_format_uninhibit_cycle_yields_empty_named_volume() {
+        let (mut vol, path) = open_rw();
+        let mut mem = ram();
+
+        // Sanity: the volume isn't empty before formatting -- readme.txt
+        // is one of `build_test_volume`'s fixtures.
+        let name_bptr = put_bstr(&mut mem, 0x1000, b"readme.txt");
+        let (r1, r2) = vol.execute(action::LOCATE_OBJECT, args3(0, name_bptr, 0), &mut mem);
+        assert_eq!(
+            (r2, r1 != 0),
+            (0, true),
+            "fixture readme.txt should exist pre-format"
+        );
+
+        let (r1, r2) = vol.execute(action::INHIBIT, args1(1), &mut mem);
+        assert_eq!((r1, r2), (DOSTRUE, 0));
+
+        let name_bptr = put_bstr(&mut mem, 0x2000, b"TestVol");
+        let dostype = Variant::Ffs.dostype();
+        let (r1, r2) = vol.execute(action::FORMAT, args2(name_bptr, dostype), &mut mem);
+        assert_eq!((r1, r2), (DOSTRUE, 0));
+
+        let (r1, r2) = vol.execute(action::INHIBIT, args1(0), &mut mem);
+        assert_eq!((r1, r2), (DOSTRUE, 0));
+
+        // The volume is now empty: the old fixture file is gone.
+        let name_bptr = put_bstr(&mut mem, 0x1000, b"readme.txt");
+        let (r1, r2) = vol.execute(action::LOCATE_OBJECT, args3(0, name_bptr, 0), &mut mem);
+        assert_eq!((r1, r2), (DOSFALSE, err::OBJECT_NOT_FOUND));
+
+        // The root now reports the freshly formatted name.
+        let fib_bptr = 0x3000 / 4;
+        let (r1, r2) = vol.execute(action::EXAMINE_OBJECT, args2(0, fib_bptr), &mut mem);
+        assert_eq!((r1, r2), (DOSTRUE, 0));
+        let fib = 0x3000;
+        let len = mem.0[fib + 8] as usize;
+        assert_eq!(&mem.0[fib + 9..fib + 9 + len], b"TestVol");
+
+        // Root has no children.
+        let fib_bptr2 = 0x4000 / 4;
+        let (r1, r2) = vol.execute(action::EXAMINE_NEXT, args2(0, fib_bptr2), &mut mem);
+        assert_eq!((r1, r2), (DOSFALSE, err::NO_MORE_ENTRIES));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn inhibit_invalidates_open_handles() {
+        let (mut vol, path) = open_rw();
+        let mut mem = ram();
+
+        let name_bptr = put_bstr(&mut mem, 0x1000, b"readme.txt");
+        let (lock, r2) = vol.execute(action::LOCATE_OBJECT, args3(0, name_bptr, 0), &mut mem);
+        assert_eq!(r2, 0);
+        assert_ne!(lock, 0);
+
+        let (r1, r2) = vol.execute(action::INHIBIT, args1(1), &mut mem);
+        assert_eq!((r1, r2), (DOSTRUE, 0));
+        let (r1, r2) = vol.execute(action::INHIBIT, args1(0), &mut mem);
+        assert_eq!((r1, r2), (DOSTRUE, 0));
+
+        // The lock handed out before INHIBIT no longer resolves.
+        let fib_bptr = 0x2000 / 4;
+        let (r1, r2) = vol.execute(action::EXAMINE_OBJECT, args2(lock, fib_bptr), &mut mem);
+        assert_eq!((r1, r2), (DOSFALSE, err::OBJECT_NOT_FOUND));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn format_outside_inhibit_is_refused() {
+        let (mut vol, path) = open_rw();
+        let mut mem = ram();
+        let name_bptr = put_bstr(&mut mem, 0x1000, b"TestVol");
+        let (r1, r2) = vol.execute(
+            action::FORMAT,
+            args2(name_bptr, Variant::Ffs.dostype()),
+            &mut mem,
+        );
+        assert_eq!((r1, r2), (DOSFALSE, err::OBJECT_IN_USE));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn inhibited_state_rejects_ordinary_actions_but_not_the_exempt_ones() {
+        let (mut vol, path) = open_rw();
+        let mut mem = ram();
+
+        let (r1, r2) = vol.execute(action::INHIBIT, args1(1), &mut mem);
+        assert_eq!((r1, r2), (DOSTRUE, 0));
+
+        let name_bptr = put_bstr(&mut mem, 0x1000, b"readme.txt");
+        let (r1, r2) = vol.execute(action::LOCATE_OBJECT, args3(0, name_bptr, 0), &mut mem);
+        assert_eq!((r1, r2), (DOSFALSE, err::NOT_A_DOS_DISK));
+
+        // IS_FILESYSTEM and DISK_INFO stay answerable while inhibited.
+        let (r1, _) = vol.execute(action::IS_FILESYSTEM, args1(0), &mut mem);
+        assert_eq!(r1, DOSTRUE);
+        let info_bptr = 0x2000 / 4;
+        let (r1, r2) = vol.execute(action::DISK_INFO, args1(info_bptr), &mut mem);
+        assert_eq!((r1, r2), (DOSTRUE, 0));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_only_volume_refuses_inhibit_for_format() {
+        let (mut vol, path) = open_ro();
+        let mut mem = ram();
+        let (r1, r2) = vol.execute(action::INHIBIT, args1(1), &mut mem);
+        assert_eq!((r1, r2), (DOSFALSE, err::WRITE_PROTECTED));
+        std::fs::remove_file(&path).ok();
     }
 
     // Silence an unused-import warning when the `Cursor`/`format` items

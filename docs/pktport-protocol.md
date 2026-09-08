@@ -188,6 +188,54 @@ locks/handles as in §4. Everything else → `RES1 = DOSFALSE`,
 | `ACTION_SET_DATE` | 34 | –, lock, name BSTR, DateStamp APTR | dates |
 | `ACTION_IS_FILESYSTEM` | 1027 | — | `RES1 = DOSTRUE` |
 | `ACTION_FLUSH` | 27 | — | flush backend to durable storage |
+| `ACTION_INHIBIT` | 31 | BOOL | flush + invalidate handles + enter inhibited state, or remount + leave it ‡ |
+| `ACTION_FORMAT` | 1020 | volume-name BSTR, dostype | re-initialize the medium (only legal while inhibited) ‡ |
+
+‡ **`ACTION_INHIBIT`/`ACTION_FORMAT`, the `C:Format` pair.** Real
+`C:Format` drives a device through `INHIBIT(TRUE)` → `FORMAT` →
+`INHIBIT(FALSE)` (`dos.library/Inhibit`, `dos.library/Format` --
+`Format()`'s own autodoc: "the filesystem should be inhibited before
+calling Format() to make sure you don't get an ERROR_OBJECT_IN_USE").
+A `pktport` volume only ever supports **QUICK** format: there is no
+`FSSM`/block device under the handler for a low-level pass to write to
+(§8's whole point -- the filesystem runs on the host, with nothing
+device-shaped underneath it in the guest), so `amiga-ffs::format` *is*
+the entire operation, and there is no "full" mode to offer. This also
+means `C:Format`'s own shell command refuses to target a `pktport`
+volume at all: confirmed against a real Kickstart 3.2.2 --
+`Format DRIVE PKT0: NAME TestVol QUICK` fails immediately with
+`Format Failure: object is not of required type`, before a single
+DosPacket reaches the handler (the identical refusal reproduces
+against `RAM:`, another handler-based device with no block device
+under it, ruling out anything `pktport`-specific -- `C:Format`'s own
+pre-flight device-class check is what refuses, not this backend).
+`ACTION_INHIBIT`/`ACTION_FORMAT` are still real and fully wired end to
+end (`crates/machine-hosted/src/pktvol.rs`'s unit suite, and a guest
+program calling `dos.library`'s `Inhibit()`/`Format()` directly reaches
+them and reformats the served image -- see that crate's own docs for
+the decisive host-side proof); only the `C:Format` *shell command*
+specifically cannot be the caller for a `pktport` volume.
+
+`ACTION_INHIBIT(TRUE)`: flushes to durable storage, invalidates every
+open handle (§4 -- they name structures about to be discarded), and
+enters an inhibited state in which every action except `ACTION_INHIBIT`
+itself, `ACTION_FORMAT`, `ACTION_IS_FILESYSTEM` and `ACTION_DISK_INFO`
+refuses with `ERROR_NOT_A_DOS_DISK` (225). Refused with
+`ERROR_WRITE_PROTECTED` (214) on a read-only volume -- there is nothing
+a subsequent `ACTION_FORMAT` could do to a medium this backend cannot
+write, so refusing at the `INHIBIT` step is the sensible place to say
+so.
+
+`ACTION_FORMAT`: legal only while inhibited (`ERROR_OBJECT_IN_USE`,
+202, otherwise -- matching `Format()`'s own autodoc). Re-initializes
+the medium via `amiga-ffs::format` with the requested volume name and
+dostype; a dostype outside `DOS\0`-`DOS\7` (whatever
+`amiga_ffs::Variant::from_dostype` refuses) is answered with
+`ERROR_NOT_A_DOS_DISK` (225).
+
+`ACTION_INHIBIT(FALSE)`: remounts from the medium (freshly formatted,
+if `ACTION_FORMAT` ran in between, or unchanged otherwise) and leaves
+the inhibited state.
 
 † The `ACTION_FIND*` wire convention: the true DosPacket carries a
 guest `FileHandle` BPTR in Arg1; the stub keeps that entirely on its

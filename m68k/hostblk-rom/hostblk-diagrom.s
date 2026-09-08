@@ -9,7 +9,8 @@
 * was -- DiagEntry still just proves the board is reachable and marks the
 * RAM copy); hostblk.device implementing OpenDevice/CloseDevice/BeginIO/
 * AbortIO plus CMD_READ/CMD_WRITE/CMD_UPDATE/TD_GETGEOMETRY/TD_CHANGENUM/
-* TD_CHANGESTATE/TD_PROTSTATUS/TD_READ64/TD_WRITE64/NSCMD_DEVICEQUERY;
+* TD_CHANGESTATE/TD_PROTSTATUS/TD_READ64/TD_WRITE64/TD_FORMAT/TD_FORMAT64/
+* NSCMD_TD_READ64/NSCMD_TD_WRITE64/NSCMD_TD_FORMAT64/NSCMD_DEVICEQUERY;
 * asynchronous completion via an INT2 interrupt server draining the
 * completion queue (docs/hostblk-protocol.md section 5) and self-limiting
 * against SUBMIT_CAPACITY (section 8) with a pending-request list rather
@@ -258,15 +259,18 @@ CMD_WRITE       equ     3
 CMD_UPDATE      equ     4
 CMD_CLEAR       equ     5
 CMD_FLUSH       equ     8
+TD_FORMAT       equ     (CMD_FLUSH+1+2)         ; CMD_NONSTD(9)+2 = 11
 TD_CHANGENUM    equ     (CMD_FLUSH+1+4)         ; CMD_NONSTD(9)+4 = 13
 TD_CHANGESTATE  equ     (CMD_FLUSH+1+5)         ; 14
 TD_PROTSTATUS   equ     (CMD_FLUSH+1+6)         ; 15
 TD_GETGEOMETRY  equ     (CMD_FLUSH+1+13)        ; 22
 TD_READ64       equ     (CMD_FLUSH+1+15)        ; 24
 TD_WRITE64      equ     (CMD_FLUSH+1+16)        ; 25
+TD_FORMAT64     equ     (CMD_FLUSH+1+18)        ; 27
 NSCMD_DEVICEQUERY equ   $4000
 NSCMD_TD_READ64 equ     $c000
 NSCMD_TD_WRITE64 equ    $c001
+NSCMD_TD_FORMAT64 equ   $c003
 
 * exec/errors.h, devices/trackdisk.h: io_Error values this driver
 * returns, mapped from hostblk's own completion error codes (protocol
@@ -961,6 +965,16 @@ dev_beginio:
         beq     .async
         cmp.w   #NSCMD_TD_WRITE64,d0
         beq     .async
+        cmp.w   #TD_FORMAT,d0                 ; dos: "write without
+        beq     .async                        ; preserving" -- on a
+                                                ; hard-disk-class device
+                                                ; this *is* a write, so it
+                                                ; routes exactly like
+                                                ; CMD_WRITE (classify_async).
+        cmp.w   #TD_FORMAT64,d0
+        beq     .async
+        cmp.w   #NSCMD_TD_FORMAT64,d0
+        beq     .async
 
         cmp.w   #CMD_RESET,d0
         beq     .quick_ok
@@ -1116,9 +1130,15 @@ classify_async:
         beq.s   .rd64
         cmp.w   #CMD_WRITE,d0
         beq.s   .wr
+        cmp.w   #TD_FORMAT,d0             ; dos "write without preserving"
+        beq.s   .wr                       ; -- same descriptor as CMD_WRITE
         cmp.w   #TD_WRITE64,d0
         beq.s   .wr64
         cmp.w   #NSCMD_TD_WRITE64,d0
+        beq.s   .wr64
+        cmp.w   #TD_FORMAT64,d0
+        beq.s   .wr64
+        cmp.w   #NSCMD_TD_FORMAT64,d0
         beq.s   .wr64
         moveq   #HB_CMD_FLUSH,d1          ; CMD_UPDATE or CMD_FLUSH
         rts
@@ -1603,7 +1623,8 @@ ExpName:
 SupportedCmds:
         dc.w    CMD_READ,CMD_WRITE,CMD_UPDATE,CMD_FLUSH,CMD_CLEAR,CMD_RESET
         dc.w    TD_GETGEOMETRY,TD_CHANGENUM,TD_CHANGESTATE,TD_PROTSTATUS
-        dc.w    TD_READ64,TD_WRITE64,NSCMD_TD_READ64,NSCMD_TD_WRITE64
+        dc.w    TD_READ64,TD_WRITE64,TD_FORMAT,TD_FORMAT64
+        dc.w    NSCMD_TD_READ64,NSCMD_TD_WRITE64,NSCMD_TD_FORMAT64
         dc.w    NSCMD_DEVICEQUERY
         dc.w    0
         even

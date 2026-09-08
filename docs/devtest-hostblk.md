@@ -26,10 +26,24 @@ is also why `devtest -p` prints "Unknown device type"), `ETD_*`
 (no enhanced/label semantics), `TD_RAWREAD`, `TD_MOTOR`,
 `TD_GETDRIVETYPE`, `TD_GETNUMTRACKS`, `CMD_START`, `TD_SEEK`.
 
-**Gap worth a future look — `TD_FORMAT`:** refused today, which means
-an in-guest full `Format` (not QUICK) of a hostblk disk fails.
-Trivially implementable as a write. Recorded here rather than fixed,
-since nothing in the current workflow formats full in-guest.
+**`TD_FORMAT`: fixed.** Was refused with `IOERR_NOCMD`; now routed
+through the exact same path as `CMD_WRITE` (dos's own "write without
+preserving" contract -- on a hard-disk-class device TD_FORMAT *is* a
+write, per `m68k/hostblk-rom/hostblk-diagrom.s`'s `dev_beginio`/
+`classify_async`). `TD_FORMAT64`/`NSCMD_TD_FORMAT64` came along for
+free, riding the existing `TD_WRITE64`/`NSCMD_TD_WRITE64` 64-bit-offset
+plumbing (`.wr64` in `classify_async`) -- three extra `cmp.w`/`beq`
+pairs, no new code path. `NSCMD_DEVICEQUERY`'s `SupportedCmds` table
+now advertises all three truthfully. Confirmed by a real devtest run
+against the rebuilt ROM (`docs/devtest-hostblk.md`'s own operational
+notes): `TD_FORMAT`, `TD_FORMAT64` and `NSCMD_TD_FORMAT64` all report
+`Success`, `ETD_FORMAT`/`NSCMD_ETD_FORMAT64` still correctly refuse
+(extended-command variants, deliberately unimplemented, same as every
+other `ETD_*`/`NSCMD_ETD_*` entry), and the rest of the conformance map
+above reproduces unchanged. The filesystem-level half of the same gap
+-- `ACTION_FORMAT`/`ACTION_INHIBIT` in the `pktport` stack, for
+`C:Format`'s QUICK path over a served volume -- is `docs/pktport-
+protocol.md` §5's own addendum.
 
 ## Throughput
 
