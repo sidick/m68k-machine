@@ -1,0 +1,40 @@
+# devtest against hostblk.device: capability probe, benchmarks, and
+# destructive integrity, in that order -- destructive LAST because the
+# target is the boot volume's own device (a throwaway copy per run) and
+# every earlier result must reach SER: before anything can trash SYS:.
+#
+# There is deliberately no PKT0:/pktport run in here: devtest talks
+# trackdisk-style commands at a block DEVICE, and the pktport volume has
+# no block layer at all -- it is a handler on a DosPacket transport
+# (ADR 0004: "a disk" vs "a volume"). The handler-level conformance
+# equivalent is DiskSpeed and the pktvol unit suite, not devtest.
+#
+# No amipilot: SER: carries results (same rule as the soak/diskspeed
+# manifests).
+base     = "os3.2.2"
+machine  = { cpu = "68040", fpu = true, ram = "chip:2M,z3:256M" }
+packages = ["mmulibs", "devtest"]
+output   = ["hdf"]
+
+[hdf]
+size = "64M"
+
+[[run]]
+command = "C:devtest"
+args    = "-p hostblk.device 0"
+output  = "SER:"
+
+[[run]]
+command = "C:devtest"
+args    = "-bb hostblk.device 0"
+output  = "SER:"
+
+[[run]]
+command = "C:devtest"
+args    = "-bdy hostblk.device 0"
+output  = "SER:"
+
+[[run]]
+command = "C:devtest"
+args    = "-t hostblk.device 0 -d -y"
+output  = "SER:"
