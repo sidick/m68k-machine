@@ -95,7 +95,7 @@ locks/handles as in §4. Everything else → `RES1 = DOSFALSE`,
 | action | value | args (wire) | backend operation |
 |---|---|---|---|
 | `ACTION_LOCATE_OBJECT` | 8 | lock, name BSTR, mode | resolve path → new lock |
-| `ACTION_FREE_LOCK` | 9 | lock | drop handle |
+| `ACTION_FREE_LOCK` | 15 | lock | drop handle |
 | `ACTION_COPY_DIR` | 19 | lock | duplicate lock |
 | `ACTION_PARENT` | 29 | lock | parent dir lock (0 at root) |
 | `ACTION_SAME_LOCK` | 40 | lock, lock | compare targets |
@@ -125,7 +125,13 @@ guest `FileHandle` BPTR in Arg1; the stub keeps that entirely on its
 side and the host returns the new handle in `RES2` (which the real
 packets don't use), the stub storing it into `fh_Arg1`. `ARG1` on the
 wire is written 0. This is §4's principle applied: guest structure
-pointers never cross the wire.
+pointers never cross the wire. Success is `RES1 = DOSTRUE` with the
+handle in `RES2`; failure is `RES1 = DOSFALSE` with the error in
+`RES2` — `RES1` is the discriminator, **never** `RES2`'s value:
+handles are monotonic integers, so any scheme that classifies `RES2`
+by magnitude or by membership in the error table breaks the moment a
+handle numerically collides with an error code (handle 205 vs
+ERROR_OBJECT_NOT_FOUND).
 
 `ACTION_EXAMINE_NEXT` continuation state lives in the FIB's
 `fib_DiskKey` as DOS intends, so no host-side iterator state can leak

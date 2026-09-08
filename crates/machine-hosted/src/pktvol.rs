@@ -98,7 +98,10 @@ use machine_core::GuestMemory;
 
 mod action {
     pub const LOCATE_OBJECT: u32 = 8;
-    pub const FREE_LOCK: u32 = 9;
+    // 15 per NDK dos/dosextens.h -- 9 is ACTION_RENAME_DISK. The
+    // protocol doc originally said 9; the 68k stub caught it against
+    // real dos.library 47.30.
+    pub const FREE_LOCK: u32 = 15;
     pub const COPY_DIR: u32 = 19;
     pub const PARENT: u32 = 29;
     pub const SAME_LOCK: u32 = 40;
@@ -988,7 +991,7 @@ impl PktVolume {
                     position: 0,
                     write: false,
                 }));
-                (0, h)
+                (DOSTRUE, h)
             }
             Ok(Some(_)) => (DOSFALSE, err::OBJECT_WRONG_TYPE),
             Ok(None) => (DOSFALSE, err::OBJECT_NOT_FOUND),
@@ -1021,7 +1024,7 @@ impl PktVolume {
                             position: 0,
                             write: true,
                         }));
-                        (0, h)
+                        (DOSTRUE, h)
                     }
                     Err(e) => (DOSFALSE, map_mutate_error(&e)),
                 }
@@ -1037,7 +1040,7 @@ impl PktVolume {
                             position: 0,
                             write: true,
                         }));
-                        (0, h)
+                        (DOSTRUE, h)
                     }
                     Err(e) => (DOSFALSE, map_mutate_error(&e)),
                 }
@@ -1067,7 +1070,7 @@ impl PktVolume {
                     position: 0,
                     write: true,
                 }));
-                (0, h)
+                (DOSTRUE, h)
             }
             None => {
                 let mutator = self.mutator_mut().expect("writable checked above");
@@ -1080,7 +1083,7 @@ impl PktVolume {
                             position: 0,
                             write: true,
                         }));
-                        (0, h)
+                        (DOSTRUE, h)
                     }
                     Err(e) => (DOSFALSE, map_mutate_error(&e)),
                 }
@@ -1662,7 +1665,12 @@ mod tests {
         let (mut vol, path) = open_ro();
         let mut mem = ram();
         let name_bptr = put_bstr(&mut mem, 0x2000, b"big.dat");
-        let (_, handle) = vol.execute(action::FINDINPUT, args3(0, 0, name_bptr), &mut mem);
+        let (res1, handle) = vol.execute(action::FINDINPUT, args3(0, 0, name_bptr), &mut mem);
+        // RES1 is the FIND* success discriminator (protocol doc §5's
+        // dagger note) -- pinned here because the first revision left it
+        // 0 on success, forcing the stub to classify RES2 by
+        // error-table membership, which collides with handle 205.
+        assert_eq!(res1, DOSTRUE);
         assert_ne!(handle, 0);
 
         // A read spanning multiple internal (512-byte) FFS blocks.
