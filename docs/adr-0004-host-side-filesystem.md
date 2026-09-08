@@ -56,6 +56,13 @@ packets, which makes backends interchangeable behind one card:
    semantics leak through it (name limits, case handling, metadata
    sidecars) and backend 1 delivers the same win without them.
 
+*Status 2026-09-08: the format layer of this ADR is delivered — both
+crates are published on crates.io (`amiga-rdb` 0.3.0, plan complete;
+`amiga-ffs` 0.2.0: read, validate, repair, format, populate, mutate —
+polish still landing). What remains is this project's half: the
+transport card, the 68k handler stub, and the host-side service wiring
+the crates behind it.*
+
 `hostblk` is not displaced. It remains what RDB fidelity, devsoak,
 whole-image work, and booting-as-a-real-disk live on. Ledger terms:
 both are permanent native devices — one is "a disk", the other is
