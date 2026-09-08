@@ -39,6 +39,17 @@ clap = { version = "4", features = ["derive"] }
 # only, like clap above: no bare-metal build depends on this crate.
 png = "0.18.1"
 
+# `pktvol.rs`'s host-side filesystem backend for the `pktport` card
+# (docs/pktport-protocol.md §8): parses the RDB partition table and mounts
+# one FFS/OFS volume from it. Both are `machine-hosted`-only (host file
+# I/O, `alloc`), like every other dependency in this section -- neither
+# board's bare-metal build depends on them, and `machine-core` stays
+# dependency-free per its own module docs. Default features (`std`) are
+# left on: both crates gate their std::io conveniences behind it and this
+# crate is std-only regardless.
+amiga-rdb = "0.3"
+amiga-ffs = "0.2"
+
 [dev-dependencies]
 # **New dev-only dependency, flagged prominently per this crate's task
 # constraints.** Used solely by `tests/blitter_differential.rs` (`#[ignore]`d,

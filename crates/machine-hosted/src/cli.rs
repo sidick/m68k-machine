@@ -194,6 +194,27 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub hostblk_writable: bool,
 
+    /// Path to an `.hdf` image to serve behind the `pktport` card
+    /// (`docs/pktport-protocol.md`, ADR 0004): a DosPacket transport, the
+    /// FFS/OFS filesystem semantics answered host-side by `pktvol.rs`
+    /// (`amiga-rdb` + `amiga-ffs`) rather than by guest-side sector I/O
+    /// the way `--hostblk` works. Same image shape as `--hostblk` -- an
+    /// RDB-partitioned `.hdf`, or a bare RDB-less FFS/OFS volume from
+    /// block 0 (`pktvol::PktVolume::open`'s fallback) -- but a different
+    /// card and a different boot path: this one hands the guest whole
+    /// files and directory entries, never raw sectors. Omit for no
+    /// `pktport` card at all.
+    #[arg(long)]
+    pub pktvol: Option<PathBuf>,
+
+    /// Open `--pktvol` for writing rather than the default read-only.
+    /// Same reasoning as `--hostblk-writable`: off by default because a
+    /// disk image worth attaching took real effort to build and is not
+    /// casually replaceable if a bug corrupts it through the write path
+    /// this flag opens up.
+    #[arg(long, default_value_t = false)]
+    pub pktvol_writable: bool,
+
     /// Attach the Graffity graphics card (`machine_core::graffity`) over
     /// heap-allocated VRAM and register its AUTOCONFIG board(s) on the
     /// chain. Without this flag nothing about the boot path changes --

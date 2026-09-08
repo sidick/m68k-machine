@@ -225,6 +225,35 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         None => None,
     };
 
+    // `pktport`'s host-side filesystem backend (`docs/pktport-protocol.md`,
+    // ADR 0004): opened the same way `hostblk_device` is above -- before
+    // `machine_bus`, outside the `Option` match, so it outlives the bus
+    // once the card attaches to it. Unlike `hostblk_device` this is not
+    // yet wired to a card: `machine_core::pktport` (the card model and
+    // its `MachineBus::with_pktport` builder) is a parallel worker's
+    // deliverable and has not landed. `PktVolume` is fully constructed
+    // and ready here; only the attachment below is a placeholder.
+    let mut pktvol_backend = match &args.pktvol {
+        Some(path) => match crate::pktvol::PktVolume::open(path, args.pktvol_writable, None) {
+            Ok(vol) => {
+                console.diag(&format!(
+                    "pktvol: {} ({})",
+                    path.display(),
+                    if args.pktvol_writable {
+                        "read-write"
+                    } else {
+                        "read-only"
+                    }
+                ));
+                Some(vol)
+            }
+            Err(e) => {
+                return setup_error(console, format!("opening --pktvol {}: {e}", path.display()))
+            }
+        },
+        None => None,
+    };
+
     // Heap-allocated, and opened (allocated) outside the `Option` match
     // below for the same lifetime reason `hostblk_device` is:
     // `with_graphics` borrows it `&'a mut`, so it must outlive
@@ -315,6 +344,14 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
             let write_protect = !dev.writable();
             machine_bus.with_hostblk(0, dev, write_protect)
         }
+        None => machine_bus,
+    };
+    let machine_bus = match &mut pktvol_backend {
+        // Borrowed for the bus's lifetime, exactly as `hostblk_device`
+        // is above -- `with_pktport` takes `&'a mut dyn PacketBackend`
+        // (machine-core has no allocator), so the `PktVolume` itself
+        // lives in this frame alongside every other card's storage.
+        Some(vol) => machine_bus.with_pktport(vol),
         None => machine_bus,
     };
     let machine_bus = if args.graphics {

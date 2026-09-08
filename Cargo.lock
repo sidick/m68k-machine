@@ -9,6 +9,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "amiga-ffs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aebef02b38763e4f9969ad9efe45d284e939702a2b32fa4620e8653ff6eac47f"
+
+[[package]]
+name = "amiga-rdb"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8511ab54756c70a6a012b2c6315d864b80cc264e9423b9668a72fc6b5c828a2e"
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -217,6 +229,8 @@ dependencies = [
 name = "machine-hosted"
 version = "0.1.0"
 dependencies = [
+ "amiga-ffs",
+ "amiga-rdb",
  "clap",
  "m68k",
  "machine-core",
