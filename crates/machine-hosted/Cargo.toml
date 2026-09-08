@@ -47,7 +47,7 @@ png = "0.18.1"
 # dependency-free per its own module docs. Default features (`std`) are
 # left on: both crates gate their std::io conveniences behind it and this
 # crate is std-only regardless.
-amiga-rdb = "0.3"
+amiga-rdb = "0.4"
 amiga-ffs = "0.2"
 
 [dev-dependencies]
