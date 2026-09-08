@@ -1,0 +1,42 @@
+# DiskSpeed measurement image: the ADR-0004 payoff run.
+#
+# Two DiskSpeed 4.2 passes over the same machine, back to back on one
+# boot, output to SER: for the runner to capture:
+#
+#   1. DRIVE DH0:  -- the boot volume: guest FFS over hostblk, this
+#      machine's copperhf-analogue (the "filesystem as emulated 68k"
+#      side of the ADR's 4x).
+#   2. DRIVE PKT0: -- the pktport volume: host-side amiga-ffs behind
+#      the DosPacket transport (the side the ADR predicts lands near
+#      HOSTFS). PKT0: exists because the card's DiagArea autoloads the
+#      handler; the runner must be started with --pktvol.
+#
+# Same-machine, same-boot, same-protocol (DIR SEEK FAST LONG, the
+# emulator_disk_speed matrix's exact switches): the ratio between the
+# two passes is the ADR's answer, independent of how our machine's
+# guest clock compares to anyone else's.
+#
+# No amipilot here, same reasoning as m68k-machine-soak.toml: SER: is
+# the only way to get results out, so nothing may hold serial.
+# mmulibs matches the matrix's methodology (caches enabled cleanly).
+base     = "os3.2.2"
+machine  = { cpu = "68040", fpu = true, ram = "chip:2M,z3:256M" }
+packages = [
+  "mmulibs",
+  "diskspeed",
+]
+output   = ["hdf"]
+
+[hdf]
+# Room for DiskSpeed's test files on DH0 alongside the system.
+size = "64M"
+
+[[run]]
+command = "C:DiskSpeed"
+args    = "DRIVE DH0: DIR SEEK FAST LONG"
+output  = "SER:"
+
+[[run]]
+command = "C:DiskSpeed"
+args    = "DRIVE PKT0: DIR SEEK FAST LONG"
+output  = "SER:"

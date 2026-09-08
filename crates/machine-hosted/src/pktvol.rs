@@ -728,6 +728,17 @@ fn fill_info_data(
 
 impl PacketBackend for PktVolume {
     fn execute(&mut self, action: u32, args: [u32; 7], mem: &mut dyn GuestMemory) -> (u32, u32) {
+        self.execute_inner(action, args, mem)
+    }
+}
+
+impl PktVolume {
+    fn execute_inner(
+        &mut self,
+        action: u32,
+        args: [u32; 7],
+        mem: &mut dyn GuestMemory,
+    ) -> (u32, u32) {
         match action {
             action::LOCATE_OBJECT => self.locate_object(args, mem),
             action::FREE_LOCK => self.free_lock(args),
@@ -989,7 +1000,13 @@ impl PktVolume {
                     name: leaf,
                     header_lba: entry.lba,
                     position: 0,
-                    write: false,
+                    // MODE_OLDFILE is *not* read-only: AmigaDOS permits
+                    // writing through a FINDINPUT handle (DiskSpeed 4.2's
+                    // own Write test does exactly this -- Open(...,
+                    // MODE_OLDFILE), Seek(0), Write). Volume-level
+                    // read-only still refuses in write_action via the
+                    // mutator gate.
+                    write: self.writable,
                 }));
                 (DOSTRUE, h)
             }
@@ -1897,6 +1914,34 @@ mod tests {
         // nothing), the result is a legal (RES1, RES2) pair.
         assert!(res1 == DOSFALSE || res1 != 0);
         assert!(res2 == 0 || res2 == err::OBJECT_NOT_FOUND || res2 == err::INVALID_COMPONENT_NAME);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// DiskSpeed 4.2's Write test sequence: Open(MODE_OLDFILE) --
+    /// ACTION_FINDINPUT -- then Seek(0, OFFSET_BEGINNING), then Write.
+    /// MODE_OLDFILE is *not* read-only on AmigaDOS; treating it as such
+    /// aborted DiskSpeed's whole PKT0: pass at the first Write test.
+    #[test]
+    fn findinput_handle_permits_write_like_mode_oldfile() {
+        let (mut vol, path) = open_rw();
+        let mut mem = ram();
+        let name_bptr = put_bstr(&mut mem, 0x2000, b"readme.txt");
+        let (res1, handle) = vol.execute(action::FINDINPUT, args3(0, 0, name_bptr), &mut mem);
+        assert_eq!(res1, DOSTRUE);
+        // Seek to start (OFFSET_BEGINNING = -1).
+        let (_, r2) = vol.execute(action::SEEK, args3(handle, 0, (-1i32) as u32), &mut mem);
+        assert_eq!(r2, 0);
+        // Write through the MODE_OLDFILE handle.
+        let payload = b"OLDFILE-WRITE";
+        mem.0[0x3000..0x3000 + payload.len()].copy_from_slice(payload);
+        let (w, werr) = vol.execute(
+            action::WRITE,
+            args3(handle, 0x3000, payload.len() as u32),
+            &mut mem,
+        );
+        assert_eq!(werr, 0, "write through FINDINPUT handle must succeed");
+        assert_eq!(w as usize, payload.len());
+        vol.execute(action::END, args1(handle), &mut mem);
         std::fs::remove_file(&path).ok();
     }
 

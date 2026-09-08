@@ -56,6 +56,15 @@ packets, which makes backends interchangeable behind one card:
    semantics leak through it (name limits, case handling, metadata
    sidecars) and backend 1 delivers the same win without them.
 
+*Status 2026-09-08 (later): **measured and confirmed** — see
+`docs/pktport-measurement.md`. DiskSpeed 4.2 under the matrix's exact
+protocol, same machine, same boot: file-create 3.8×, delete 3.6×,
+throughput 2–5×+ over the guest-FFS-on-hostblk path, with 256 KB reads
+at ≈1.09 GB/s (fast enough to wrap DiskSpeed's own 32-bit counter,
+which briefly masqueraded as a regression). The prediction below —
+"largest gains in file-create and seek rates" — held; the revisit
+clause is not triggered.*
+
 *Status 2026-09-08: the format layer of this ADR is delivered — both
 crates are published on crates.io (`amiga-rdb` 0.3.0, plan complete;
 `amiga-ffs` 0.2.0: read, validate, repair, format, populate, mutate —
