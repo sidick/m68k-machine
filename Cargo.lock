@@ -16,9 +16,9 @@ checksum = "2052b2bf0af9369e533931922d3e7fabf3ab0bde3e0312d7069eb306379ad948"
 
 [[package]]
 name = "amiga-rdb"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aff37aa74dbca069a95d0829dafde649d0f06e3c7f9ab7884012bf7686fe0304"
+checksum = "362f43b2e4bb6094407669798235df5a9747d182eb74ce5aba2d65605b5ba6b3"
 
 [[package]]
 name = "anstream"
