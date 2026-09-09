@@ -10,9 +10,9 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "amiga-ffs"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aebef02b38763e4f9969ad9efe45d284e939702a2b32fa4620e8653ff6eac47f"
+checksum = "2052b2bf0af9369e533931922d3e7fabf3ab0bde3e0312d7069eb306379ad948"
 
 [[package]]
 name = "amiga-rdb"

@@ -84,9 +84,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use amiga_ffs::{
-    format as ffs_format, AllocError, Allocator, DateStamp, EntryKind, Error as FfsError,
-    FormatError, FormatOptions, MetaUpdate, Metadata, MutateError, Mutator, Variant, Volume,
-    DEFAULT_RESERVED, ST_ROOT,
+    format as ffs_format, AllocError, Allocator, DateStamp, Entry, EntryKind, Error as FfsError,
+    FileChain, FormatError, FormatOptions, MetaUpdate, Metadata, MutateError, Mutator,
+    MutatorVolume, RootBlock, Variant, Volume, DEFAULT_RESERVED, ST_ROOT,
 };
 use amiga_rdb::{Rdb, RdbError};
 
@@ -380,6 +380,110 @@ pub struct PktVolume {
     inhibited: bool,
 }
 
+/// [`PktVolume::volume`]'s return type: 0.3.0's `MutatorVolume`
+/// deliberately narrows what a live mutation session exposes (see its
+/// own doc comment -- reaching the session's `Volume` directly while a
+/// `Mutator` borrow is live would let `resize`/`repair` invalidate the
+/// allocator's cached bitmap out from under it). This enum unifies that
+/// narrowed view with the read-only path's plain `&mut Volume` so every
+/// call site here stays unchanged -- one forwarding match per method,
+/// covering exactly the methods this file calls, not `Volume`'s whole
+/// surface.
+enum AnyVolume<'a> {
+    Ro(&'a mut Volume<FileMedium>),
+    Mutator(MutatorVolume<'a, FileMedium>),
+}
+
+impl<'a> AnyVolume<'a> {
+    fn lookup(&mut self, dir_lba: u64, name: &[u8]) -> Result<Option<Entry>, FfsError<io::Error>> {
+        match self {
+            Self::Ro(v) => v.lookup(dir_lba, name),
+            Self::Mutator(v) => v.lookup(dir_lba, name),
+        }
+    }
+    fn lookup_path(
+        &mut self,
+        dir_lba: u64,
+        path: &[u8],
+    ) -> Result<Option<Entry>, FfsError<io::Error>> {
+        match self {
+            Self::Ro(v) => v.lookup_path(dir_lba, path),
+            Self::Mutator(v) => v.lookup_path(dir_lba, path),
+        }
+    }
+    fn read_dir(&mut self, dir_lba: u64) -> Result<Vec<Entry>, FfsError<io::Error>> {
+        match self {
+            Self::Ro(v) => v.read_dir(dir_lba),
+            Self::Mutator(v) => v.read_dir(dir_lba),
+        }
+    }
+    fn entry_at(&mut self, lba: u64) -> Result<Entry, FfsError<io::Error>> {
+        match self {
+            Self::Ro(v) => v.entry_at(lba),
+            Self::Mutator(v) => v.entry_at(lba),
+        }
+    }
+    fn file_chain(&mut self, header_lba: u64) -> Result<FileChain, FfsError<io::Error>> {
+        match self {
+            Self::Ro(v) => v.file_chain(header_lba),
+            Self::Mutator(v) => v.file_chain(header_lba),
+        }
+    }
+    fn read_range(
+        &mut self,
+        chain: &FileChain,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, FfsError<io::Error>> {
+        match self {
+            Self::Ro(v) => v.read_range(chain, offset, buf),
+            Self::Mutator(v) => v.read_range(chain, offset, buf),
+        }
+    }
+    fn comment(&mut self, entry: &Entry) -> Result<Vec<u8>, FfsError<io::Error>> {
+        match self {
+            Self::Ro(v) => v.comment(entry),
+            Self::Mutator(v) => v.comment(entry),
+        }
+    }
+    fn root(&self) -> &RootBlock {
+        match self {
+            Self::Ro(v) => v.root(),
+            Self::Mutator(v) => v.root(),
+        }
+    }
+    fn root_lba(&self) -> u64 {
+        match self {
+            Self::Ro(v) => v.root_lba(),
+            Self::Mutator(v) => v.root_lba(),
+        }
+    }
+    fn block_size(&self) -> usize {
+        match self {
+            Self::Ro(v) => v.block_size(),
+            Self::Mutator(v) => v.block_size(),
+        }
+    }
+    fn block_count(&self) -> u64 {
+        match self {
+            Self::Ro(v) => v.block_count(),
+            Self::Mutator(v) => v.block_count(),
+        }
+    }
+    fn variant(&self) -> Variant {
+        match self {
+            Self::Ro(v) => v.variant(),
+            Self::Mutator(v) => v.variant(),
+        }
+    }
+    fn source_mut(&mut self) -> &mut FileMedium {
+        match self {
+            Self::Ro(v) => v.source_mut(),
+            Self::Mutator(v) => v.source_mut(),
+        }
+    }
+}
+
 impl PktVolume {
     /// Open `path` as a `pktport` volume.
     ///
@@ -518,10 +622,10 @@ impl PktVolume {
         Ok(())
     }
 
-    fn volume(&mut self) -> &mut Volume<FileMedium> {
+    fn volume(&mut self) -> AnyVolume<'_> {
         match &mut self.backing {
-            Backing::ReadOnly { vol, .. } => vol,
-            Backing::Writable(m) => m.volume(),
+            Backing::ReadOnly { vol, .. } => AnyVolume::Ro(vol),
+            Backing::Writable(m) => AnyVolume::Mutator(m.volume()),
         }
     }
 
@@ -718,6 +822,7 @@ fn map_format_error<E>(e: &FormatError<E>) -> u32 {
         NameEmpty | NameTooLong { .. } | NameInvalidByte { .. } => err::INVALID_COMPONENT_NAME,
         BadBlockSize(_)
         | BadReserved { .. }
+        | ReservedTooSmall { .. }
         | VolumeTooSmall { .. }
         | VolumeTooLarge { .. }
         | SinkTooSmall { .. } => err::NOT_A_DOS_DISK,
@@ -964,7 +1069,8 @@ impl PktVolume {
         let (dir_entry_type, name, protection, size, date, comment, owner, is_dir) = if lba == root
         {
             let (name, date) = {
-                let r = self.volume().root();
+                let vol = self.volume();
+                let r = vol.root();
                 (r.name.clone(), r.dir_altered)
             };
             (ST_ROOT, name, 0u32, 0u32, date, Vec::new(), 0u32, true)
@@ -1633,7 +1739,8 @@ impl PktVolume {
             // exactly what §7's hostility rules forbid.
             None => return (DOSFALSE, err::WRITE_PROTECTED),
         };
-        let medium = mutator.volume().source_mut();
+        let mut vol = mutator.volume();
+        let medium = vol.source_mut();
         match ffs_format(medium, &opts) {
             Ok(_) => (DOSTRUE, 0),
             Err(e) => (DOSFALSE, map_format_error(&e)),
