@@ -143,22 +143,20 @@ guest address asks it. If you find yourself writing an address constant
 or a range comparison for something AUTOCONFIG placed, that is the
 signal to route the question back rather than to widen the constant.
 
-That seam now exists: `lib.rs` defines a `GuestMemory` trait
+That seam exists: `lib.rs` defines a `GuestMemory` trait
 (`ram_slice`/`ram_slice_mut`, validated `[addr, addr+len)` views) and
 implements it on `MachineBus`, checking chip RAM's fixed range and fast
 RAM's AUTOCONFIG-placed one (`self.autoconfig.placement`, never a
 hardcoded base) without either range living anywhere but that one
-implementation. `hostblk.rs`'s own `0..CHIP_RAM_SIZE` check has not been
-changed to use it yet — that file is owned by whoever reviews this
-change, per this project's file-ownership convention — but the seam it
-would call through is ready: `tick`/`execute`/`read_descriptor`/
-`transfer` would take `&(mut) dyn GuestMemory` instead of `ram: &mut
-[u8]`, and the `MachineBus::tick` call site would need the `Option::take`
-dance (`let Some(mut h) = self.hostblk.take() { h.tick(self); ...
-self.hostblk = Some(h); }`) to hand `hostblk` a `&mut dyn GuestMemory`
-view of `self` while `self.hostblk` itself is also borrowed — two
-disjoint borrows of `self`'s fields, not a conflict, but only once
-`hostblk` no longer occupies one of them for the duration.
+implementation. `hostblk.rs`'s own `0..CHIP_RAM_SIZE` check has since
+been migrated onto it (landed alongside Gayle's retirement): `tick`/
+`execute`/`read_descriptor`/`transfer` take `&(mut) dyn GuestMemory`
+rather than `ram: &mut [u8]`, and `MachineBus::tick`'s call site uses
+the `Option::take` dance (`let Some(mut h) = self.hostblk.take() {
+h.tick(self); ... self.hostblk = Some(h); }`) to hand `hostblk` a `&mut
+dyn GuestMemory` view of `self` while `self.hostblk` itself is also
+borrowed — two disjoint borrows of `self`'s fields, not a conflict, but
+only once `hostblk` no longer occupies one of them for the duration.
 
 ## The ledger
 
