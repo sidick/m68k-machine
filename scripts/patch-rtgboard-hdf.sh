@@ -99,11 +99,13 @@ trap 'rm -rf "$TMP"' EXIT
 
 SETTINGS="$TMP/Picasso96Settings"
 INFO="$TMP/rtgboard.info"
+SCREENMODE="$TMP/ScreenMode.prefs"
 GRAFFITY_STUB="$TMP/Graffity"
 
 "$PYTHON3" "$SCRIPT_DIR/../tools/rtgboard/make_settings.py" "$SETTINGS" rtgboard
 "$PYTHON3" "$SCRIPT_DIR/../tools/rtgboard/make_monitor_info.py" "$INFO"
-echo "==> generated $SETTINGS and $INFO"
+"$PYTHON3" "$SCRIPT_DIR/../tools/rtgboard/make_screenmode_prefs.py" "$SCREENMODE"
+echo "==> generated $SETTINGS, $INFO and $SCREENMODE"
 
 # --- Patch the OUTPUT image (never the source) --------------------------
 #
@@ -130,8 +132,12 @@ echo "==> generated $SETTINGS and $INFO"
     + write "$GRAFFITY_STUB" Devs/Monitors/rtgboard \
     + write "$INFO" Devs/Monitors/rtgboard.info \
     + delete Devs/Monitors/Graffity \
-    + delete Devs/Monitors/Graffity.info
-echo "==> wrote rtgboard.card, Picasso96Settings, Devs/Monitors/rtgboard{,.info}; removed Graffity monitor"
+    + delete Devs/Monitors/Graffity.info \
+    + write "$SCREENMODE" Prefs/Env-Archive/Sys/ScreenMode.prefs
+echo "==> wrote rtgboard.card, Picasso96Settings, Devs/Monitors/rtgboard{,.info},"
+echo "==> ScreenMode.prefs (steers Workbench onto the 16-bit mode -- fake"
+echo "==> native modes are CLUT screens this board has no hardware for);"
+echo "==> removed Graffity monitor"
 
 # --- Verify positively. Absence of complaint is never success on this
 # platform: read every changed path back and check concrete evidence. ---
@@ -207,5 +213,14 @@ if [ "$(od -An -t x1 -j 8 -N 4 "$READBACK_SETTINGS" | tr -d ' \n')" != "50393653
     exit 1
 fi
 echo "==>   confirmed: Picasso96Settings starts with FORM....P96S ($SETTINGS_SIZE bytes)"
+
+# ScreenMode.prefs: read back and byte-compare against what we generated.
+READBACK_SCREENMODE="$TMP/ScreenMode.prefs.readback"
+"$XDFTOOL" -r "$OUT" read Prefs/Env-Archive/Sys/ScreenMode.prefs "$READBACK_SCREENMODE" >/dev/null
+if ! cmp -s "$SCREENMODE" "$READBACK_SCREENMODE"; then
+    echo "error: read-back ScreenMode.prefs differs from the generated file" >&2
+    exit 1
+fi
+echo "==>   confirmed: ENVARC:Sys/ScreenMode.prefs is byte-identical to the generated file"
 
 echo "all checks passed"

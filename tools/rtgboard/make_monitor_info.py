@@ -58,7 +58,16 @@ ICON_H = 22
 TOOLTYPES = [
     "BOARDTYPE=rtgboard",
     "SettingsFile=SYS:Devs/Picasso96Settings",
-    "FakeNativeModes=Yes",
+    # FakeNativeModes deliberately INACTIVE (first-light finding,
+    # 2026-09-15): fake native modes are fabricated as 8-bit CLUT
+    # screens, and this board has no palette hardware by design
+    # (docs/rtgboard-protocol.md SS11). With it active, Workbench's
+    # first boot landed on a CLUT screen -- P96's CPU renderer drew
+    # 1-byte pen indices into VRAM the board scanned out as 16-bit
+    # RGB565 (green-on-black, rows doubled side by side). Workbench is
+    # steered onto the real 16-bit mode by ENVARC:Sys/ScreenMode.prefs
+    # (tools/rtgboard/make_screenmode_prefs.py) instead.
+    "(FakeNativeModes=Yes)",
     "(BORDERBLANK=Yes)",
     "(IGNOREMASK=Yes)",
 ]
