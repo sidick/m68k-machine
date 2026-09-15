@@ -376,6 +376,22 @@ it is regression protection for what exists, and it is what caught the
 21-bit pointer-register truncation that eight years of correct rendering
 would never have surfaced.
 
+*Recorded intent (2026-09-15, so it is reviewable rather than
+remembered):* the eventual direction is **P96 FakeNativeModes on the
+`rtgboard` card in place of the emulated native display path** — native
+screenmodes redirected onto RTG the way P96 forces on a DraCo, shrinking
+the planar renderer's role to the pre-RTG window (boot screens, ROMWack)
+that runs before any driver could load. What that requires, and why it
+is deferred: the fabricated native modes are palette-based, so the board
+must first grow an 8-bit CLUT format (palette registers, a protocol
+`VERSION` bump, present-path palette expansion, `SetColorArray` becoming
+real in the driver) — the palette-expansion bug class ADR 0002
+deliberately avoided, taken on knowingly when this lands. Until then
+`fake-native-modes` stays disabled on rtgboard images
+(`scripts/patch-rtgboard-hdf.sh`'s inactive tooltype + generated
+`ScreenMode.prefs`), and native-mode software renders through the
+planar path as today.
+
 ### Bring-up
 
 **Cirrus CL-GD542x and the Graffity boards** — `cirrus.rs`,
