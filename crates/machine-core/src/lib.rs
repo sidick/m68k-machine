@@ -55,6 +55,7 @@ pub mod graffity;
 pub mod hostblk;
 pub mod input;
 pub mod mirage;
+pub mod pci;
 pub mod pktport;
 pub mod render;
 pub mod rom;
