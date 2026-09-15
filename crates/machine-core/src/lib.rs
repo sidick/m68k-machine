@@ -794,6 +794,20 @@ impl<'a> MachineBus<'a> {
             }
         }
 
+        // `pcibridge` has no engine of its own to advance (config cycles
+        // stay synchronous, module docs) -- but unlike every card above,
+        // its `INTx` level can change with *no* register write at all:
+        // stage 3's virtio-net ISR will raise/lower its line from its own
+        // function logic, the same reason Graffity's card is polled here
+        // rather than only checked after a write. Polled every host tick
+        // so that edge is never missed just because nothing happened to
+        // touch `INTX_ENABLE`/`INTX_TEST` in between.
+        if let Some(dev) = &mut self.pcibridge {
+            if dev.irq_pending() {
+                self.chipset.raise_int(chipset::intbit::PORTS);
+            }
+        }
+
         if self.cia_a.tick(cpu_clocks, CPU_CLOCKS_PER_ECLOCK) {
             self.chipset.raise_int(chipset::intbit::PORTS);
         }
@@ -952,9 +966,14 @@ impl<'a> MachineBus<'a> {
             }
         } else if let Some(offset) = self.pcibridge_target(address) {
             match &mut self.pcibridge {
-                // No interrupt to check here either -- `pcibridge`'s
-                // module docs: config cycles are synchronous and this
-                // card raises no interrupt at all, this increment.
+                // No interrupt check needed here even though this card
+                // can now raise INT2 (stage 2's INTx registers): every
+                // register this arm can read is a pure query --
+                // `INTX_STATUS` recomputes itself live rather than being
+                // mutated by a read, and nothing else in the register
+                // file changes `irq_pending()`'s answer on a read path --
+                // the same reasoning `hostblk`'s/`pktport`'s own read
+                // arms give for the identical choice.
                 Some(dev) => dev.read(offset),
                 None => OPEN_BUS_BYTE,
             }
@@ -1006,6 +1025,26 @@ impl<'a> MachineBus<'a> {
         }
         let base = self.autoconfig.placement(idx)?.base;
         Some(address - base)
+    }
+
+    /// The BAR-aperture-relative offset a naturally-aligned `width`
+    /// access at `address` reaches, if `pcibridge` is attached and the
+    /// access lies entirely within its aperture (`docs/
+    /// pcibridge-protocol.md` §5's landed sized-aperture prerequisite --
+    /// virtio's modern spec requires natural-width field access). `None`
+    /// in every other case -- misaligned, inside the register file
+    /// instead of the aperture, or no card attached -- and the caller
+    /// falls through to the ordinary byte-decomposition path in every
+    /// one of those, an intentional behavior-preserving fallback (module
+    /// docs' "everything else... stays byte-granular"), not merely a
+    /// convenience.
+    fn pcibridge_aperture_sized(&self, address: u32, width: pci::AccessWidth) -> Option<u32> {
+        if !address.is_multiple_of(width.bytes()) {
+            return None;
+        }
+        let offset = self.pcibridge_target(address)?;
+        (offset >= pcibridge::APERTURE_BASE_OFFSET)
+            .then(|| offset - pcibridge::APERTURE_BASE_OFFSET)
     }
 
     /// Whether `address` falls inside `hostblk`'s configured AUTOCONFIG
@@ -1176,6 +1215,19 @@ impl<'a> MachineBus<'a> {
         {
             return self.read_custom_word(address);
         }
+        // `pcibridge`'s BAR aperture, before the byte-decomposition
+        // fallback: a naturally-aligned word access becomes ONE width-2
+        // backend access rather than two width-1s, the same reason the
+        // custom-chip special case above exists -- virtio's modern spec
+        // requires natural-width field access (`docs/
+        // pcibridge-protocol.md` §5). Only the aperture range takes this
+        // path; the register file stays byte-granular through the
+        // ordinary fallback below, unchanged.
+        if let Some(k) = self.pcibridge_aperture_sized(address, pci::AccessWidth::W16) {
+            if let Some(dev) = &mut self.pcibridge {
+                return dev.read_aperture_sized(k, pci::AccessWidth::W16) as u16;
+            }
+        }
         let hi = self.read_byte(address) as u16;
         let lo = self.read_byte(address.wrapping_add(1)) as u16;
         (hi << 8) | lo
@@ -1183,6 +1235,13 @@ impl<'a> MachineBus<'a> {
 
     /// Read one big-endian 32-bit longword, composed from four byte reads.
     pub fn read_long(&mut self, address: u32) -> u32 {
+        // Same sized-aperture path as `read_word`, one width-4 backend
+        // access instead of four width-1s.
+        if let Some(k) = self.pcibridge_aperture_sized(address, pci::AccessWidth::W32) {
+            if let Some(dev) = &mut self.pcibridge {
+                return dev.read_aperture_sized(k, pci::AccessWidth::W32);
+            }
+        }
         let hi = self.read_word(address) as u32;
         let lo = self.read_word(address.wrapping_add(2)) as u32;
         (hi << 16) | lo
@@ -1280,8 +1339,15 @@ impl<'a> MachineBus<'a> {
         } else if let Some(offset) = self.pcibridge_target(address) {
             if let Some(dev) = &mut self.pcibridge {
                 dev.write(offset, value);
-                // No interrupt check here either -- see `read_byte`'s
-                // matching arm above.
+                // `INTX_ENABLE`/`INTX_TEST` (and, indirectly, whatever a
+                // config-cycle write did to a device the backend routes
+                // `intx_levels()` through) are exactly the registers that
+                // can change `irq_pending()`'s answer, so this check is
+                // load-bearing here -- the `input` arm above is the
+                // model (`input` module docs, "Interrupt model").
+                if dev.irq_pending() {
+                    self.chipset.raise_int(chipset::intbit::PORTS);
+                }
             }
         }
         // ROM and open-bus writes: discarded.
@@ -1297,6 +1363,26 @@ impl<'a> MachineBus<'a> {
             self.write_custom_word(address, value);
             return;
         }
+        // `pcibridge`'s BAR aperture, before the byte-decomposition
+        // fallback -- see `read_word`'s matching arm for why.
+        if let Some(k) = self.pcibridge_aperture_sized(address, pci::AccessWidth::W16) {
+            if let Some(dev) = &mut self.pcibridge {
+                dev.write_aperture_sized(k, pci::AccessWidth::W16, value as u32);
+                // A sized aperture write cannot change INTx state today --
+                // no device behind any BAR has real function logic yet
+                // (`crate::pci::VirtioNetStub`'s own module docs), so
+                // there is nothing this write could have done to
+                // `intx_levels()`'s answer. Checked anyway, the same
+                // future-proofing reason `hostblk`'s doorbell arm gives
+                // for its own always-false-today check: a future device
+                // whose BAR-mapped registers *do* affect its INTx line
+                // must not require remembering to add this back in.
+                if dev.irq_pending() {
+                    self.chipset.raise_int(chipset::intbit::PORTS);
+                }
+                return;
+            }
+        }
         self.write_byte(address, (value >> 8) as u8);
         self.write_byte(address.wrapping_add(1), value as u8);
     }
@@ -1304,6 +1390,19 @@ impl<'a> MachineBus<'a> {
     /// Write one big-endian 32-bit longword, decomposed into two word
     /// writes.
     pub fn write_long(&mut self, address: u32, value: u32) {
+        // Same sized-aperture path as `write_word`, one width-4 backend
+        // access instead of decomposing further.
+        if let Some(k) = self.pcibridge_aperture_sized(address, pci::AccessWidth::W32) {
+            if let Some(dev) = &mut self.pcibridge {
+                dev.write_aperture_sized(k, pci::AccessWidth::W32, value);
+                // See `write_word`'s matching arm: future-proofing only,
+                // nothing behind a BAR can change INTx state yet.
+                if dev.irq_pending() {
+                    self.chipset.raise_int(chipset::intbit::PORTS);
+                }
+                return;
+            }
+        }
         self.write_word(address, (value >> 16) as u16);
         self.write_word(address.wrapping_add(2), value as u16);
     }
@@ -2794,6 +2893,83 @@ mod tests {
         assert_eq!(
             pcibridge_read_u32(&mut bus, hostblk_base + hostblk::reg::VERSION),
             hostblk::PROTOCOL_VERSION
+        );
+    }
+
+    /// `INTX_TEST` asserted and deasserted through the guest-visible
+    /// register file, end to end on the real bus: `INTX_STATUS` reflects
+    /// it, `pending_irq_level` shows `PORTS`' level (`2`, `chipset.rs`)
+    /// once `INTX_ENABLE` unmasks the line, and deasserting clears it
+    /// with no acknowledgement write required at all -- the level-
+    /// triggered contract module docs describe, proven the same way
+    /// `configured_input_card_raises_int2_seen_on_the_read_path_and_clears_via_ack`
+    /// proves `input`'s.
+    #[test]
+    fn pcibridge_intx_test_is_observable_through_the_register_file_and_raises_int2() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut hostbridge_dev = pci::HostBridge::new();
+        let mut slots = [pci::VirtualSlot {
+            bdf: pci::Bdf {
+                bus: 0,
+                device: 0,
+                function: 0,
+            },
+            device: &mut hostbridge_dev,
+        }];
+        let mut vpci = pci::VirtualPciBus::new(&mut slots);
+        let mut bus = new_bus(&mut ram, &rom).with_pcibridge(&mut vpci);
+        let base = 0x4000_0000u32;
+        configure_zorro_iii(&mut bus, base);
+
+        // Master-enable INTEN and unmask PORTS in INTENA, same shape
+        // `vertb_fires_once_per_frame_and_requests_level_3` uses.
+        bus.write_word(
+            CUSTOM_BASE + chipset::reg::INTENA as u32,
+            0x8000 | (1 << chipset::intbit::INTEN) | (1 << chipset::intbit::PORTS),
+        );
+        assert_eq!(bus.pending_irq_level(), 0);
+
+        // Assert INTX_TEST bit 0 (INTA): visible in INTX_STATUS
+        // immediately, but INTX_ENABLE still masks it from INT2.
+        pcibridge_write_u32(&mut bus, base + pcibridge::reg::INTX_TEST, 0x1);
+        assert_eq!(
+            pcibridge_read_u32(&mut bus, base + pcibridge::reg::INTX_STATUS),
+            0x1
+        );
+        assert_eq!(
+            bus.pending_irq_level(),
+            0,
+            "asserted but not enabled must not reach INT2"
+        );
+
+        // Unmask it: PORTS (level 2) is now pending, observed the
+        // instant the enabling write lands (the write-path check).
+        pcibridge_write_u32(&mut bus, base + pcibridge::reg::INTX_ENABLE, 0x1);
+        assert_eq!(bus.pending_irq_level(), 2, "PORTS is level 2");
+
+        // Deassert INTX_TEST: `pcibridge`'s own `INTX_STATUS` clears with
+        // no write-1-to-clear at all, level-triggered as module docs
+        // describe. The chipset's shared `INTREQ` latch is a separate
+        // matter, though -- exactly like every other card on this bus,
+        // it stays set until the driver acknowledges it (real Amiga
+        // hardware: `INTREQ` is a level *latch*, not a live mirror of
+        // every source), so `pending_irq_level` only drops once that
+        // acknowledgement lands, the same two-step shape `armed_graffity_
+        // raises_ports_once_per_frame_and_reacknowledges` proves for
+        // Graffity's own PORTS source.
+        pcibridge_write_u32(&mut bus, base + pcibridge::reg::INTX_TEST, 0x0);
+        assert_eq!(
+            pcibridge_read_u32(&mut bus, base + pcibridge::reg::INTX_STATUS),
+            0,
+            "the card's own status clears immediately, with no ack needed"
+        );
+        let ports = 1u16 << chipset::intbit::PORTS;
+        bus.write_word(CUSTOM_BASE + chipset::reg::INTREQ as u32, ports);
+        assert_eq!(
+            bus.pending_irq_level(),
+            0,
+            "acknowledging INTREQ clears it once the source is already quiet"
         );
     }
 

@@ -31,7 +31,7 @@
 //! interrupt at all** — not yet: see "Why no interrupt exists on this
 //! card yet" below.
 //!
-//! # Register map (frozen for this increment; see `reg`)
+//! # Register map (stage 2; see `reg`)
 //!
 //! | Offset | Register | Width | Access |
 //! |---|---|---|---|
@@ -42,8 +42,10 @@
 //! | `0x10` | [`reg::CFG_OP`] | byte | W |
 //! | `0x14` | [`reg::CFG_STATUS`] | byte | RW (write-1-to-clear) |
 //! | `0x18` | [`reg::APERTURE_BASE`] | u32 | RW |
-//! | `0x1C..0x28` | reserved | — | R0/discard |
-//! | [`APERTURE_BASE_OFFSET`]`..`[`super::pcibridge::WINDOW_BYTES`] | BAR aperture | byte | RW |
+//! | `0x1C` | [`reg::INTX_STATUS`] | u32 | R |
+//! | `0x20` | [`reg::INTX_ENABLE`] | u32 | RW (bits 0-3 only) |
+//! | `0x24` | [`reg::INTX_TEST`] | u32 | RW (bits 0-3 only) |
+//! | [`APERTURE_BASE_OFFSET`]`..`[`super::pcibridge::WINDOW_BYTES`] | BAR aperture | byte, word, long | RW |
 //!
 //! [`reg::CFG_ADDR`] is ECAM-style: bits `[27:20]` are the target bus,
 //! `[19:15]` the device, `[14:12]` the function, and `[11:0]` the offset
@@ -98,15 +100,41 @@
 //! unlike config cycles), because sliding a window has no invalid state
 //! to guard against the way a config op's malformed address/width does.
 //!
-//! # Why no interrupt exists on this card yet
+//! # `INTx` routing onto `INT2` (stage 2)
 //!
-//! Config cycles are synchronous (above), so there is no completion to
-//! announce asynchronously — `rtgboard.rs`'s §8 reasoning applies
-//! verbatim. The reserved register range `0x1C..0x28` is left
-//! deliberately empty rather than reused for anything else, specifically
-//! so stage 3's `INTx` routing (`INTX_STATUS`/`INTX_ENABLE`, when a real
-//! interrupt-capable device like the virtio-net stub needs to signal the
-//! guest) can land there without reshuffling every offset after it.
+//! Config cycles themselves are still synchronous (above, unchanged from
+//! stage 1) — there is no completion to announce for those. But a PCI
+//! *device*'s own `INTx` line is a genuinely asynchronous thing (real
+//! hardware: the function raises it whenever its own logic decides to,
+//! with no CPU access involved at all), and this card's job is to make
+//! that line's live state visible to the guest and OR it onto Zorro's
+//! shared `INT2` pin — `docs/pcibridge-protocol.md` §8 / `docs/
+//! pci-library.md` §5's contract in full:
+//!
+//! - [`reg::INTX_STATUS`] is **not stored state**: every read recomputes
+//!   `backend.intx_levels() | INTX_TEST`, live, the instant it is read
+//!   ([`PciBridge::intx_status`]). Level-triggered means exactly this —
+//!   the register tracks the line's *current* condition, with no
+//!   write-1-to-clear and no edge to lose, unlike [`reg::CFG_STATUS`]
+//!   just above it.
+//! - [`reg::INTX_ENABLE`] is the mask a driver (`Prm_AddIntServer`,
+//!   `docs/pci-library.md` §5) sets to unmask the line(s) it services.
+//! - [`PciBridge::irq_pending`] is `(INTX_STATUS & INTX_ENABLE) != 0` —
+//!   the same shared-line, poll-your-device discipline every other card
+//!   on this bus uses, computed fresh on every call rather than cached,
+//!   because [`crate::pci::PciBackend::intx_levels`] can change with no
+//!   register write at all (stage 3's virtio-net ISR will raise/lower it
+//!   from its own function logic).
+//! - [`reg::INTX_TEST`] exists purely as a diagnostic assertion source:
+//!   with no device having real function logic yet (this increment's
+//!   virtio-net stub still answers all-ones behind every BAR — module
+//!   docs on [`crate::pci::VirtioNetStub`]), there is nothing else that
+//!   could exercise the INTA-INTD-to-INT2 wiring end to end before stage
+//!   3 exists. It is ORed into [`reg::INTX_STATUS`] alongside whatever
+//!   the backend itself reports, so the two sources are indistinguishable
+//!   to a driver — deliberately: stage 3's virtio-net ISR replaces
+//!   `INTX_TEST` as *a* source without changing anything else about the
+//!   contract (`docs/pci-library.md` §6's probe-tool step 4).
 //!
 //! # Hostile input
 //!
@@ -156,27 +184,52 @@
 //! there is no queue behind it that an early acknowledgement could
 //! strand, so a driver may clear it the instant it has read the result.
 //!
-//! # The BAR aperture
+//! # The BAR aperture, and sized accesses (stage 2)
 //!
-//! A byte read/write at window offset [`APERTURE_BASE_OFFSET`]`+ k`
-//! reaches the backend's PCI memory space at address
-//! `(APERTURE_BASE as u64) + (k as u64)`. Both operands are
-//! zero-extended from a `u32` before the addition, so the sum can never
-//! exceed `2 * u32::MAX`, which fits comfortably below `u64::MAX` — this
-//! addition is therefore infallible and needs no `checked_add`, unlike
-//! [`crate::pci::VirtualPciBus`]'s own window-containment arithmetic
-//! (which subtracts instead, guarding a *different* hostile input: an
-//! adversarial BAR base near `u64::MAX`, not reachable from this card's
-//! own `u32` `APERTURE_BASE`).
+//! An access at window offset [`APERTURE_BASE_OFFSET`]`+ k` reaches the
+//! backend's PCI memory space at address `(APERTURE_BASE as u64) + (k as
+//! u64)`. Both operands are zero-extended from a `u32` before the
+//! addition, so the sum can never exceed `2 * u32::MAX`, which fits
+//! comfortably below `u64::MAX` — this addition is therefore infallible
+//! and needs no `checked_add`, unlike [`crate::pci::VirtualPciBus`]'s own
+//! window-containment arithmetic (which subtracts instead, guarding a
+//! *different* hostile input: an adversarial BAR base near `u64::MAX`,
+//! not reachable from this card's own `u32` `APERTURE_BASE`).
 //!
-//! Every aperture access this card issues to the backend is a `W8`
-//! access: the Zorro bus hands this card one byte at a time exactly as
-//! `rtgboard.rs`'s VRAM aperture does, so that is what reaches
-//! [`crate::pci::PciBackend::mem_read`]/[`crate::pci::PciBackend::
-//! mem_write`]. A future increment could recognise a 68k word/long
-//! access and upgrade to `W16`/`W32` backend accesses for devices that
-//! care about access-size side effects (some MMIO registers do); that is
-//! a documented possibility, not something this increment builds.
+//! Byte accesses ([`PciBridge::read`]/[`PciBridge::write`]'s own aperture
+//! arm) always reach the backend as a single `W8` access, unchanged from
+//! stage 1. [`PciBridge::read_aperture_sized`]/[`PciBridge::
+//! write_aperture_sized`] are stage 2's addition: `docs/
+//! pcibridge-protocol.md` §5 recorded, from stage 1, that virtio's modern
+//! spec requires a driver to access fields at their *natural* width, and
+//! that decomposing every word/long access into bytes (as `MachineBus`'s
+//! ordinary byte-decomposition path still does everywhere else on this
+//! bus) cannot honour that. These two methods perform exactly **one**
+//! backend access of the requested width — `MachineBus`'s own
+//! `read_word`/`read_long`/`write_word`/`write_long` arms (`lib.rs`) call
+//! them only for an access that lies entirely within the aperture and is
+//! naturally aligned to its own width; everything else (the register
+//! file, a misaligned aperture access) keeps decomposing to bytes exactly
+//! as before, unchanged.
+//!
+//! **Byte-lane swap, and why it is needed even though [`crate::pci::
+//! PciBackend`] is value-carrying (§3).** [`crate::pci::PciBackend::
+//! mem_read`]/`mem_write` traffic in *decoded little-endian values* (a
+//! same-width load on this trait's little-endian real-ECAM backing needs
+//! no swap at all — trait docs). But address-invariance (§3, and `docs/
+//! pci-library.md` §3) demands that aperture byte `k` be PCI byte
+//! `APERTURE_BASE + k` at *every* width, the same guarantee stage 1's
+//! byte-by-byte path already gave for free (one byte in, one byte out,
+//! nothing to get backwards). A sized access has no such luxury: the
+//! backend hands back (or expects) a little-endian-composed integer, and
+//! this card's own registers present everything big-endian (module docs,
+//! "Why the byte-order story is clean here") — so [`swap_lanes`] performs
+//! exactly the byte-lane reversal within `width` that reconciles the two,
+//! at read and write alike (writes: swap first, then hand the backend
+//! its little-endian value; symmetric). The result: a driver doing a
+//! sized word/long aperture access sees byte-for-byte what four/two byte
+//! accesses at the same offset would have produced, which is exactly what
+//! §5's tests assert.
 //!
 //! # No `DiagArea`, host side only, this increment
 //!
@@ -213,8 +266,13 @@ const ERFF_ZORRO_III: u8 = 1 << 4;
 /// table rather than Zorro II's 64 KB-8 MB one.
 const ERFF_EXTENDED: u8 = 1 << 5;
 
-/// The value [`reg::VERSION`] reports.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// The value [`reg::VERSION`] reports. History: `1` was stage 1 (config
+/// cycles and the byte-granular BAR aperture, no `INTx`). `2` is stage 2
+/// (this increment): the `INTx` registers at `0x1C..0x28` and sized
+/// aperture accesses are now part of the contract, so a stage-2 guest
+/// library refuses any card that does not answer `2` here — a deliberate
+/// breaking bump, not silently tolerated (`docs/pci-library.md` §2).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Where the BAR aperture starts within this board's 16 MB AUTOCONFIG
 /// window — well clear of the register file (which ends at `0x28`),
@@ -256,7 +314,23 @@ pub mod reg {
     /// scratch: takes effect on the very next aperture access, no commit
     /// step (module docs, "Why the aperture is banked").
     pub const APERTURE_BASE: u32 = 0x18;
-    // 0x1C..0x28 reserved for stage 3's INTx registers (module docs).
+    /// Live `INTA`-`INTD` line levels ORed with [`INTX_TEST`]'s own bits
+    /// (module docs, "`INTx` routing onto `INT2`"), recomputed on every
+    /// read — never stored, never latched. Bits 4-31 always read `0`.
+    /// Read-only; writes discarded.
+    pub const INTX_STATUS: u32 = 0x1C;
+    /// Mask of which [`INTX_STATUS`] bits actually assert `INT2`
+    /// (`docs/pci-library.md` §5/§6: `Prm_AddIntServer` unmasks a line
+    /// here). Only bits 0-3 are writable; bits 4-31 always read `0` and
+    /// discard writes.
+    pub const INTX_ENABLE: u32 = 0x20;
+    /// Diagnostic line assertion, ORed straight into [`INTX_STATUS`]:
+    /// exists so the `INTA`-`INTD`-to-`INT2` routing is provable before
+    /// any device has real function logic (module docs) -- stage 3's
+    /// virtio-net ISR replaces this as *a* source of asserted bits, not
+    /// as the mechanism. Only bits 0-3 are writable; bits 4-31 always
+    /// read `0` and discard writes.
+    pub const INTX_TEST: u32 = 0x24;
 }
 
 /// [`reg::CFG_STATUS`] bit values.
@@ -281,6 +355,15 @@ pub struct PciBridge<'a> {
     cfg_data: u32,
     cfg_status: u8,
     aperture_base: u32,
+    /// [`reg::INTX_ENABLE`]'s low nibble; bits 4-7 are always `0` (module
+    /// docs, "`INTx` routing onto `INT2`") -- stored as a byte like
+    /// [`Self::cfg_width`]/[`Self::cfg_status`] since only 4 bits are
+    /// ever live, the same "hot byte, nibble-masked" idiom applied to a
+    /// register the protocol still describes as a full `u32`.
+    intx_enable: u8,
+    /// [`reg::INTX_TEST`]'s low nibble, same storage shape as
+    /// [`Self::intx_enable`].
+    intx_test: u8,
 }
 
 impl<'a> PciBridge<'a> {
@@ -295,6 +378,8 @@ impl<'a> PciBridge<'a> {
             cfg_data: 0,
             cfg_status: 0,
             aperture_base: 0,
+            intx_enable: 0,
+            intx_test: 0,
         }
     }
 
@@ -379,6 +464,73 @@ impl<'a> PciBridge<'a> {
         self.backend.mem_write(addr, AccessWidth::W8, value as u32);
     }
 
+    /// Perform ONE backend access of `width` into the BAR aperture at
+    /// window offset [`APERTURE_BASE_OFFSET`]`+ k`, address-invariant at
+    /// every width (module docs, "The BAR aperture, and sized accesses").
+    /// `MachineBus`'s own `read_word`/`read_long` call this only for a
+    /// naturally-aligned access lying entirely within the aperture; every
+    /// other case keeps decomposing into [`Self::read_aperture`] byte
+    /// calls unchanged.
+    pub fn read_aperture_sized(&mut self, k: u32, width: AccessWidth) -> u32 {
+        let addr = self.aperture_base as u64 + k as u64;
+        swap_lanes(self.backend.mem_read(addr, width), width)
+    }
+
+    /// Write ONE backend access of `width` into the BAR aperture, same
+    /// addressing and swap as [`Self::read_aperture_sized`] (symmetric:
+    /// swap first, then hand the backend its little-endian value).
+    pub fn write_aperture_sized(&mut self, k: u32, width: AccessWidth, value: u32) {
+        let addr = self.aperture_base as u64 + k as u64;
+        self.backend
+            .mem_write(addr, width, swap_lanes(value, width));
+    }
+
+    /// [`reg::INTX_STATUS`]'s live value: the backend's own asserted
+    /// lines ORed with [`Self::intx_test`]'s diagnostic bits, masked to
+    /// the four bits this register actually has (module docs, "`INTx`
+    /// routing onto `INT2`"). Recomputed every call -- there is no stored
+    /// status to go stale.
+    fn intx_status(&mut self) -> u8 {
+        ((self.backend.intx_levels() | self.intx_test as u32) & 0x0F) as u8
+    }
+
+    /// Whether this card is currently holding `INT2` asserted:
+    /// `(INTX_STATUS & INTX_ENABLE) != 0`, level-triggered (module docs)
+    /// -- `MachineBus` polls this after every register write that could
+    /// change the answer, and once per host tick besides (backend state
+    /// can change with no register write at all).
+    pub fn irq_pending(&mut self) -> bool {
+        (self.intx_status() & self.intx_enable) != 0
+    }
+
+    /// Host-side cross-check of a guest-assigned BAR (or any other config
+    /// register): reads straight through the backend, bypassing every
+    /// guest-visible register ([`reg::CFG_ADDR`]/[`reg::CFG_WIDTH`]/
+    /// [`reg::CFG_OP`]/[`reg::CFG_DATA`]) entirely. **Never a path a
+    /// guest driver can reach** -- this exists solely for `--inspect` to
+    /// print what a device itself latched, so it can be compared against
+    /// whatever the guest's own `pci.library`/`pciprobe` reported through
+    /// the ordinary config-cycle registers (`docs/pci-library.md` §6,
+    /// "BAR consistency is checked from both sides").
+    pub fn config_read_for_inspection(
+        &mut self,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u16,
+        width: AccessWidth,
+    ) -> u32 {
+        self.backend.config_read(
+            Bdf {
+                bus,
+                device,
+                function,
+            },
+            offset,
+            width,
+        )
+    }
+
     /// Read a byte of the register file, offset from this board's
     /// configured AUTOCONFIG base, or of the BAR aperture above
     /// [`APERTURE_BASE_OFFSET`]. `&mut self`: an aperture read reaches
@@ -397,6 +549,9 @@ impl<'a> PciBridge<'a> {
             o if in_slot(o, reg::APERTURE_BASE) => {
                 byte_of(self.aperture_base, o - reg::APERTURE_BASE)
             }
+            o if in_slot(o, reg::INTX_STATUS) => low_byte(o, reg::INTX_STATUS, self.intx_status()),
+            o if in_slot(o, reg::INTX_ENABLE) => low_byte(o, reg::INTX_ENABLE, self.intx_enable),
+            o if in_slot(o, reg::INTX_TEST) => low_byte(o, reg::INTX_TEST, self.intx_test),
             o if (APERTURE_BASE_OFFSET..WINDOW_BYTES).contains(&o) => {
                 self.read_aperture(o - APERTURE_BASE_OFFSET)
             }
@@ -431,11 +586,39 @@ impl<'a> PciBridge<'a> {
             o if in_slot(o, reg::APERTURE_BASE) => {
                 set_byte_of(&mut self.aperture_base, o - reg::APERTURE_BASE, value)
             }
+            o if in_slot(o, reg::INTX_STATUS) => {} // read-only, discarded
+            o if in_slot(o, reg::INTX_ENABLE) && o - reg::INTX_ENABLE == 3 => {
+                // Only bits 0-3 are writable (module docs); the other
+                // four bits of this byte are simply never stored, which
+                // is what makes them permanently read `0` in `read`
+                // above without a separate mask on every read.
+                self.intx_enable = value & 0x0F;
+            }
+            o if in_slot(o, reg::INTX_ENABLE) => {} // the other three bytes: always 0, discarded
+            o if in_slot(o, reg::INTX_TEST) && o - reg::INTX_TEST == 3 => {
+                self.intx_test = value & 0x0F;
+            }
+            o if in_slot(o, reg::INTX_TEST) => {}
             o if (APERTURE_BASE_OFFSET..WINDOW_BYTES).contains(&o) => {
                 self.write_aperture(o - APERTURE_BASE_OFFSET, value)
             }
             _ => {}
         }
+    }
+}
+
+/// Byte-lane-reverse `value`'s low `width` bytes, the rest left `0` --
+/// see [`PciBridge::read_aperture_sized`]'s doc comment for why this
+/// reconciles [`crate::pci::PciBackend`]'s little-endian-decoded values
+/// with this card's big-endian register presentation at every sized
+/// width. `AccessWidth::W8` is a no-op: a single byte has no lanes to
+/// reverse, matching [`PciBridge::read_aperture`]'s own untouched byte
+/// path.
+fn swap_lanes(value: u32, width: AccessWidth) -> u32 {
+    match width {
+        AccessWidth::W8 => value,
+        AccessWidth::W16 => (value as u16).swap_bytes() as u32,
+        AccessWidth::W32 => value.swap_bytes(),
     }
 }
 
@@ -470,7 +653,9 @@ fn set_byte_of(value: &mut u32, lane: u32, byte: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pci::{HostBridge, TestMemDevice, VirtioNetStub, VirtualPciBus, VirtualSlot};
+    use crate::pci::{
+        HostBridge, IntxTestDevice, TestMemDevice, VirtioNetStub, VirtualPciBus, VirtualSlot,
+    };
 
     fn read_u32(dev: &mut PciBridge, base: u32) -> u32 {
         u32::from_be_bytes([
@@ -504,7 +689,7 @@ mod tests {
     // ---- VERSION / board identity -----------------------------------------
 
     #[test]
-    fn version_reads_one() {
+    fn version_reads_two() {
         let mut bridge = HostBridge::new();
         let mut slots = [VirtualSlot {
             bdf: Bdf {
@@ -516,8 +701,8 @@ mod tests {
         }];
         let mut bus = VirtualPciBus::new(&mut slots);
         let mut dev = PciBridge::new(&mut bus);
-        assert_eq!(read_u32(&mut dev, reg::VERSION), 1);
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(read_u32(&mut dev, reg::VERSION), 2);
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     #[test]
@@ -850,6 +1035,151 @@ mod tests {
         );
     }
 
+    /// Enable memory space and program BAR0 to `base` through the card's
+    /// own config-cycle registers, then bank the aperture at `base` --
+    /// the common setup every sized-aperture test below shares with
+    /// [`aperture_reads_and_writes_route_to_the_backend_bar`] above
+    /// (full-stack, never poking the device directly).
+    fn enable_and_map_bar0(dev: &mut PciBridge, base: u32) {
+        write_u32(dev, reg::CFG_DATA, 0x0002);
+        stage_and_op(dev, pack_cfg_addr(0, 3, 0, 0x04), 2, 1);
+        dev.write(reg::CFG_STATUS + 3, 0xFF);
+
+        write_u32(dev, reg::CFG_DATA, base);
+        stage_and_op(dev, pack_cfg_addr(0, 3, 0, 0x10), 4, 1);
+        dev.write(reg::CFG_STATUS + 3, 0xFF);
+
+        write_u32(dev, reg::APERTURE_BASE, base);
+    }
+
+    #[test]
+    fn a_sized_word_aperture_read_equals_the_byte_composed_read_as_one_backend_access() {
+        let mut mem = TestMemDevice::new();
+        let base = 0x1000_0000u32;
+        let mut slots = [VirtualSlot {
+            bdf: Bdf {
+                bus: 0,
+                device: 3,
+                function: 0,
+            },
+            device: &mut mem,
+        }];
+        let mut vbus = VirtualPciBus::new(&mut slots);
+        let mut dev = PciBridge::new(&mut vbus);
+        enable_and_map_bar0(&mut dev, base);
+
+        let k = 0x10u32;
+        // Byte-composed: two separate byte reads, big-endian composed,
+        // exactly what the aperture's ordinary byte path already gives.
+        let byte_composed = ((dev.read(APERTURE_BASE_OFFSET + k) as u16) << 8)
+            | dev.read(APERTURE_BASE_OFFSET + k + 1) as u16;
+
+        let sized = dev.read_aperture_sized(k, AccessWidth::W16) as u16;
+        assert_eq!(
+            sized, byte_composed,
+            "a sized word read must see the same byte lanes byte-by-byte would"
+        );
+    }
+
+    #[test]
+    fn a_sized_word_aperture_read_reaches_the_backend_as_one_width_2_access() {
+        let mut mem = TestMemDevice::new();
+        let base = 0x1000_0000u32;
+        {
+            let mut slots = [VirtualSlot {
+                bdf: Bdf {
+                    bus: 0,
+                    device: 3,
+                    function: 0,
+                },
+                device: &mut mem,
+            }];
+            let mut vbus = VirtualPciBus::new(&mut slots);
+            let mut dev = PciBridge::new(&mut vbus);
+            enable_and_map_bar0(&mut dev, base);
+            let _ = dev.read_aperture_sized(0x10, AccessWidth::W16);
+        }
+
+        assert_eq!(
+            mem.read_count(AccessWidth::W16),
+            1,
+            "exactly one width-2 backend access, not two width-1s"
+        );
+        assert_eq!(mem.read_count(AccessWidth::W8), 0);
+        assert_eq!(mem.read_count(AccessWidth::W32), 0);
+    }
+
+    #[test]
+    fn a_sized_long_aperture_read_reaches_the_backend_as_one_width_4_access() {
+        let mut mem = TestMemDevice::new();
+        let base = 0x1000_0000u32;
+        let byte_composed;
+        {
+            let mut slots = [VirtualSlot {
+                bdf: Bdf {
+                    bus: 0,
+                    device: 3,
+                    function: 0,
+                },
+                device: &mut mem,
+            }];
+            let mut vbus = VirtualPciBus::new(&mut slots);
+            let mut dev = PciBridge::new(&mut vbus);
+            enable_and_map_bar0(&mut dev, base);
+
+            let k = 0x20u32;
+            byte_composed = u32::from_be_bytes([
+                dev.read(APERTURE_BASE_OFFSET + k),
+                dev.read(APERTURE_BASE_OFFSET + k + 1),
+                dev.read(APERTURE_BASE_OFFSET + k + 2),
+                dev.read(APERTURE_BASE_OFFSET + k + 3),
+            ]);
+            let sized = dev.read_aperture_sized(k, AccessWidth::W32);
+            assert_eq!(
+                sized, byte_composed,
+                "a sized long read must see the same byte lanes byte-by-byte would"
+            );
+        }
+
+        assert_eq!(
+            mem.read_count(AccessWidth::W32),
+            1,
+            "exactly one width-4 backend access, not four width-1s"
+        );
+        assert_eq!(
+            mem.read_count(AccessWidth::W8),
+            4,
+            "the byte-composed check above"
+        );
+    }
+
+    #[test]
+    fn a_sized_aperture_write_round_trips_through_the_swap() {
+        let mut mem = TestMemDevice::new();
+        let base = 0x1000_0000u32;
+        {
+            let mut slots = [VirtualSlot {
+                bdf: Bdf {
+                    bus: 0,
+                    device: 3,
+                    function: 0,
+                },
+                device: &mut mem,
+            }];
+            let mut vbus = VirtualPciBus::new(&mut slots);
+            let mut dev = PciBridge::new(&mut vbus);
+            enable_and_map_bar0(&mut dev, base);
+            dev.write_aperture_sized(0x30, AccessWidth::W32, 0x1122_3344);
+        }
+
+        // The backend saw the little-endian-decoded value the guest's
+        // big-endian 0x1122_3344 swaps to.
+        assert_eq!(
+            mem.last_write(),
+            Some((0x30, AccessWidth::W32, 0x4433_2211))
+        );
+    }
+
     #[test]
     fn aperture_base_near_u32_max_does_not_panic_and_unmapped_reads_are_ff() {
         let mut mem = TestMemDevice::new();
@@ -875,7 +1205,14 @@ mod tests {
     // ---- reserved offsets and the gap ----------------------------------------
 
     #[test]
-    fn reserved_offsets_read_zero_and_discard_writes() {
+    fn intx_registers_only_expose_their_low_order_lane() {
+        // Stage 1's reserved `0x1C..0x28` range is now fully claimed by
+        // the three INTx registers (module docs) -- this is the
+        // replacement for the old "reserved range" coverage: each
+        // register's top three byte lanes always read `0` and discard
+        // writes, exactly like every other u32 register's non-hot lanes
+        // on this card (`CFG_WIDTH`/`CFG_STATUS`'s own "hot at offset+3"
+        // shape).
         let mut net = VirtioNetStub::new();
         let mut slots = [VirtualSlot {
             bdf: Bdf {
@@ -888,14 +1225,17 @@ mod tests {
         let mut vbus = VirtualPciBus::new(&mut slots);
         let mut dev = PciBridge::new(&mut vbus);
 
-        for offset in [0x1Cu32, 0x1F, 0x20, 0x24, 0x27] {
-            assert_eq!(dev.read(offset), 0, "reserved offset {offset:#x}");
-            dev.write(offset, 0xFF);
-            assert_eq!(
-                dev.read(offset),
-                0,
-                "reserved offset {offset:#x} after write"
-            );
+        for base in [reg::INTX_STATUS, reg::INTX_ENABLE, reg::INTX_TEST] {
+            for lane in 0..3 {
+                let offset = base + lane;
+                assert_eq!(dev.read(offset), 0, "register {base:#x} lane {lane}");
+                dev.write(offset, 0xFF);
+                assert_eq!(
+                    dev.read(offset),
+                    0,
+                    "register {base:#x} lane {lane} after write"
+                );
+            }
         }
     }
 
@@ -918,6 +1258,125 @@ mod tests {
         assert_eq!(dev.read(gap), 0);
         dev.write(gap, 0xFF);
         assert_eq!(dev.read(gap), 0);
+    }
+
+    // ---- INTx registers -------------------------------------------------------
+
+    #[test]
+    fn intx_enable_and_test_only_keep_their_low_nibble() {
+        let mut net = VirtioNetStub::new();
+        let mut slots = [VirtualSlot {
+            bdf: Bdf {
+                bus: 0,
+                device: 1,
+                function: 0,
+            },
+            device: &mut net,
+        }];
+        let mut vbus = VirtualPciBus::new(&mut slots);
+        let mut dev = PciBridge::new(&mut vbus);
+
+        write_u32(&mut dev, reg::INTX_ENABLE, 0xFFFF_FFFF);
+        assert_eq!(
+            read_u32(&mut dev, reg::INTX_ENABLE),
+            0x0F,
+            "only bits 0-3 are writable"
+        );
+
+        write_u32(&mut dev, reg::INTX_TEST, 0xFFFF_FFFF);
+        assert_eq!(read_u32(&mut dev, reg::INTX_TEST), 0x0F);
+    }
+
+    #[test]
+    fn intx_status_tracks_the_backend_live_with_no_latching() {
+        let mut dev = IntxTestDevice::new(1); // INTA -> bit 0
+
+        // Before asserting: INTX_STATUS reads 0.
+        {
+            let mut slots = [VirtualSlot {
+                bdf: Bdf {
+                    bus: 0,
+                    device: 0,
+                    function: 0,
+                },
+                device: &mut dev,
+            }];
+            let mut vbus = VirtualPciBus::new(&mut slots);
+            let mut bridge = PciBridge::new(&mut vbus);
+            assert_eq!(read_u32(&mut bridge, reg::INTX_STATUS), 0);
+        }
+
+        // Assert the device's line directly, with no register write in
+        // sight -- exactly the case module docs call out: stage 3's
+        // virtio-net ISR will change `INTX_STATUS`'s answer with no
+        // `CFG_OP`/`INTX_ENABLE`/`INTX_TEST` write at all, and this
+        // register must track it live, not go stale until poked.
+        dev.set_asserted(true);
+        {
+            let mut slots = [VirtualSlot {
+                bdf: Bdf {
+                    bus: 0,
+                    device: 0,
+                    function: 0,
+                },
+                device: &mut dev,
+            }];
+            let mut vbus = VirtualPciBus::new(&mut slots);
+            let mut bridge = PciBridge::new(&mut vbus);
+            assert_eq!(read_u32(&mut bridge, reg::INTX_STATUS), 0b0001);
+        }
+
+        // Deassert: the bit clears, with nothing to write-1-to-clear --
+        // level-triggered, no latch (module docs).
+        dev.set_asserted(false);
+        {
+            let mut slots = [VirtualSlot {
+                bdf: Bdf {
+                    bus: 0,
+                    device: 0,
+                    function: 0,
+                },
+                device: &mut dev,
+            }];
+            let mut vbus = VirtualPciBus::new(&mut slots);
+            let mut bridge = PciBridge::new(&mut vbus);
+            assert_eq!(read_u32(&mut bridge, reg::INTX_STATUS), 0);
+        }
+    }
+
+    #[test]
+    fn irq_pending_is_true_only_while_status_and_enable_are_both_nonzero() {
+        let mut net = VirtioNetStub::new();
+        let mut slots = [VirtualSlot {
+            bdf: Bdf {
+                bus: 0,
+                device: 1,
+                function: 0,
+            },
+            device: &mut net,
+        }];
+        let mut vbus = VirtualPciBus::new(&mut slots);
+        let mut dev = PciBridge::new(&mut vbus);
+
+        // Nothing enabled, nothing asserted.
+        assert!(!dev.irq_pending());
+
+        // INTX_TEST asserts a line, but INTX_ENABLE still masks it.
+        write_u32(&mut dev, reg::INTX_TEST, 0x1);
+        assert_eq!(read_u32(&mut dev, reg::INTX_STATUS), 0x1);
+        assert!(
+            !dev.irq_pending(),
+            "asserted but not enabled must not raise INT2"
+        );
+
+        // Enable that line: now it is pending.
+        write_u32(&mut dev, reg::INTX_ENABLE, 0x1);
+        assert!(dev.irq_pending());
+
+        // Deassert INTX_TEST: pending clears even though ENABLE is
+        // untouched -- the condition, not a latch, is what gates it.
+        write_u32(&mut dev, reg::INTX_TEST, 0x0);
+        assert!(!dev.irq_pending());
     }
 
     #[test]

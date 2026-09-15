@@ -189,6 +189,24 @@ pub trait PciBackend {
     /// Write `value` to PCI memory space, same contract as
     /// [`Self::mem_read`].
     fn mem_write(&mut self, addr: u64, width: AccessWidth, value: u32);
+
+    /// Live `INTA`-`INTD` line levels, bits 0-3 = INTA..INTD, ORed
+    /// together across every function behind this backend --
+    /// `docs/pcibridge-protocol.md` §8's level-triggered INTx-to-INT2
+    /// contract: a line reads asserted for exactly as long as some
+    /// device holds it there, no latching, no edge to miss or
+    /// acknowledge here (the guest-visible edge, if any, lives entirely
+    /// in `pcibridge.rs`'s own `INTX_STATUS`/`INTX_ENABLE` register
+    /// pair). Defaulted to "nothing asserted" so a real-ECAM
+    /// implementation (this trait's other real backing, module docs)
+    /// keeps compiling unchanged until its own board crate wires up
+    /// whatever hardware INTx-status register its root complex exposes;
+    /// only [`VirtualPciBus`] overrides this, by asking each attached
+    /// [`PciDevice`] whether it is currently asserting and which pin it
+    /// is wired to.
+    fn intx_levels(&mut self) -> u32 {
+        0
+    }
 }
 
 /// One virtual device's config space and BAR-mapped function, as seen by
@@ -231,6 +249,18 @@ pub trait PciDevice {
     /// discarded.
     fn bar_write(&mut self, bar: usize, offset: u64, width: AccessWidth, value: u32) {
         let _ = (bar, offset, width, value);
+    }
+
+    /// Whether this device is currently asserting its `INTx` line.
+    /// Default: never -- every device in this file with no real function
+    /// behind it ([`HostBridge`], [`VirtioNetStub`]) keeps this default;
+    /// a device with genuine interrupt-generating logic (stage 3's
+    /// virtio-net ISR, or this file's own [`IntxTestDevice`] diagnostic)
+    /// overrides it. [`VirtualPciBus::intx_levels`] combines this with
+    /// the device's own `Interrupt Pin` config byte (offset `0x3D`) to
+    /// decide which of the four shared lines it ORs onto.
+    fn intx_level(&self) -> bool {
+        false
     }
 }
 
@@ -319,6 +349,28 @@ impl PciBackend for VirtualPciBus<'_> {
                 }
             }
         }
+    }
+
+    /// OR every asserted device's line onto the bit its own `Interrupt
+    /// Pin` config byte (offset `0x3D`, `1` = INTA .. `4` = INTD) names,
+    /// `0` meaning "uses no legacy interrupt pin" and therefore never
+    /// contributing a bit regardless of [`PciDevice::intx_level`]'s
+    /// answer -- the routing half of the trait docs' "Live `INTA`-`INTD`
+    /// line levels" contract, done here rather than by each device
+    /// because which shared line a function's pin routes to is bus
+    /// topology, not something a device knows about itself.
+    fn intx_levels(&mut self) -> u32 {
+        let mut levels = 0u32;
+        for slot in self.devices.iter_mut() {
+            if !slot.device.intx_level() {
+                continue;
+            }
+            let pin = slot.device.config_read(off::INTERRUPT_PIN, AccessWidth::W8) as u8;
+            if (1..=4).contains(&pin) {
+                levels |= 1 << (pin - 1);
+            }
+        }
+        levels
     }
 }
 
@@ -636,6 +688,17 @@ fn all_ones(width: AccessWidth) -> u32 {
     }
 }
 
+/// A dense `0..3` index for [`AccessWidth`], for the rare case (here,
+/// [`TestMemDevice`]'s per-width call counters) where a caller wants one
+/// small array slot per width rather than a `match`.
+fn width_index(width: AccessWidth) -> usize {
+    match width {
+        AccessWidth::W8 => 0,
+        AccessWidth::W16 => 1,
+        AccessWidth::W32 => 2,
+    }
+}
+
 fn write_u16(image: &mut [u8; CONFIG_SPACE_LEN], offset: u16, value: u16) {
     let bytes = value.to_le_bytes();
     image[offset as usize] = bytes[0];
@@ -944,6 +1007,12 @@ impl PciDevice for VirtioNetStub {
 pub struct TestMemDevice {
     config: ConfigSpace,
     last_write: Option<(u64, AccessWidth, u32)>,
+    /// Number of [`Self::bar_read`] calls seen at each width, indexed by
+    /// [`width_index`] -- the stage-2 sized-aperture proof needs to show
+    /// a word/long access reaches the backend as ONE access of that
+    /// width, not four/two width-1 ones, and counting calls is the only
+    /// way to see that from outside `pcibridge.rs`.
+    read_counts: [u32; 3],
 }
 
 impl TestMemDevice {
@@ -981,6 +1050,7 @@ impl TestMemDevice {
         Self {
             config,
             last_write: None,
+            read_counts: [0; 3],
         }
     }
 
@@ -989,6 +1059,12 @@ impl TestMemDevice {
     /// accessor, not part of the guest-visible surface.
     pub fn last_write(&self) -> Option<(u64, AccessWidth, u32)> {
         self.last_write
+    }
+
+    /// How many [`Self::bar_read`] calls have landed at `width` so far --
+    /// see [`Self::read_counts`]'s doc comment.
+    pub fn read_count(&self, width: AccessWidth) -> u32 {
+        self.read_counts[width_index(width)]
     }
 
     /// The deterministic pattern [`Self::bar_read`] returns for a given
@@ -1029,6 +1105,7 @@ impl PciDevice for TestMemDevice {
 
     fn bar_read(&mut self, bar: usize, offset: u64, width: AccessWidth) -> u32 {
         if bar == 0 {
+            self.read_counts[width_index(width)] += 1;
             Self::pattern(offset, width)
         } else {
             u32::MAX
@@ -1039,6 +1116,71 @@ impl PciDevice for TestMemDevice {
         if bar == 0 {
             self.last_write = Some((offset, width, value));
         }
+    }
+}
+
+/// A minimal device whose only job is asserting/deasserting its `INTx`
+/// line on command, wired to whatever pin its constructor chose --
+/// proves [`VirtualPciBus::intx_levels`]'s pin-routing math end to end
+/// independently of any device with real BAR-backed function, the same
+/// role [`TestMemDevice`] plays for the aperture path.
+pub struct IntxTestDevice {
+    config: ConfigSpace,
+    asserted: bool,
+}
+
+impl IntxTestDevice {
+    /// Build a device wired to `Interrupt Pin` `pin` (`1` = INTA .. `4` =
+    /// INTD, `0` = "uses no legacy interrupt pin" -- see
+    /// [`ConfigSpaceIdentity::interrupt_pin`]). Starts deasserted.
+    pub fn new(pin: u8) -> Self {
+        let config = ConfigSpace::new(
+            ConfigSpaceIdentity {
+                vendor_id: 0x1234,
+                device_id: 0xDEAD,
+                revision: 0,
+                class_base: 0xFF, // vendor-specific test device, like TestMemDevice
+                class_sub: 0x00,
+                prog_if: 0x00,
+                subsystem_vendor: 0,
+                subsystem_id: 0,
+                interrupt_pin: pin,
+            },
+            [BarKind::None; 6],
+        );
+        Self {
+            config,
+            asserted: false,
+        }
+    }
+
+    /// Assert or deassert this device's `INTx` line.
+    pub fn set_asserted(&mut self, asserted: bool) {
+        self.asserted = asserted;
+    }
+}
+
+impl Default for IntxTestDevice {
+    fn default() -> Self {
+        Self::new(1)
+    }
+}
+
+impl PciDevice for IntxTestDevice {
+    fn config_read(&mut self, offset: u16, width: AccessWidth) -> u32 {
+        self.config.read(offset, width)
+    }
+
+    fn config_write(&mut self, offset: u16, width: AccessWidth, value: u32) {
+        self.config.write(offset, width, value);
+    }
+
+    fn bar_window(&self, bar: usize) -> Option<(u64, u64)> {
+        self.config.bar_window(bar)
+    }
+
+    fn intx_level(&self) -> bool {
+        self.asserted
     }
 }
 
@@ -1532,5 +1674,139 @@ mod tests {
             net.config_read(0xFD, AccessWidth::W8),
             0, // reserved, untouched byte
         );
+    }
+
+    // ---- INTx routing (VirtualPciBus::intx_levels) --------------------------
+
+    #[test]
+    fn an_asserted_device_ors_its_line_onto_the_bit_its_pin_names() {
+        let mut inta = IntxTestDevice::new(1); // INTA -> bit 0
+        let mut intc = IntxTestDevice::new(3); // INTC -> bit 2
+        inta.set_asserted(true);
+        let mut slots = [
+            VirtualSlot {
+                bdf: Bdf {
+                    bus: 0,
+                    device: 0,
+                    function: 0,
+                },
+                device: &mut inta,
+            },
+            VirtualSlot {
+                bdf: Bdf {
+                    bus: 0,
+                    device: 1,
+                    function: 0,
+                },
+                device: &mut intc,
+            },
+        ];
+        let mut bus = VirtualPciBus::new(&mut slots);
+        assert_eq!(bus.intx_levels(), 0b0001, "only INTA's bit is set");
+    }
+
+    #[test]
+    fn pin_zero_never_asserts_regardless_of_intx_level() {
+        let mut dev = IntxTestDevice::new(0); // "uses no legacy interrupt pin"
+        dev.set_asserted(true);
+        let mut slots = [VirtualSlot {
+            bdf: Bdf {
+                bus: 0,
+                device: 0,
+                function: 0,
+            },
+            device: &mut dev,
+        }];
+        let mut bus = VirtualPciBus::new(&mut slots);
+        assert_eq!(bus.intx_levels(), 0);
+    }
+
+    #[test]
+    fn multiple_devices_on_the_same_pin_or_onto_one_bit() {
+        let mut a = IntxTestDevice::new(2); // INTB -> bit 1
+        let mut b = IntxTestDevice::new(2); // same pin, different device
+        a.set_asserted(true);
+        b.set_asserted(false);
+        {
+            let mut slots = [
+                VirtualSlot {
+                    bdf: Bdf {
+                        bus: 0,
+                        device: 0,
+                        function: 0,
+                    },
+                    device: &mut a,
+                },
+                VirtualSlot {
+                    bdf: Bdf {
+                        bus: 0,
+                        device: 1,
+                        function: 0,
+                    },
+                    device: &mut b,
+                },
+            ];
+            let mut bus = VirtualPciBus::new(&mut slots);
+            assert_eq!(bus.intx_levels(), 0b0010, "one device asserting is enough");
+        }
+
+        // Deassert a, assert b instead: still just bit 1 -- the OR does
+        // not depend on which of the two devices sharing the pin is the
+        // one currently asserting.
+        a.set_asserted(false);
+        b.set_asserted(true);
+        {
+            let mut slots = [
+                VirtualSlot {
+                    bdf: Bdf {
+                        bus: 0,
+                        device: 0,
+                        function: 0,
+                    },
+                    device: &mut a,
+                },
+                VirtualSlot {
+                    bdf: Bdf {
+                        bus: 0,
+                        device: 1,
+                        function: 0,
+                    },
+                    device: &mut b,
+                },
+            ];
+            let mut bus = VirtualPciBus::new(&mut slots);
+            assert_eq!(bus.intx_levels(), 0b0010);
+        }
+    }
+
+    #[test]
+    fn deasserting_every_device_on_a_line_clears_it() {
+        let mut a = IntxTestDevice::new(4); // INTD -> bit 3
+        a.set_asserted(true);
+        {
+            let mut slots = [VirtualSlot {
+                bdf: Bdf {
+                    bus: 0,
+                    device: 0,
+                    function: 0,
+                },
+                device: &mut a,
+            }];
+            let mut bus = VirtualPciBus::new(&mut slots);
+            assert_eq!(bus.intx_levels(), 0b1000);
+        }
+        a.set_asserted(false);
+        {
+            let mut slots = [VirtualSlot {
+                bdf: Bdf {
+                    bus: 0,
+                    device: 0,
+                    function: 0,
+                },
+                device: &mut a,
+            }];
+            let mut bus = VirtualPciBus::new(&mut slots);
+            assert_eq!(bus.intx_levels(), 0, "no bit is stuck once deasserted");
+        }
     }
 }

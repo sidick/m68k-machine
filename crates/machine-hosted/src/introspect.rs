@@ -1274,6 +1274,51 @@ pub fn format_pcibridge_state(bus: &mut MachineBus) -> String {
         ),
     }
 
+    // Stage 2: cross-check the virtio-net stub's own BAR0/COMMAND,
+    // read directly through the backend (`PciBridge::
+    // config_read_for_inspection`) rather than through the guest-visible
+    // config-cycle registers -- this is `--inspect`'s own host-side view
+    // of what the device itself latched, for the real-ROM test to
+    // compare against whatever the guest's own `pci.library`/`pciprobe`
+    // printed from its side (`docs/pci-library.md` §6, "BAR consistency
+    // is checked from both sides"). Bus 0, device 1, function 0 is where
+    // `run.rs`'s virtual topology places the stub -- fixed by this
+    // project's own construction, not guest-discovered, so naming it
+    // directly here is not a "hardcoded address" in the
+    // `device-ledger.md` sense (that rule is about *guest-visible*
+    // addresses AUTOCONFIG assigns, not this host-side topology's own
+    // fixed `Bdf`). Only printed once `pcibridge` is actually attached
+    // with its backing bus -- `pcibridge_mut()` is `None` until
+    // `with_pcibridge` runs, the same `Option`-shaped guard every other
+    // card's introspection uses.
+    if let Some(bridge) = bus.pcibridge_mut() {
+        let net = machine_core::pci::Bdf {
+            bus: 0,
+            device: 1,
+            function: 0,
+        };
+        use machine_core::pci::AccessWidth;
+        let bar0_raw = bridge.config_read_for_inspection(
+            net.bus,
+            net.device,
+            net.function,
+            0x10,
+            AccessWidth::W32,
+        );
+        let bar0_addr = bar0_raw & !0xF;
+        let command = bridge.config_read_for_inspection(
+            net.bus,
+            net.device,
+            net.function,
+            0x04,
+            AccessWidth::W16,
+        );
+        out.push_str(&format!(
+            "  virtio-net stub (00:01.0) BAR0 raw {bar0_raw:#010x}  \
+             PCI address {bar0_addr:#010x}  COMMAND {command:#06x}\n"
+        ));
+    }
+
     out
 }
 

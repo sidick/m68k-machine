@@ -3,13 +3,15 @@
 **Status:** host side implemented (`crates/machine-core/src/pcibridge.rs`
 over `crates/machine-core/src/pci.rs`), wired into
 `MachineBus::with_pcibridge` and `machine-hosted`'s `--pcibridge` flag.
-This is ADR 0005 **stage 1 only**: the Zorro III shim that exposes a PCI
-configuration/BAR space to the guest, proven by host-side enumeration
-tests — before any 68k code, any `pci.library` (stage 2), or any
-virtio-net driver (stage 3) exists. The register contract below is what
-stage 2's library will program; treat changes to it as breaking a
-published driver ABI even though no driver exists yet, because the whole
-point of landing it first is that the library gets written against it.
+Stage 1 was the Zorro III shim that exposes a PCI configuration/BAR space
+to the guest, proven by host-side enumeration tests — before any 68k
+code, any `pci.library`, or any virtio-net driver existed. **This
+document now also covers stage 2's own host-side landing**: the `INTx`
+registers (`INTX_STATUS`/`INTX_ENABLE`/`INTX_TEST`, §4/§8) and sized
+(word/long) aperture accesses (§5), both of which `docs/pci-library.md`'s
+stage-2 library programs. The register contract below is what that
+library programs; treat changes to it as breaking a published driver ABI
+even though the library is only now being written against it.
 
 **Context:** `docs/adr-0005-networking-virtio-behind-pci-library.md` (the
 decision and staging this executes — read it first);
@@ -135,15 +137,17 @@ Anything not listed reads `0` and discards writes.
 
 | Offset | Register | Width | Access | Notes |
 |---|---|---|---|---|
-| `0x00` | `VERSION` | u32 | R | protocol version; `1` for this document |
+| `0x00` | `VERSION` | u32 | R | protocol version. `1` was stage 1 (no INTx, byte-granular aperture only). `2` is stage 2 (this document, current): a stage-2 guest library refuses any other value — a deliberate breaking bump (`docs/pci-library.md` §2) |
 | `0x04` | `CFG_ADDR` | u32 | RW | ECAM-style target: bits 27–20 bus, 19–15 device, 14–12 function, 11–0 offset into the 4 KB config space. Bits 31–28 reserved, must be zero (checked at `CFG_OP` time — the register itself is plain scratch) |
 | `0x08` | `CFG_WIDTH` | byte | RW | access size in bytes: `1`, `2` or `4` (validated at `CFG_OP` time) |
 | `0x0C` | `CFG_DATA` | u32 | RW | staged write data / latched read result. Value semantics (§3); a 1- or 2-byte read latches into the low bits with the high bits zero |
 | `0x10` | `CFG_OP` | byte | W | `0` = config read (result → `CFG_DATA`), `1` = config write (of `CFG_DATA`). Synchronous: the cycle completes within the write itself, like `rtgboard`'s `COMMIT` |
 | `0x14` | `CFG_STATUS` | byte | RW | write-1-to-clear, ungated; bit 0 = `REJECTED`, bit 1 = `COMPLETED`, mutually exclusive per op |
 | `0x18` | `APERTURE_BASE` | u32 | RW | PCI memory-space address the BAR aperture maps to. Plain scratch — takes effect on the next aperture access, no commit step |
-| `0x1C`–`0x27` | reserved | — | — | reads `0`, writes discarded. Reserved for stage 3's INTx routing registers (`INTX_STATUS`/`INTX_ENABLE`), so the map will not reshuffle when interrupts arrive |
-| `0x800000`–`0xFFFFFF` | BAR aperture | — | RW | 8 MB banked window into PCI memory space (§5) |
+| `0x1C` | `INTX_STATUS` | u32 | R | live `INTA`–`INTD` line levels (bits 0–3) ORed with `INTX_TEST`'s own bits, recomputed on every read — never stored, never latched (§8). Writes discarded |
+| `0x20` | `INTX_ENABLE` | u32 | RW | mask of which `INTX_STATUS` bits assert `INT2`; only bits 0–3 are writable, the rest always read `0` and discard writes (§8) |
+| `0x24` | `INTX_TEST` | u32 | RW | diagnostic line assertion ORed straight into `INTX_STATUS`, so the `INTx`-to-`INT2` routing is provable before any device has real function logic; only bits 0–3 are writable (§8) |
+| `0x800000`–`0xFFFFFF` | BAR aperture | — | RW (byte, word, long — §5) | 8 MB banked window into PCI memory space (§5) |
 
 Driver-side (stage 2) config-cycle shape:
 
@@ -171,14 +175,23 @@ Two properties recorded now so stage 2/3 build on them knowingly:
   `APERTURE_BASE + k`. Multi-byte loads by the big-endian CPU see
   little-endian device registers swapped; the driver swaps, as on real
   Prometheus/AmigaPCI hardware.
-- **Byte-granular today.** The Zorro bus hands this card one byte per
-  access, so aperture traffic reaches the backend as 1-byte accesses.
-  Virtio's modern spec requires drivers to access fields with their
-  natural width, so **before stage 3 drives real ring registers through
-  this aperture, the card needs the bus's word/long accesses delivered
-  as sized accesses** (the `PciBackend` trait already carries widths;
-  the gap is bus-to-card plumbing, not the seam). Recorded here as a
-  known stage-3 prerequisite rather than discovered then.
+- **Sized accesses landed (stage 2).** A byte access still reaches the
+  backend as a single 1-byte access, unchanged from stage 1. A
+  naturally-aligned word or long access lying entirely within the
+  aperture now reaches the backend as a single access of that width
+  instead — `PciBridge::read_aperture_sized`/`write_aperture_sized`,
+  called from `MachineBus::read_word`/`read_long`/`write_word`/
+  `write_long` ahead of the ordinary byte-decomposition fallback that
+  still handles everything else (a misaligned aperture access, or any
+  access to the register file). Byte lanes are preserved at every width:
+  `PciBackend::mem_read`/`mem_write` traffic in little-endian-decoded
+  values, so the card byte-lane-swaps in both directions to reconcile
+  that with its own big-endian register presentation, and the result is
+  address-invariant — a sized access sees byte-for-byte what the
+  equivalent byte-by-byte accesses would have produced. Virtio's modern
+  spec requires drivers to access fields with their natural width; this
+  is what lets stage 3 do that once it drives real ring registers
+  through this aperture.
 
 Nothing in this increment allocates BAR addresses. Stage 2's library
 owns BAR assignment (proposal §10.1: 32-bit BARs, host assigner
@@ -232,20 +245,59 @@ not use it.
   unimplemented gap are discarded; reads of write-only slots
   (`CFG_OP`) return `0`.
 
-## 8. Why there is no interrupt on this card yet
+## 8. `INTx` onto `INT2` (stage 2)
 
-The same reasoning as `rtgboard` §8: a config cycle validates a few
-integers and calls a synchronous backend — the result is in
+Config cycles remain synchronous (§6, unchanged): the result is in
 `CFG_STATUS`/`CFG_DATA` before the instruction after the `CFG_OP` write
-executes, so there is nothing for INT2 to announce. The genuinely
-asynchronous thing on a PCI bus — a device raising INTx — belongs to
-stage 3 (virtio-net's ISR), routed per proposal §10.1's contract
-(INTA–D ORed onto INT2, level-triggered shared-server discipline,
-drivers poll their device). The reserved register slots at
-`0x1C`–`0x27` are where that lands, and the `PciBackend` trait can
-grow a defaulted `intx_level()`-style method without breaking existing
-implementations. Nothing else about this card's contract is expected
-to change for it.
+executes, so there was never anything for INT2 to announce *there*. But
+a PCI device's own `INTx` line is genuinely asynchronous — real hardware
+raises it whenever a function's own logic decides to, with no CPU access
+involved — and this card's stage-2 job is to make that visible to the
+guest and route it onto Zorro's shared `INT2` pin, per proposal §10.1's
+contract (INTA–D ORed onto INT2, level-triggered, shared-server
+discipline, drivers poll their device).
+
+**The backend side.** `PciBackend` gained a defaulted
+`intx_levels(&mut self) -> u32` (bits 0–3 = live INTA–INTD levels,
+default `0` so a real-ECAM implementation keeps compiling unchanged
+until its own board crate wires up whatever hardware INTx-status
+register its root complex exposes). `PciDevice` gained a defaulted
+`intx_level(&self) -> bool` (default `false` — every function-less
+device in this file, `HostBridge` and the virtio-net stub, keeps it).
+`VirtualPciBus::intx_levels` combines the two: for every device
+currently asserting, it reads that device's own `Interrupt Pin` config
+byte (offset `0x3D`; `0` = "uses no legacy interrupt pin", so it never
+contributes a bit regardless of assertion) and ORs a bit onto the line
+that pin names.
+
+**The card side.** `INTX_STATUS` is not stored state at all — every
+read recomputes `backend.intx_levels() | INTX_TEST`, live, the instant
+it is read. This is what "level-triggered" means concretely here: the
+register tracks the line's *current* condition, with no write-1-to-clear
+and no edge to lose, unlike `CFG_STATUS` just above it in the register
+map. `INTX_ENABLE` is the mask a driver sets (`Prm_AddIntServer`,
+`docs/pci-library.md` §5) to unmask the line(s) it services.
+`PciBridge::irq_pending()` is `(INTX_STATUS & INTX_ENABLE) != 0`,
+computed fresh on every call — `MachineBus` polls it after every
+register write that could change the answer (`INTX_ENABLE`/`INTX_TEST`
+writes, and, indirectly, a config-cycle write that changes a device's
+own asserted state) and once per host tick besides, because
+`PciBackend::intx_levels()` can change with no register write at all
+(stage 3's virtio-net ISR will raise/lower it from its own function
+logic). The chipset's own shared `INT2` (`PORTS`) latch is unaffected by
+this liveness, though: like every other card on this bus, it stays
+asserted until the driver acknowledges it via `INTREQ`, even once the
+underlying condition has already cleared.
+
+**`INTX_TEST`'s role.** With no device having real function logic yet
+(the virtio-net stub still answers all-ones behind every BAR — §2),
+there is nothing else that could exercise the INTA–D-to-INT2 wiring end
+to end before stage 3 exists. `INTX_TEST` is a diagnostic assertion
+source ORed into `INTX_STATUS` alongside whatever the backend itself
+reports, indistinguishable to a driver from a real device's line —
+deliberately: stage 3's virtio-net ISR replaces `INTX_TEST` as *a*
+source of asserted bits without changing anything else about the
+contract (`docs/pci-library.md` §6's probe-tool step 4).
 
 ## 9. Verification
 
@@ -257,20 +309,43 @@ every width, absent-`Bdf` master-abort all-ones, the BAR sizing probe
 exact (`0xFFFFC000` for 16 KiB), low BAR bits genuinely unwritable,
 COMMAND writable-bits mask, the four-capability virtio chain walked the
 way a real driver walks it, memory-space routing gated on COMMAND
-memory-enable, and containment math that cannot wrap at `u64::MAX`.
+memory-enable, containment math that cannot wrap at `u64::MAX`, and
+(stage 2) `VirtualPciBus::intx_levels`'s pin routing:
+`an_asserted_device_ors_its_line_onto_the_bit_its_pin_names`,
+`pin_zero_never_asserts_regardless_of_intx_level`,
+`multiple_devices_on_the_same_pin_or_onto_one_bit`,
+`deasserting_every_device_on_a_line_clears_it`.
 
 Unit tests in `pcibridge.rs` prove the guest-visible contract: full
 config read/write cycles through the register file at all three widths,
 BAR sizing through the card's own registers, every `CFG_OP` rejection
 case with `CFG_DATA` untouched and recovery after a `W1C` clear,
 absent-device cycles completing with all-ones, and the aperture
-round-trip against a device with a programmed BAR.
+round-trip against a device with a programmed BAR. Stage 2 adds:
+`version_reads_two`; `intx_enable_and_test_only_keep_their_low_nibble`;
+`intx_registers_only_expose_their_low_order_lane`;
+`intx_status_tracks_the_backend_live_with_no_latching` (assert, read,
+deassert, read again — no write-1-to-clear needed);
+`irq_pending_is_true_only_while_status_and_enable_are_both_nonzero`;
+and the sized-aperture proof —
+`a_sized_word_aperture_read_equals_the_byte_composed_read_as_one_backend_access`,
+`a_sized_word_aperture_read_reaches_the_backend_as_one_width_2_access`,
+`a_sized_long_aperture_read_reaches_the_backend_as_one_width_4_access`
+(the instrumented `TestMemDevice::read_count` is the positive evidence
+that exactly one sized backend access happened, not several byte-wide
+ones), and `a_sized_aperture_write_round_trips_through_the_swap`.
 
 Bus-level tests in `lib.rs` prove it on the real bus: enumeration
 walked entirely through `read_byte`/`write_byte` against the card's
 AUTOCONFIG-assigned placement, and coexistence — the full native chain
 (`hostblk`, `input`, `rtgboard`, `fastram`, `pktport`) placed
-byte-identically with and without this board attached last.
+byte-identically with and without this board attached last. Stage 2
+adds `pcibridge_intx_test_is_observable_through_the_register_file_and_
+raises_int2`: `INTX_TEST` asserted and deasserted purely through
+`read_byte`/`write_byte`, `INTX_STATUS` tracking it live, `INTX_ENABLE`
+gating `pending_irq_level` (reporting `2`, `PORTS`'s level), and the
+chipset's own `INTREQ` acknowledgement behaving exactly as it does for
+every other card sharing that line.
 
 Real-ROM verification (2026-09-15):
 `kickstart_3_2_2_a1200_configures_the_pcibridge_board`
@@ -290,16 +365,23 @@ alongside it.
 
 ## 10. What this increment does not include
 
-- **No `pci.library`, no 68k code of any kind.** Stage 2 builds the
-  Prometheus-compatible library against this contract; its
-  conformance obligations (the *actual* byte-swap presentation,
-  `GetDMAAddress()`, `CacheClearE()` mapping, INTx→INT2) are §10.1's,
-  not this document's.
+- **No `pci.library`, no 68k code of any kind, from this document's own
+  increment.** `docs/pci-library.md` is where the Prometheus-compatible
+  library that programs this contract (including stage 2's own
+  additions above) is specified; its conformance obligations (the
+  *actual* byte-swap presentation, `GetDMAAddress()`, `CacheClearE()`
+  mapping) are that document's, not this one's.
 - **No BAR allocation.** The shim proves sizing works; the library owns
   assignment policy (32-bit, below the Zorro III window).
-- **No interrupts** (§8) — reserved space exists, nothing is wired.
-- **No sized aperture accesses** (§5) — a recorded stage-3
-  prerequisite.
+- **Interrupts landed (§8), but only the routing, not a real source.**
+  `INTx`-to-`INT2` is fully wired and provable end to end via
+  `INTX_TEST`; no device in this virtual topology has real function
+  logic yet, so nothing *other than* `INTX_TEST` can assert a line until
+  stage 3.
+- **Sized aperture accesses landed (§5).** Word/long accesses lying
+  entirely within the aperture and naturally aligned now reach the
+  backend as a single sized access; everything else (misaligned, or the
+  register file) is unchanged from stage 1's byte-granular path.
 - **No virtio function.** The stub answers enumeration, capability
   walks and BAR probes; its BARs have no registers behind them. Rings,
   queues and the SANA-II driver are stage 3.
