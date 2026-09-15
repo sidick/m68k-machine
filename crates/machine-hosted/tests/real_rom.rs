@@ -1208,7 +1208,12 @@ fn kickstart_3_2_2_a1200_workbench_renders_through_the_rtgboard_card_driver() {
 /// pointer P96 soft-renders into rtgboard VRAM (see this test's own doc
 /// comment for why that colour, rather than the pointer's cream highlight
 /// or black outline, is the discriminant used here).
-fn red_pointer_pixels(width: u32, rgba: &[u8], expected_x: u32, expected_y: u32) -> Vec<(u32, u32)> {
+fn red_pointer_pixels(
+    width: u32,
+    rgba: &[u8],
+    expected_x: u32,
+    expected_y: u32,
+) -> Vec<(u32, u32)> {
     const RED: [u8; 4] = [239, 69, 66, 255];
     let mut found = Vec::new();
     for (i, px) in rgba.chunks(4).enumerate() {
@@ -1226,7 +1231,8 @@ fn red_pointer_pixels(width: u32, rgba: &[u8], expected_x: u32, expected_y: u32)
     );
     for &(x, y) in &found {
         assert!(
-            (expected_x..=expected_x + 15).contains(&x) && (expected_y..=expected_y + 15).contains(&y),
+            (expected_x..=expected_x + 15).contains(&x)
+                && (expected_y..=expected_y + 15).contains(&y),
             "expected every red pointer pixel within a 16x16 box at \
              ({expected_x}, {expected_y}), but found one at ({x}, {y}) -- this is exactly \
              the 'pointer stale-rendered somewhere else too' failure mode this helper \
