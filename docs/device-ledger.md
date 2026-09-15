@@ -300,17 +300,32 @@ A native input board carries its driver in its own AUTOCONFIG ROM via
 DiagArea injection, so unlike the RTG case it needs nothing installed on
 the guest — the "needs a file on disk" objection does not apply here.
 
-*Built so far (host side only):* a Zorro III AUTOCONFIG board (no
-DiagArea yet — see below), a bounded host-to-guest event queue (key
-down/up, button down/up, absolute pointer motion), the register
-interface (`docs/input-protocol.md`), an overflow policy that coalesces
-pointer motion so it can never crowd out a key/button event (a stuck-down
-key from a dropped key-up is far worse than a dropped keystroke), and the
-`machine-hosted --input-script` CLI flag for driving it deterministically
-in CI. **Not yet built:** the m68k driver and the DiagArea ROM that would
-let a guest actually see an event — this increment cannot demonstrate a
-keypress reaching Intuition, only exercise the card's host-side half end
-to end, the same honest limitation `hostblk`'s first increment stated.
+*Built, both halves:* host side, a Zorro III AUTOCONFIG board, a
+bounded host-to-guest event queue (key down/up, button down/up,
+absolute pointer motion, character events), the register interface
+(`docs/input-protocol.md`), an overflow policy that coalesces pointer
+motion so it can never crowd out a key/button event (a stuck-down key
+from a dropped key-up is far worse than a dropped keystroke), and the
+`machine-hosted --input-script` CLI flag for driving it
+deterministically in CI. Guest side, the m68k driver and DiagArea ROM
+(`m68k/input-rom/input-diagrom.s`): an INT2 interrupt server draining
+the card's queue into a software ring, a hand-built driver task doing
+the `IND_WRITEEVENT` injection the interrupt context cannot (the
+task/interrupt split, verified rather than assumed), and keymap-aware
+character typing via `MapANSI()`. Keypresses reach Intuition and the
+pointer visibly moves on a live Workbench screen —
+`docs/input-protocol.md` §13 is the driver retrospective recording
+where the contract held and where it needed correcting. (This
+paragraph previously described the driver as not yet built long after
+it existed — the second time this file went stale the same way; when a
+device's "not yet built" claim matters to a decision, check the
+`m68k/` directory before trusting it.)
+
+**Not yet proven:** the input driver against an RTG screen driven by
+`rtgboard.card` — `docs/rtgboard-protocol.md` §9's combination (P96
+soft-renders the pointer into rtgboard VRAM; Intuition routes clicks by
+pointer position). Both drivers now exist, so this combination test is
+unblocked.
 
 The design brief this card was built against initially described
 `IECLASS_POINTERPOS` as the class an external driver injects for absolute
