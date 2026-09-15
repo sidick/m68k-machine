@@ -22,8 +22,9 @@ checksum = "362f43b2e4bb6094407669798235df5a9747d182eb74ce5aba2d65605b5ba6b3"
 
 [[package]]
 name = "amiga-rom"
-version = "0.3.0"
-source = "git+https://github.com/sidick/amiga-rom-rs?rev=9e123e0572178999d24190dc1991ce255e384af6#9e123e0572178999d24190dc1991ce255e384af6"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39580e2229b854aa18d68695c03c07925d769eeda6a5838eb95bd14f6e71ef4e"
 
 [[package]]
 name = "anstream"
