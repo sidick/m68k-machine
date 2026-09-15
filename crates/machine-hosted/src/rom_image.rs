@@ -228,11 +228,30 @@ fn identity_lines(label: &str, normalized: &[u8]) -> Vec<String> {
     // something -- no noise on AROS or synthetic test images, which carry
     // none of the resident names this looks for.
     let hints = rom.machine_hints();
-    if hints.named_machine.is_some() || hints.has_pcmcia || hints.has_ncr_scsi {
-        let machine = hints
-            .named_machine
-            .map(|name| String::from_utf8_lossy(name).into_owned())
-            .unwrap_or_else(|| "unknown".to_string());
+    if hints.named_machine.is_some()
+        || hints.has_pcmcia
+        || hints.has_ncr_scsi
+        || hints.is_aros
+        || hints.target_platform.is_some()
+    {
+        // AROS first: `is_aros` (an `aros.library` resident) is the one
+        // signal the crate calls reliable rather than heuristic, and it
+        // already forces `has_pcmcia` false upstream -- AROS ships
+        // `card.resource` generically, so before the pinned fix this
+        // line reported "PCMCIA yes" on the vendored AROS pair this
+        // project boots routinely. `target_platform` is AROS's own
+        // documented `<platform>-<cpu>` port token (e.g. `amiga-m68k`).
+        let machine = if hints.is_aros {
+            match hints.target_platform {
+                Some(port) => format!("AROS ({})", String::from_utf8_lossy(port)),
+                None => "AROS".to_string(),
+            }
+        } else {
+            hints
+                .named_machine
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+                .unwrap_or_else(|| "unknown".to_string())
+        };
         lines.push(format!(
             "{label} ROM: machine hints: {machine}, PCMCIA {}, NCR SCSI {} (best-effort, from \
              resident names -- not a confirmed identification)",
@@ -452,12 +471,30 @@ mod tests {
     /// Regression guard: `Loader::normalize` must not mangle an image
     /// that is already in canonical byte order and not Cloanto-encoded --
     /// the AROS main ROM comes back byte-identical.
+    ///
+    /// Also pins the machine-hints AROS fix the `9e123e0` pin exists
+    /// for: under the previous rev this exact vendored image reported
+    /// "unknown, PCMCIA yes" (AROS ships `card.resource` generically,
+    /// which the earlier heuristic misread as a PCMCIA machine); the
+    /// fixed heuristic keys off the `aros.library` resident and the
+    /// documented `amiga-m68k` port token instead, and forces the
+    /// PCMCIA signal off. Verified against this fixture's actual
+    /// output, not assumed from upstream's own (different) AROS sample.
     #[test]
     fn aros_main_rom_passes_through_prepare_byte_identical() {
         let raw = fs::read(AROS_MAIN).expect("AROS main ROM is vendored in-repo (assets/aros/)");
         let original = raw.clone();
         let prepared = prepared_ok("main", raw, None);
         assert_eq!(prepared.bytes, original);
+        let joined = prepared.lines.join("\n");
+        assert!(
+            joined.contains("machine hints: AROS (amiga-m68k)"),
+            "expected the AROS identity (with its port token) in the hints line: {joined}"
+        );
+        assert!(
+            joined.contains("PCMCIA no"),
+            "PCMCIA yes on AROS is the exact false positive the pinned rev fixes: {joined}"
+        );
     }
 
     /// Same regression guard for the AROS *extended* ROM, which

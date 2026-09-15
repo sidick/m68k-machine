@@ -58,12 +58,16 @@ m68k = { git = "https://github.com/sidick/m68k-rs", rev = "5d27b8c083e1e6db6c135
 # fixture (Kickstart 1.3's doubled 512 KB layout: a 256 KB image mirrored
 # twice to fill a 512 KB EEPROM footprint) directly exercises. That fix
 # landed in `42ae522` ("Add KickRom::check_doubled and RomInfo::doubled_ok");
-# this pin sits one commit further, at `8ae26a4` ("Add machine
-# identification: machine_hints and identify/KnownRom"), which is a strict
-# superset -- it additionally carries `KickRom::machine_hints()` (best-
+# this pin sits two commits further, at `9e123e0`. The first (`8ae26a4`,
+# "Add machine identification") carries `KickRom::machine_hints()` (best-
 # effort machine-identity signals from resident names) and a checksum-
-# table `identify`/`KnownRom` lookup, neither required by this crate's own
-# use here but harmless to pick up along the way. Neither commit is
+# table `identify`/`KnownRom` lookup; the second (`9e123e0`) is a real
+# correctness fix to `machine_hints` this project would otherwise print
+# wrong output from: AROS ROMs ship `card.resource` generically, so the
+# earlier heuristic reported PCMCIA support on the vendored AROS pair
+# this project boots routinely -- fixed upstream by an `is_aros` signal
+# (an `aros.library` resident) that forces `has_pcmcia` false, plus the
+# AROS `target_platform` port token (`amiga-m68k`). None of these is
 # released to crates.io yet -- the release is being held back for further
 # work on the crate, unrelated to this project's needs -- so pinning by
 # `rev`, not `branch`, is the only way to get either fix at all right now.
@@ -73,4 +77,4 @@ m68k = { git = "https://github.com/sidick/m68k-rs", rev = "5d27b8c083e1e6db6c135
 # direction: there `crates.io` was deliberately avoided because no release
 # exists yet; here a release exists but is stale, so the fix has to come
 # from a specific commit past it instead.
-amiga-rom = { git = "https://github.com/sidick/amiga-rom-rs", rev = "8ae26a4a6c14365544666cbf92f416ec030d56ed" }
+amiga-rom = { git = "https://github.com/sidick/amiga-rom-rs", rev = "9e123e0572178999d24190dc1991ce255e384af6" }

@@ -23,7 +23,7 @@ checksum = "362f43b2e4bb6094407669798235df5a9747d182eb74ce5aba2d65605b5ba6b3"
 [[package]]
 name = "amiga-rom"
 version = "0.3.0"
-source = "git+https://github.com/sidick/amiga-rom-rs?rev=8ae26a4a6c14365544666cbf92f416ec030d56ed#8ae26a4a6c14365544666cbf92f416ec030d56ed"
+source = "git+https://github.com/sidick/amiga-rom-rs?rev=9e123e0572178999d24190dc1991ce255e384af6#9e123e0572178999d24190dc1991ce255e384af6"
 
 [[package]]
 name = "anstream"
