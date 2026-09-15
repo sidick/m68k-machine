@@ -177,6 +177,7 @@ only once `hostblk` no longer occupies one of them for the duration.
 | `input` native input card | permanent | — | never; the machine's own keyboard/mouse path |
 | `rtgboard` native RTG display board | permanent | — | never; ADR 0002's generic-board tier. P96 `.card` driver landed, first light verified — see below |
 | `pcibridge` PCI/ECAM shim | permanent | — | never; ADR 0005 — the machine's real bus surface, growing more load-bearing over time like AUTOCONFIG itself |
+| virtio-net function + `virtionet.device` | permanent, QEMU/KVM tier | — | never on that tier; ADR 0005 — under KVM this is the production NIC, not a stand-in. Bare-metal is ADR 0001's open question, not this one's |
 
 ### Permanent
 

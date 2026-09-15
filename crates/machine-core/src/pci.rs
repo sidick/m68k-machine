@@ -207,6 +207,24 @@ pub trait PciBackend {
     fn intx_levels(&mut self) -> u32 {
         0
     }
+
+    /// Advance whatever engine(s) this backend holds by one step against
+    /// `mem` -- ADR 0005 stage 3's seam for virtio-net's ring processing
+    /// (ring walks need a `&mut dyn GuestMemory` view of the guest's
+    /// address space, which config/mem-space accesses alone never carry).
+    /// Defaulted to a no-op so a real-ECAM implementation keeps compiling
+    /// unchanged: real hardware processes its own rings with no host-side
+    /// polling loop at all. Only [`VirtualPciBus`] overrides this, by
+    /// forwarding to every attached [`PciDevice`]'s own
+    /// [`PciDevice::tick`]. `MachineBus::tick` drives this exactly like
+    /// `hostblk`/`pktport`'s own engines (module docs on those cards): the
+    /// same lift-out-of-the-`Option`, call, put-back dance, because this
+    /// backend is itself borrowed for the bus's whole lifetime and cannot
+    /// be borrowed again while `self` (the `GuestMemory` view) is also
+    /// borrowed.
+    fn tick(&mut self, mem: &mut dyn crate::GuestMemory) {
+        let _ = mem;
+    }
 }
 
 /// One virtual device's config space and BAR-mapped function, as seen by
@@ -261,6 +279,15 @@ pub trait PciDevice {
     /// decide which of the four shared lines it ORs onto.
     fn intx_level(&self) -> bool {
         false
+    }
+
+    /// Advance this device's own engine by one step against `mem`, if it
+    /// has one -- see [`PciBackend::tick`]'s doc comment. Defaulted to a
+    /// no-op; every device in this file with no ring to walk
+    /// ([`HostBridge`], [`TestMemDevice`], [`IntxTestDevice`]) keeps the
+    /// default, and [`VirtioNetStub`] is the one device that overrides it.
+    fn tick(&mut self, mem: &mut dyn crate::GuestMemory) {
+        let _ = mem;
     }
 }
 
@@ -371,6 +398,16 @@ impl PciBackend for VirtualPciBus<'_> {
             }
         }
         levels
+    }
+
+    /// Forward to every attached device's own [`PciDevice::tick`] -- see
+    /// [`PciBackend::tick`]'s doc comment. Devices with nothing to do
+    /// (the default) simply ignore `mem`; only [`VirtioNetStub`] acts on
+    /// it.
+    fn tick(&mut self, mem: &mut dyn crate::GuestMemory) {
+        for slot in self.devices.iter_mut() {
+            slot.device.tick(mem);
+        }
     }
 }
 
@@ -802,25 +839,333 @@ mod virtio_cap {
     pub const F_NOTIFY_OFF_MULTIPLIER: usize = 16;
 }
 
-/// A config-space-complete, function-less modern virtio-net device (ADR
-/// 0005 stage 1's client-to-be for stage 3's SANA-II driver).
-///
-/// This struct implements exactly the config space and capability chain a
-/// real modern virtio-net device presents — enough for a driver's
-/// enumeration, capability walk and BAR sizing to succeed precisely as it
-/// would against real virtio-net. It implements **no queue, no register
-/// behaviour behind BAR0's four capability windows**: [`Self::bar_read`]/
-/// [`Self::bar_write`] are the trait's own default (all-ones/discard).
-/// Giving this device a working ring is stage 3's SANA-II driver
-/// increment's job, once `pci.library` (stage 2) exists to drive it
-/// through; this increment only needs the config-space surface real
-/// enumeration and capability-walk code exercises, per ADR 0005's own
-/// sequencing ("ECAM reachability first, host side").
-pub struct VirtioNetStub {
-    config: ConfigSpace,
+/// What backs a [`VirtioNetStub`]'s frame traffic: transmit-out and
+/// inject-in, borrowed the same way every other seam in this crate is
+/// (module docs, "No allocator, caller supplies everything") — not
+/// [`crate::pktport::PacketBackend`], deliberately: that trait's shape is
+/// a synchronous request/response descriptor (one `execute` call per
+/// guest doorbell, whole DOS-packet semantics baked into `args`), while a
+/// NIC's traffic is two independent, asynchronous directions with no
+/// request/response pairing at all -- a transmitted frame gets no reply,
+/// and a received frame arrives with no guest action having asked for it.
+/// Forcing that shape through `PacketBackend` would mean inventing a fake
+/// request just to get a call site, in both directions. What *is* reused
+/// is the seam's spirit: borrow, don't own, and let the frame data live
+/// in caller-supplied storage rather than anything this crate allocates.
+pub trait NetBackend {
+    /// Deliver one transmitted Ethernet frame to the host side, the
+    /// virtio-net header already stripped off by [`VirtioNetStub`].
+    /// `frame` borrows scratch storage owned by the stub and is valid
+    /// only for the duration of this call -- a backend that needs to keep
+    /// the bytes must copy them out itself.
+    fn transmit(&mut self, frame: &[u8]);
+
+    /// If a frame is waiting to be delivered to the guest, copy it into
+    /// `buf` (at least [`VirtioNetStub::MAX_ETH_PAYLOAD`] bytes) and
+    /// return its length; `None` if nothing is pending. [`VirtioNetStub`]
+    /// calls this only once it has already confirmed the guest has an
+    /// available receive descriptor, so a backend never needs to queue a
+    /// frame the guest cannot yet accept -- it can hold at most one ready
+    /// frame of its own accord (or more, if it chooses; this trait places
+    /// no limit on the backend's own queieing policy).
+    fn poll_receive(&mut self, buf: &mut [u8]) -> Option<usize>;
 }
 
-impl VirtioNetStub {
+/// A backend that transmits nothing anywhere and never has a frame to
+/// deliver -- `machine-hosted`'s current placeholder until a later stage
+/// wires real host network I/O behind [`NetBackend`] (this increment's
+/// brief is explicit: host-side virtqueue processing and the seam trait,
+/// not a host network path). Also handy for any test that only cares
+/// about config-space/BAR/queue-negotiation behaviour and never drives a
+/// real frame through the rings.
+#[derive(Default)]
+pub struct NullNetBackend;
+
+impl NetBackend for NullNetBackend {
+    fn transmit(&mut self, _frame: &[u8]) {}
+
+    fn poll_receive(&mut self, _buf: &mut [u8]) -> Option<usize> {
+        None
+    }
+}
+
+/// Split-virtqueue descriptor flags (module docs, virtio 1.x §2.7.5).
+mod desc_flags {
+    /// This descriptor continues via `next`.
+    pub const NEXT: u16 = 1;
+    /// Device-writable (a receive buffer), rather than device-readable
+    /// (a transmit buffer).
+    pub const WRITE: u16 = 2;
+    /// Indirect descriptor table -- not supported by this device; seeing
+    /// this flag on a chain fails that chain closed (module docs on
+    /// [`VirtioNetStub`]'s hostile-input posture).
+    pub const INDIRECT: u16 = 4;
+}
+
+/// Device-status bits (module docs, virtio 1.x §2.1).
+/// Recorded in full even though this device's own logic only ever tests
+/// `FEATURES_OK`/`DRIVER_OK`/`DEVICE_NEEDS_RESET` by name (the rest are
+/// simply passed through a `device_status` write verbatim) -- a reader
+/// checking this device's behaviour against the spec's status-bit table
+/// should find the whole table here, not just the bits this file happens
+/// to branch on.
+#[allow(dead_code)]
+mod status_bits {
+    pub const ACKNOWLEDGE: u8 = 1;
+    pub const DRIVER: u8 = 2;
+    pub const DRIVER_OK: u8 = 4;
+    pub const FEATURES_OK: u8 = 8;
+    pub const DEVICE_NEEDS_RESET: u8 = 64;
+    pub const FAILED: u8 = 128;
+}
+
+/// Byte offsets within the `COMMON_CFG` window (module docs) -- the
+/// modern virtio-pci `struct virtio_pci_common_cfg` layout (virtio 1.x
+/// §4.1.4.3), hand-encoded the same way [`virtio_cap`] hand-encodes the
+/// capability structures: this crate has no reason to trust the host
+/// compiler's layout for a byte format a guest driver parses field by
+/// field.
+mod common_off {
+    pub const DEVICE_FEATURE_SELECT: u32 = 0x00;
+    pub const DEVICE_FEATURE: u32 = 0x04;
+    pub const DRIVER_FEATURE_SELECT: u32 = 0x08;
+    pub const DRIVER_FEATURE: u32 = 0x0C;
+    pub const MSIX_CONFIG: u32 = 0x10;
+    pub const NUM_QUEUES: u32 = 0x12;
+    pub const DEVICE_STATUS: u32 = 0x14;
+    pub const CONFIG_GENERATION: u32 = 0x15;
+    pub const QUEUE_SELECT: u32 = 0x16;
+    pub const QUEUE_SIZE: u32 = 0x18;
+    pub const QUEUE_MSIX_VECTOR: u32 = 0x1A;
+    pub const QUEUE_ENABLE: u32 = 0x1C;
+    pub const QUEUE_NOTIFY_OFF: u32 = 0x1E;
+    pub const QUEUE_DESC: u32 = 0x20;
+    pub const QUEUE_DRIVER: u32 = 0x28;
+    pub const QUEUE_DEVICE: u32 = 0x30;
+    // Byte 0x38 and up, to `VirtioNetStub::COMMON_CFG_BAR_LEN`, is not
+    // named here at all: it reads `0`/discards writes via
+    // `VirtioNetStub::common_read_byte`/`common_write_byte`'s own
+    // catch-all arm, the same "reserved reads as zero" posture
+    // `ConfigSpace` takes.
+}
+
+/// One virtqueue's negotiated shape and ring position -- both queues
+/// (module docs, `VirtioNetStub::queues`) use this identically; only
+/// which queue index means rx vs tx differs.
+#[derive(Clone, Copy)]
+struct VirtQueueState {
+    /// Driver-selected size, `1..=`[`VirtioNetStub::QUEUE_SIZE_MAX`].
+    /// Never `0`: every place that could set it that way clamps instead
+    /// (module docs) -- so every modulo against `size` elsewhere in this
+    /// file is safe without an extra runtime check at the use site.
+    size: u16,
+    enabled: bool,
+    /// Guest address of the descriptor table.
+    desc_addr: u64,
+    /// Guest address of the avail (driver-owned) ring.
+    driver_addr: u64,
+    /// Guest address of the used (device-owned) ring.
+    device_addr: u64,
+    /// The avail ring index this device has consumed up to -- this
+    /// device's own shadow, compared against the guest's live
+    /// `avail.idx` each poll; never read back out of guest memory.
+    last_avail_idx: u16,
+    /// The next slot this device will publish into the used ring, and
+    /// the value written to `used.idx` after it does -- this device's
+    /// own shadow of state it, not the driver, owns.
+    used_idx: u16,
+}
+
+impl VirtQueueState {
+    /// The state every queue starts in, both at construction and after a
+    /// `device_status` reset-to-zero (module docs) -- `size` starts at
+    /// the device's maximum, matching a real device's queue_size
+    /// register before any driver has negotiated a smaller one down.
+    const fn reset(max_size: u16) -> Self {
+        Self {
+            size: max_size,
+            enabled: false,
+            desc_addr: 0,
+            driver_addr: 0,
+            device_addr: 0,
+            last_avail_idx: 0,
+            used_idx: 0,
+        }
+    }
+}
+
+/// Read a little-endian `u16` from guest memory at `addr`, or `None` if
+/// `addr` does not fit a 32-bit guest address or the span is not fully
+/// mapped -- see [`GuestMemory::ram_slice`]'s own contract. Free function
+/// (not a method) because both directions of ring-walking need it and
+/// neither needs `self`.
+fn gm_read_u16(mem: &dyn crate::GuestMemory, addr: u64) -> Option<u16> {
+    let a = u32::try_from(addr).ok()?;
+    let s = mem.ram_slice(a, 2)?;
+    Some(u16::from_le_bytes([s[0], s[1]]))
+}
+
+/// Write a little-endian `u16` into guest memory at `addr`, or `None` on
+/// the same failure conditions as [`gm_read_u16`] -- never partially
+/// written: [`GuestMemory::ram_slice_mut`] hands back the whole span or
+/// nothing.
+fn gm_write_u16(mem: &mut dyn crate::GuestMemory, addr: u64, value: u16) -> Option<()> {
+    let a = u32::try_from(addr).ok()?;
+    let s = mem.ram_slice_mut(a, 2)?;
+    s.copy_from_slice(&value.to_le_bytes());
+    Some(())
+}
+
+/// The `u32` equivalent of [`gm_write_u16`].
+fn gm_write_u32(mem: &mut dyn crate::GuestMemory, addr: u64, value: u32) -> Option<()> {
+    let a = u32::try_from(addr).ok()?;
+    let s = mem.ram_slice_mut(a, 4)?;
+    s.copy_from_slice(&value.to_le_bytes());
+    Some(())
+}
+
+fn lane_u16(value: u16, lane: u32) -> u8 {
+    value.to_le_bytes()[lane as usize]
+}
+
+fn merge_u16(value: u16, lane: u32, byte: u8) -> u16 {
+    let mut bytes = value.to_le_bytes();
+    bytes[lane as usize] = byte;
+    u16::from_le_bytes(bytes)
+}
+
+fn lane_u32_of(value: u32, lane: u32) -> u8 {
+    value.to_le_bytes()[lane as usize]
+}
+
+fn merge_u32_of(value: u32, lane: u32, byte: u8) -> u32 {
+    let mut bytes = value.to_le_bytes();
+    bytes[lane as usize] = byte;
+    u32::from_le_bytes(bytes)
+}
+
+fn lane_u64(value: u64, lane: u32) -> u8 {
+    value.to_le_bytes()[lane as usize]
+}
+
+fn merge_u64(value: u64, lane: u32, byte: u8) -> u64 {
+    let mut bytes = value.to_le_bytes();
+    bytes[lane as usize] = byte;
+    u64::from_le_bytes(bytes)
+}
+
+/// Free-standing (not associated) copies of the handful of
+/// [`VirtioNetStub`] constants used to size a fixed-length array, either
+/// as a struct field type or an array-repeat expression inside
+/// [`VirtioNetStub::new`]/[`VirtioNetStub::build_capability_chain`].
+/// Needed only because `rustc` currently refuses `Self::CONST` in an
+/// anonymous-constant position (an array length or repeat count) once
+/// the type has *any* generic parameter, lifetimes included -- a known
+/// limitation, not a semantic difference; [`VirtioNetStub`]'s own
+/// associated consts of the same names/values remain the public,
+/// documented API and are asserted equal to these in this module's own
+/// tests.
+const VNET_NUM_QUEUES: usize = 2;
+const VNET_HDR_LEN: usize = 12;
+const VNET_MAX_ETH_PAYLOAD: usize = 1514;
+const VNET_MAX_FRAME_TOTAL: usize = VNET_HDR_LEN + VNET_MAX_ETH_PAYLOAD;
+const VNET_CAPS_LEN: usize = virtio_cap::BASIC_LEN as usize * 3 + virtio_cap::NOTIFY_LEN as usize;
+
+/// A config-space-complete, functional modern virtio-net device (ADR 0005
+/// stage 3): the enumeration/capability/BAR-sizing surface stage 1 built,
+/// now with real register behaviour and virtqueue processing behind
+/// BAR0's four capability windows.
+///
+/// # BAR0 region map
+///
+/// The four capability windows (module docs on [`Self::COMMON_CFG_BAR_OFFSET`]
+/// and siblings) exactly tile all `0x4000` bytes of BAR0 -- there is no
+/// unmapped middle space to fall back to all-ones for, unlike a device
+/// with room to grow:
+///
+/// | BAR0 offset | Region | Behaviour |
+/// |---|---|---|
+/// | `0x0000..0x1000` | `COMMON_CFG` | feature negotiation, status, per-queue registers (below) |
+/// | `0x1000..0x2000` | `NOTIFY` | write-only, content ignored, any offset in range accepted; reads `0` |
+/// | `0x2000..0x3000` | `ISR` | byte `0` is the read-to-clear ISR status; everything else reads `0` |
+/// | `0x3000..0x4000` | `DEVICE_CFG` | bytes `0..6` are the MAC (below); everything else reads `0`, writes discarded |
+///
+/// A BAR other than `0`, or an offset beyond `0x4000` -- unreachable in
+/// practice since [`ConfigSpace::bar_window`] already bounds every access
+/// to BAR0's own `0x4000`-byte window -- keeps this trait's all-ones
+/// default, same as stage 1.
+///
+/// # Feature negotiation and the reset dance
+///
+/// Offers exactly `VIRTIO_F_VERSION_1` (bit 32) and `VIRTIO_NET_F_MAC`
+/// (bit 5); nothing else. `device_status` writes implement the spec's
+/// reset semantics (`0` resets everything, including every queue back to
+/// disabled/max-size) and this device's own fail-closed negotiation
+/// guard: a driver that sets `FEATURES_OK` without having acked
+/// `VIRTIO_F_VERSION_1` gets `FEATURES_OK` silently cleared right back
+/// out of what it wrote (spec 3.1.1's own "re-read and check" contract:
+/// the driver discovers the refusal by reading the register back, not
+/// through any side channel), and a driver that sets `DRIVER_OK` while
+/// `FEATURES_OK` is not (yet) set gets `DRIVER_OK` stripped back out and
+/// [`status_bits::DEVICE_NEEDS_RESET`] set instead -- this platform's
+/// house style is silent failure, but a stuck, narratable status
+/// register beats a device that quietly pretends to be running.
+///
+/// # Virtqueues: two, split, bounded
+///
+/// `num_queues` is fixed at [`Self::NUM_QUEUES`] (`2`): queue `0` is rx,
+/// queue `1` is tx, matching virtio-net's own convention. Every
+/// guest-controlled ring field (descriptor/avail/used addresses,
+/// lengths, `next` indices, ring positions) is walked with checked
+/// arithmetic and validated against the negotiated queue size before
+/// use; anything that fails validation aborts just that poll and sets
+/// [`status_bits::DEVICE_NEEDS_RESET`] (module docs above) rather than
+/// panicking, indexing out of bounds, or wrapping into a false match --
+/// see [`Self::read_desc`], [`Self::process_tx`], [`Self::process_rx`].
+/// A descriptor chain is bounded to at most `size` links (a chain whose
+/// `next` fields cycle back on themselves, however "validly", cannot
+/// loop forever).
+///
+/// Frames are staged through two fixed-size buffers
+/// ([`Self::MAX_FRAME_TOTAL`]/[`Self::MAX_ETH_PAYLOAD`]) rather than
+/// anything allocated -- this crate has no allocator (module docs at the
+/// top of this file).
+pub struct VirtioNetStub<'a> {
+    config: ConfigSpace,
+    backend: &'a mut dyn NetBackend,
+
+    device_feature_select: u32,
+    driver_feature_select: u32,
+    /// Bits the driver has acked, masked down to [`Self::OFFERED_FEATURES`]
+    /// at the moment they are written (module docs) -- so this is always
+    /// a subset of what was offered, never something to re-check later.
+    acked_features: u64,
+    device_status: u8,
+    queue_select: u16,
+    queues: [VirtQueueState; VNET_NUM_QUEUES],
+
+    /// ISR status byte: bit 0 set when a used buffer was added since the
+    /// last read. Read-to-clear (module docs).
+    isr_status: u8,
+
+    /// Shared scratch for one frame at a time, header included -- reused
+    /// by both directions since `tick` runs them one after the other,
+    /// never concurrently (module docs, [`Self::MAX_FRAME_TOTAL`]).
+    scratch: [u8; VNET_MAX_FRAME_TOTAL],
+    /// Holds one frame handed back by [`NetBackend::poll_receive`],
+    /// header-less (module docs, [`Self::MAX_ETH_PAYLOAD`]).
+    rx_frame_buf: [u8; VNET_MAX_ETH_PAYLOAD],
+
+    /// Host-side introspection counters, not registers -- the same
+    /// "count it, don't invent a register for it yet" posture
+    /// `pktport::Pktport`'s own drop counters take.
+    tx_frames: u32,
+    tx_dropped: u32,
+    rx_frames: u32,
+    rx_dropped: u32,
+}
+
+impl<'a> VirtioNetStub<'a> {
     pub const VENDOR_ID: u16 = 0x1AF4;
     /// Modern (non-transitional) virtio-net device ID.
     pub const DEVICE_ID: u16 = 0x1041;
@@ -849,8 +1194,6 @@ impl VirtioNetStub {
     const CAP_NOTIFY_OFFSET: u16 = Self::CAP_COMMON_OFFSET + virtio_cap::BASIC_LEN as u16;
     const CAP_ISR_OFFSET: u16 = Self::CAP_NOTIFY_OFFSET + virtio_cap::NOTIFY_LEN as u16;
     const CAP_DEVICE_OFFSET: u16 = Self::CAP_ISR_OFFSET + virtio_cap::BASIC_LEN as u16;
-    const CAPS_END: u16 = Self::CAP_DEVICE_OFFSET + virtio_cap::BASIC_LEN as u16;
-    const CAPS_LEN: usize = (Self::CAPS_END - Self::CAP_COMMON_OFFSET) as usize;
 
     /// BAR0-relative windows for the four capability types (offset,
     /// length), per this file's brief.
@@ -867,7 +1210,77 @@ impl VirtioNetStub {
     const DEVICE_CFG_BAR_OFFSET: u32 = 0x3000;
     const DEVICE_CFG_BAR_LEN: u32 = 0x1000;
 
-    pub fn new() -> Self {
+    /// rx is queue `0`, tx is queue `1` -- virtio-net's own convention,
+    /// and what [`common_off::NUM_QUEUES`] reports.
+    const NUM_QUEUES: u16 = 2;
+    const QUEUE_RX: usize = 0;
+    const QUEUE_TX: usize = 1;
+    /// The largest queue size a driver may negotiate down from, and what
+    /// `queue_size` reads back as before any driver has written a
+    /// smaller value -- comfortably above any real SANA-II driver's
+    /// working set, and small enough that this device's descriptor-chain
+    /// loop bound ([`Self::read_desc`]) stays cheap.
+    pub const QUEUE_SIZE_MAX: u16 = 256;
+    /// A "no vector" MSI-X value -- this device has no MSI-X capability
+    /// at all (module docs, `INTERRUPT_PIN`), so [`common_off::MSIX_CONFIG`]/
+    /// [`common_off::QUEUE_MSIX_VECTOR`] always read this and ignore
+    /// writes; a spec-compliant driver never touches them for a device
+    /// with no MSI-X capability to begin with.
+    const NO_VECTOR: u16 = 0xFFFF;
+
+    /// `VIRTIO_F_VERSION_1`, bit 32 of the 64-bit feature space (virtio
+    /// 1.x §6): required of every non-transitional device, and the one
+    /// bit [`Self::write_device_status`]'s `FEATURES_OK` guard actually
+    /// checks for.
+    const F_VERSION_1: u64 = 1 << 32;
+    /// `VIRTIO_NET_F_MAC`, bit 5 (virtio 1.x §5.1.3): the device config
+    /// carries a MAC and the driver should use it rather than generating
+    /// its own.
+    const F_MAC: u64 = 1 << 5;
+    /// Exactly the two feature bits this device offers -- nothing else,
+    /// per this increment's brief ("Offer `VIRTIO_F_VERSION_1` and
+    /// `VIRTIO_NET_F_MAC`"). Every driver-feature-write path masks
+    /// against this, so a driver acking a bit this device never offered
+    /// simply never sticks (module docs on [`Self::acked_features`]).
+    const OFFERED_FEATURES: u64 = Self::F_VERSION_1 | Self::F_MAC;
+
+    /// This device's locally-administered MAC: `02` in the first octet's
+    /// low nibble marks it locally administered and unicast (IEEE 802-2014
+    /// §8.2.2), never a real assigned OUI -- the deliberate choice every
+    /// virtual NIC in this position makes. The remaining bytes spell nothing
+    /// significant; chosen once and fixed so a guest driver sees the same
+    /// address across every run.
+    pub const MAC: [u8; 6] = [0x02, 0x6d, 0x36, 0x4b, 0x00, 0x01];
+
+    /// The largest Ethernet payload (header/FCS excluded) this device
+    /// stages at once -- the standard 1500-byte MTU plus the 14-byte
+    /// Ethernet header (module docs, "Frames are staged through two
+    /// fixed-size buffers"). No jumbo frames, no `VIRTIO_NET_F_MTU`
+    /// offered, so a conformant driver never hands this device anything
+    /// larger.
+    pub const MAX_ETH_PAYLOAD: usize = 1514;
+    /// Bytes in a modern (no legacy `num_buffers`-absent variant) virtio-net
+    /// packet header (virtio 1.x §5.1.6.1, `struct virtio_net_hdr`, no
+    /// merge-buffers layout since that feature is not offered here so the
+    /// header stays the base 10 bytes... except this device advertises no
+    /// `VIRTIO_NET_F_MRG_RXBUF` either, yet still writes `num_buffers` at
+    /// bytes 10-11 as `1`: real devices that don't negotiate merged
+    /// buffers still send the 10-byte legacy-shaped header. This device
+    /// instead always uses the 12-byte modern layout with `num_buffers`
+    /// fixed at `1` and expects the same from a transmitting driver,
+    /// documented explicitly here since it is this device's own choice,
+    /// not a spec-mandated one -- stage 3's driver-side guest code must
+    /// match it exactly (see this file's own report to its caller).
+    pub const VIRTIO_NET_HDR_LEN: usize = 12;
+    /// The largest single frame (header included) this device stages --
+    /// [`Self::VIRTIO_NET_HDR_LEN`] + [`Self::MAX_ETH_PAYLOAD`].
+    pub const MAX_FRAME_TOTAL: usize = Self::VIRTIO_NET_HDR_LEN + Self::MAX_ETH_PAYLOAD;
+
+    /// Build a device over a caller-owned [`NetBackend`] -- borrowed, not
+    /// boxed, the same shape every other seam in this crate borrows its
+    /// backing store (module docs, "No allocator, caller supplies
+    /// everything").
+    pub fn new(backend: &'a mut dyn NetBackend) -> Self {
         let mut config = ConfigSpace::new(
             ConfigSpaceIdentity {
                 vendor_id: Self::VENDOR_ID,
@@ -893,14 +1306,33 @@ impl VirtioNetStub {
         );
         let caps = Self::build_capability_chain();
         config.install_capabilities(Self::CAP_COMMON_OFFSET, &caps);
-        Self { config }
+        Self {
+            config,
+            backend,
+            device_feature_select: 0,
+            driver_feature_select: 0,
+            acked_features: 0,
+            device_status: 0,
+            queue_select: 0,
+            queues: [
+                VirtQueueState::reset(Self::QUEUE_SIZE_MAX),
+                VirtQueueState::reset(Self::QUEUE_SIZE_MAX),
+            ],
+            isr_status: 0,
+            scratch: [0u8; VNET_MAX_FRAME_TOTAL],
+            rx_frame_buf: [0u8; VNET_MAX_ETH_PAYLOAD],
+            tx_frames: 0,
+            tx_dropped: 0,
+            rx_frames: 0,
+            rx_dropped: 0,
+        }
     }
 
     /// Hand-encode the four `virtio_pci_cap` structures at `0x40..0x84`
     /// (module docs, `virtio_cap`): little-endian throughout, `cap_next`
     /// chaining `COMMON_CFG -> NOTIFY_CFG -> ISR_CFG -> DEVICE_CFG -> 0`.
-    fn build_capability_chain() -> [u8; Self::CAPS_LEN] {
-        let mut buf = [0u8; Self::CAPS_LEN];
+    fn build_capability_chain() -> [u8; VNET_CAPS_LEN] {
+        let mut buf = [0u8; VNET_CAPS_LEN];
         Self::write_cap(
             &mut buf,
             Self::CAP_COMMON_OFFSET,
@@ -977,15 +1409,681 @@ impl VirtioNetStub {
                 .copy_from_slice(&mult.to_le_bytes());
         }
     }
-}
 
-impl Default for VirtioNetStub {
-    fn default() -> Self {
-        Self::new()
+    /// Whether this device is currently in a state where a driver's next
+    /// action must be a `device_status` reset -- [`Self::tick`] refuses
+    /// to touch the rings while this is true, the same "stop, don't
+    /// pretend" posture the register write path already takes.
+    fn needs_reset(&self) -> bool {
+        self.device_status & status_bits::DEVICE_NEEDS_RESET != 0
+    }
+
+    /// Fail this poll closed: the narratable posture this file's brief
+    /// asks for, in place of this platform's usual silent-failure norm
+    /// (module docs on [`Self`]). Idempotent -- setting the bit twice is
+    /// harmless.
+    fn fail_closed(&mut self) {
+        self.device_status |= status_bits::DEVICE_NEEDS_RESET;
+    }
+
+    /// Return every piece of negotiable state to its power-on default --
+    /// `device_status` write of `0` (virtio 1.x §2.1: "the driver...
+    /// should re-initialize the device") and this struct's own
+    /// construction-time state alike.
+    fn reset(&mut self) {
+        self.device_feature_select = 0;
+        self.driver_feature_select = 0;
+        self.acked_features = 0;
+        self.device_status = 0;
+        self.queue_select = 0;
+        self.queues = [
+            VirtQueueState::reset(Self::QUEUE_SIZE_MAX),
+            VirtQueueState::reset(Self::QUEUE_SIZE_MAX),
+        ];
+        self.isr_status = 0;
+        // Frame counters are host-side introspection, not guest-visible
+        // state -- deliberately not reset, the same
+        // `pktport::Pktport::doorbell_overflow` posture.
+    }
+
+    /// Queue `idx`'s size, clamped to `1..=QUEUE_SIZE_MAX` -- the value
+    /// every ring-math use site sees, and what a `queue_size` register
+    /// read reports, even if the raw stored value is momentarily `0` or
+    /// out of range mid-write (module docs on [`Self::common_write_byte`]'s
+    /// `QUEUE_SIZE` arm). Never `0`, so every modulo against it
+    /// elsewhere in this file is safe.
+    fn effective_queue_size(&self, idx: usize) -> u16 {
+        self.queues[idx].size.clamp(1, Self::QUEUE_SIZE_MAX)
+    }
+
+    /// The currently `queue_select`-ed queue's index, or `None` if the
+    /// driver has selected past [`Self::NUM_QUEUES`] -- every
+    /// queue-specific register read/write goes through this and treats
+    /// `None` as "reads 0, discards writes", the same fail-closed
+    /// posture an out-of-range `Bdf` gets elsewhere in this file.
+    fn selected_queue(&self) -> Option<usize> {
+        let idx = self.queue_select as usize;
+        (idx < Self::NUM_QUEUES as usize).then_some(idx)
+    }
+
+    /// The 32-bit window of [`Self::OFFERED_FEATURES`] named by
+    /// `device_feature_select`, or `0` for any select value beyond `0`/`1`
+    /// -- there are no more feature bits to report past bit 63, and this
+    /// device only ever offers bits within the first two 32-bit windows
+    /// anyway.
+    fn device_feature_window(&self) -> u32 {
+        match self.device_feature_select {
+            0 => Self::OFFERED_FEATURES as u32,
+            1 => (Self::OFFERED_FEATURES >> 32) as u32,
+            _ => 0,
+        }
+    }
+
+    /// The 32-bit window of [`Self::acked_features`] named by
+    /// `driver_feature_select`, the read-back half of feature negotiation.
+    fn driver_feature_window(&self) -> u32 {
+        match self.driver_feature_select {
+            0 => self.acked_features as u32,
+            1 => (self.acked_features >> 32) as u32,
+            _ => 0,
+        }
+    }
+
+    /// Merge one byte into `driver_feature`'s currently-selected 32-bit
+    /// window of [`Self::acked_features`], masking the result against
+    /// [`Self::OFFERED_FEATURES`] so a driver acking a bit this device
+    /// never offered simply never sticks (module docs on
+    /// [`Self::acked_features`]). A no-op once `FEATURES_OK` is set
+    /// (virtio 1.x: feature negotiation is over at that point) or while
+    /// `driver_feature_select` names a window past bit 63.
+    fn merge_driver_feature_byte(&mut self, lane: u32, byte: u8) {
+        if self.device_status & status_bits::FEATURES_OK != 0 {
+            return;
+        }
+        let sel = self.driver_feature_select;
+        if sel > 1 {
+            return;
+        }
+        let shift = 32 * sel as u64;
+        let window = (self.acked_features >> shift) as u32;
+        let merged = merge_u32_of(window, lane, byte);
+        let mask = 0xFFFF_FFFFu64 << shift;
+        self.acked_features = (self.acked_features & !mask)
+            | (((merged as u64) << shift) & Self::OFFERED_FEATURES & mask);
+    }
+
+    /// Apply a `device_status` write: reset-to-zero (module docs,
+    /// [`Self::reset`]), or the negotiation guard described in [`Self`]'s
+    /// own doc comment ("Feature negotiation and the reset dance").
+    fn write_device_status(&mut self, value: u8) {
+        if value == 0 {
+            self.reset();
+            return;
+        }
+        let mut new_status = value;
+
+        let requesting_features_ok = new_status & status_bits::FEATURES_OK != 0;
+        let already_features_ok = self.device_status & status_bits::FEATURES_OK != 0;
+        if requesting_features_ok
+            && !already_features_ok
+            && self.acked_features & Self::F_VERSION_1 == 0
+        {
+            // Refuse: strip FEATURES_OK back out. The driver discovers
+            // this by reading device_status back, exactly as spec 3.1.1
+            // describes -- no separate error channel invented here.
+            new_status &= !status_bits::FEATURES_OK;
+        }
+
+        if new_status & status_bits::DRIVER_OK != 0 && new_status & status_bits::FEATURES_OK == 0 {
+            // Refuse DRIVER_OK without FEATURES_OK: fail closed with a
+            // narratable, stuck status register rather than silently
+            // pretending to run (module docs, [`Self`]).
+            new_status = (new_status & !status_bits::DRIVER_OK) | status_bits::DEVICE_NEEDS_RESET;
+        }
+
+        self.device_status = new_status;
+    }
+
+    /// Read one byte of the `COMMON_CFG` window at `rel` (module docs,
+    /// [`common_off`]). Reserved/out-of-range bytes read `0`.
+    fn common_read_byte(&self, rel: u32) -> u8 {
+        match rel {
+            common_off::DEVICE_FEATURE_SELECT..=3 => lane_u32_of(
+                self.device_feature_select,
+                rel - common_off::DEVICE_FEATURE_SELECT,
+            ),
+            common_off::DEVICE_FEATURE..=7 => lane_u32_of(
+                self.device_feature_window(),
+                rel - common_off::DEVICE_FEATURE,
+            ),
+            common_off::DRIVER_FEATURE_SELECT..=11 => lane_u32_of(
+                self.driver_feature_select,
+                rel - common_off::DRIVER_FEATURE_SELECT,
+            ),
+            common_off::DRIVER_FEATURE..=15 => lane_u32_of(
+                self.driver_feature_window(),
+                rel - common_off::DRIVER_FEATURE,
+            ),
+            common_off::MSIX_CONFIG..=17 => {
+                lane_u16(Self::NO_VECTOR, rel - common_off::MSIX_CONFIG)
+            }
+            common_off::NUM_QUEUES..=19 => lane_u16(Self::NUM_QUEUES, rel - common_off::NUM_QUEUES),
+            common_off::DEVICE_STATUS => self.device_status,
+            common_off::CONFIG_GENERATION => 0, // device config never changes post-construction
+            common_off::QUEUE_SELECT..=23 => {
+                lane_u16(self.queue_select, rel - common_off::QUEUE_SELECT)
+            }
+            common_off::QUEUE_SIZE..=25 => {
+                let size = self
+                    .selected_queue()
+                    .map_or(0, |i| self.effective_queue_size(i));
+                lane_u16(size, rel - common_off::QUEUE_SIZE)
+            }
+            common_off::QUEUE_MSIX_VECTOR..=27 => {
+                lane_u16(Self::NO_VECTOR, rel - common_off::QUEUE_MSIX_VECTOR)
+            }
+            common_off::QUEUE_ENABLE..=29 => {
+                let enable = self
+                    .selected_queue()
+                    .is_some_and(|i| self.queues[i].enabled);
+                lane_u16(enable as u16, rel - common_off::QUEUE_ENABLE)
+            }
+            common_off::QUEUE_NOTIFY_OFF..=31 => {
+                // One `notify_off_multiplier`-sized slot per queue index
+                // -- see this device's report on notify semantics.
+                let off = self.selected_queue().map_or(0, |i| i as u16);
+                lane_u16(off, rel - common_off::QUEUE_NOTIFY_OFF)
+            }
+            common_off::QUEUE_DESC..=39 => {
+                let addr = self
+                    .selected_queue()
+                    .map_or(0, |i| self.queues[i].desc_addr);
+                lane_u64(addr, rel - common_off::QUEUE_DESC)
+            }
+            common_off::QUEUE_DRIVER..=47 => {
+                let addr = self
+                    .selected_queue()
+                    .map_or(0, |i| self.queues[i].driver_addr);
+                lane_u64(addr, rel - common_off::QUEUE_DRIVER)
+            }
+            common_off::QUEUE_DEVICE..=55 => {
+                let addr = self
+                    .selected_queue()
+                    .map_or(0, |i| self.queues[i].device_addr);
+                lane_u64(addr, rel - common_off::QUEUE_DEVICE)
+            }
+            _ => 0,
+        }
+    }
+
+    /// Write one byte of the `COMMON_CFG` window at `rel`, same contract
+    /// as [`Self::common_read_byte`]. Read-only fields
+    /// (`device_feature`, `num_queues`, `config_generation`,
+    /// `queue_notify_off`) and out-of-range bytes discard the write.
+    fn common_write_byte(&mut self, rel: u32, byte: u8) {
+        match rel {
+            common_off::DEVICE_FEATURE_SELECT..=3 => {
+                self.device_feature_select = merge_u32_of(
+                    self.device_feature_select,
+                    rel - common_off::DEVICE_FEATURE_SELECT,
+                    byte,
+                );
+            }
+            common_off::DRIVER_FEATURE_SELECT..=11 => {
+                self.driver_feature_select = merge_u32_of(
+                    self.driver_feature_select,
+                    rel - common_off::DRIVER_FEATURE_SELECT,
+                    byte,
+                );
+            }
+            common_off::DRIVER_FEATURE..=15 => {
+                self.merge_driver_feature_byte(rel - common_off::DRIVER_FEATURE, byte);
+            }
+            common_off::MSIX_CONFIG..=17 => {} // no MSI-X capability; ignored
+            common_off::DEVICE_STATUS => self.write_device_status(byte),
+            common_off::QUEUE_SELECT..=23 => {
+                self.queue_select =
+                    merge_u16(self.queue_select, rel - common_off::QUEUE_SELECT, byte);
+            }
+            common_off::QUEUE_SIZE..=25 => {
+                if let Some(i) = self.selected_queue() {
+                    if !self.queues[i].enabled {
+                        // Not clamped here: a 2-byte write merges one
+                        // byte at a time (this function's own contract),
+                        // and clamping mid-merge would corrupt the
+                        // still-incomplete value the *other* lane is
+                        // about to land on top of. Clamped instead at
+                        // every point this value is actually used --
+                        // [`Self::effective_queue_size`] -- so an
+                        // in-flight two-byte write is never observed
+                        // half-clamped.
+                        self.queues[i].size =
+                            merge_u16(self.queues[i].size, rel - common_off::QUEUE_SIZE, byte);
+                    }
+                }
+            }
+            common_off::QUEUE_MSIX_VECTOR..=27 => {} // no MSI-X capability; ignored
+            common_off::QUEUE_ENABLE..=29 => {
+                // Only the low byte (bit 0) is defined; only 0 -> 1 is a
+                // legal transition (virtio 1.x §4.1.4.3.2: a driver must
+                // not clear queue_enable except via a full device reset).
+                if rel == common_off::QUEUE_ENABLE {
+                    if let Some(i) = self.selected_queue() {
+                        if byte & 1 != 0 && !self.queues[i].enabled {
+                            self.queues[i].enabled = true;
+                            self.queues[i].last_avail_idx = 0;
+                            self.queues[i].used_idx = 0;
+                        }
+                    }
+                }
+            }
+            common_off::QUEUE_DESC..=39 => {
+                if let Some(i) = self.selected_queue() {
+                    if !self.queues[i].enabled {
+                        self.queues[i].desc_addr =
+                            merge_u64(self.queues[i].desc_addr, rel - common_off::QUEUE_DESC, byte);
+                    }
+                }
+            }
+            common_off::QUEUE_DRIVER..=47 => {
+                if let Some(i) = self.selected_queue() {
+                    if !self.queues[i].enabled {
+                        self.queues[i].driver_addr = merge_u64(
+                            self.queues[i].driver_addr,
+                            rel - common_off::QUEUE_DRIVER,
+                            byte,
+                        );
+                    }
+                }
+            }
+            common_off::QUEUE_DEVICE..=55 => {
+                if let Some(i) = self.selected_queue() {
+                    if !self.queues[i].enabled {
+                        self.queues[i].device_addr = merge_u64(
+                            self.queues[i].device_addr,
+                            rel - common_off::QUEUE_DEVICE,
+                            byte,
+                        );
+                    }
+                }
+            }
+            _ => {} // includes every read-only field: DEVICE_FEATURE,
+                    // NUM_QUEUES, CONFIG_GENERATION, QUEUE_NOTIFY_OFF
+        }
+    }
+
+    /// Compose a `width`-byte read of the `COMMON_CFG` window at `rel`,
+    /// the same byte-lane composition [`ConfigSpace::read`] uses.
+    fn common_cfg_read(&self, rel: u32, width: AccessWidth) -> u32 {
+        let mut value = 0u32;
+        for lane in 0..width.bytes() {
+            value |= (self.common_read_byte(rel + lane) as u32) << (8 * lane);
+        }
+        value
+    }
+
+    /// The `COMMON_CFG` write equivalent of [`Self::common_cfg_read`].
+    fn common_cfg_write(&mut self, rel: u32, width: AccessWidth, value: u32) {
+        for lane in 0..width.bytes() {
+            let byte = (value >> (8 * lane)) as u8;
+            self.common_write_byte(rel + lane, byte);
+        }
+    }
+
+    /// Mark a used buffer added: ISR bit 0 set, which is also exactly
+    /// [`PciDevice::intx_level`]'s condition -- see this device's doc
+    /// comment on `INTx`.
+    fn raise_used_irq(&mut self) {
+        self.isr_status |= 0x1;
+    }
+
+    /// Read one descriptor-table entry (virtio 1.x §2.7.5, 16 bytes:
+    /// `addr:u64, len:u32, flags:u16, next:u16`) at table `desc_addr`,
+    /// index `idx`. `None` on anything hostile: `idx >= size` (never
+    /// masked/modulo'd -- a descriptor *index* is not a ring position),
+    /// the entry's own address arithmetic overflowing, or the entry's
+    /// 16 bytes not lying entirely within mapped guest RAM.
+    fn read_desc(
+        mem: &dyn crate::GuestMemory,
+        desc_addr: u64,
+        size: u16,
+        idx: u16,
+    ) -> Option<(u64, u32, u16, u16)> {
+        if idx >= size {
+            return None;
+        }
+        let entry_addr = desc_addr.checked_add(16u64.checked_mul(idx as u64)?)?;
+        let a = u32::try_from(entry_addr).ok()?;
+        let s = mem.ram_slice(a, 16)?;
+        let addr = u64::from_le_bytes(s[0..8].try_into().ok()?);
+        let len = u32::from_le_bytes(s[8..12].try_into().ok()?);
+        let flags = u16::from_le_bytes(s[12..14].try_into().ok()?);
+        let next = u16::from_le_bytes(s[14..16].try_into().ok()?);
+        Some((addr, len, flags, next))
+    }
+
+    /// The guest address of avail ring position `pos` (module docs on
+    /// [`VirtQueueState::last_avail_idx`]) -- `driver_addr + 4 + 2*pos`,
+    /// checked throughout since `driver_addr` is guest-controlled.
+    fn avail_ring_slot_addr(driver_addr: u64, pos: u16) -> Option<u64> {
+        driver_addr
+            .checked_add(4)?
+            .checked_add(2u64.checked_mul(pos as u64)?)
+    }
+
+    /// The guest address of used ring element `pos` -- `device_addr + 4 +
+    /// 8*pos`, same checked-arithmetic posture as
+    /// [`Self::avail_ring_slot_addr`].
+    fn used_ring_elem_addr(device_addr: u64, pos: u16) -> Option<u64> {
+        device_addr
+            .checked_add(4)?
+            .checked_add(8u64.checked_mul(pos as u64)?)
+    }
+
+    /// Publish one used-buffer completion for queue `qidx`: the used
+    /// element (`id`, `len`) at this device's own shadow `used_idx`, then
+    /// bump `used.idx` in guest memory and raise the ISR/`INTx`. `false`
+    /// (never a panic) on any hostile `device_addr`/arithmetic failure --
+    /// the caller treats that exactly like every other ring failure
+    /// (module docs, [`Self::fail_closed`]).
+    fn complete_used(
+        &mut self,
+        mem: &mut dyn crate::GuestMemory,
+        qidx: usize,
+        desc_id: u16,
+        len: u32,
+    ) -> bool {
+        let (device_addr, used_idx) = {
+            let q = &self.queues[qidx];
+            (q.device_addr, q.used_idx)
+        };
+        let size = self.effective_queue_size(qidx);
+        let slot = used_idx % size;
+        let Some(elem_addr) = Self::used_ring_elem_addr(device_addr, slot) else {
+            return false;
+        };
+        if gm_write_u32(mem, elem_addr, desc_id as u32).is_none() {
+            return false;
+        }
+        if gm_write_u32(mem, elem_addr.wrapping_add(4), len).is_none() {
+            return false;
+        }
+        let new_used_idx = used_idx.wrapping_add(1);
+        if gm_write_u16(mem, device_addr.wrapping_add(2), new_used_idx).is_none() {
+            return false;
+        }
+        self.queues[qidx].used_idx = new_used_idx;
+        self.raise_used_irq();
+        true
+    }
+
+    /// Walk a device-readable (tx) descriptor chain starting at `head`,
+    /// copying every descriptor's bytes into [`Self::scratch`] in order.
+    /// `None` on: a descriptor flagged device-writable or indirect (this
+    /// device supports neither on the tx side), the accumulated length
+    /// exceeding [`Self::MAX_FRAME_TOTAL`], or anything
+    /// [`Self::read_desc`] itself already fails on. The chain is bounded
+    /// to at most `size` links, so a `next` cycle cannot loop forever
+    /// even though every individual link it visits is individually valid
+    /// (module docs on [`Self`], "Virtqueues").
+    fn copy_chain_out(
+        &mut self,
+        mem: &dyn crate::GuestMemory,
+        desc_addr: u64,
+        size: u16,
+        head: u16,
+    ) -> Option<usize> {
+        let mut total = 0usize;
+        let mut idx = head;
+        for _ in 0..size {
+            let (addr, len, flags, next) = Self::read_desc(mem, desc_addr, size, idx)?;
+            if flags & (desc_flags::WRITE | desc_flags::INDIRECT) != 0 {
+                return None;
+            }
+            let a = u32::try_from(addr).ok()?;
+            let l = len as usize;
+            let new_total = total.checked_add(l)?;
+            if new_total > self.scratch.len() {
+                return None;
+            }
+            let src = mem.ram_slice(a, len)?;
+            self.scratch[total..new_total].copy_from_slice(src);
+            total = new_total;
+            if flags & desc_flags::NEXT == 0 {
+                return Some(total);
+            }
+            idx = next;
+        }
+        // Exhausted the bound without terminating -- a cycle. Fail
+        // closed rather than accept a chain longer than the queue itself
+        // could legitimately describe.
+        None
+    }
+
+    /// Advance the tx (queue [`Self::QUEUE_TX`]) engine: for every newly
+    /// available descriptor since the last poll, extract the frame
+    /// (module docs, [`Self::copy_chain_out`]), strip the
+    /// [`Self::VIRTIO_NET_HDR_LEN`]-byte header, hand the remainder to
+    /// [`NetBackend::transmit`], and publish a used-buffer completion.
+    /// Stops (without panicking) at the first hostile ring content,
+    /// setting [`status_bits::DEVICE_NEEDS_RESET`] (module docs,
+    /// [`Self::fail_closed`]).
+    fn process_tx(&mut self, mem: &mut dyn crate::GuestMemory) {
+        if self.needs_reset() || !self.queues[Self::QUEUE_TX].enabled {
+            return;
+        }
+        loop {
+            let (driver_addr, desc_addr, last_avail) = {
+                let q = &self.queues[Self::QUEUE_TX];
+                (q.driver_addr, q.desc_addr, q.last_avail_idx)
+            };
+            let size = self.effective_queue_size(Self::QUEUE_TX);
+            let Some(avail_idx) = gm_read_u16(mem, driver_addr.wrapping_add(2)) else {
+                self.fail_closed();
+                return;
+            };
+            if avail_idx == last_avail {
+                return;
+            }
+            let Some(slot_addr) = Self::avail_ring_slot_addr(driver_addr, last_avail % size) else {
+                self.fail_closed();
+                return;
+            };
+            let Some(desc_head) = gm_read_u16(mem, slot_addr) else {
+                self.fail_closed();
+                return;
+            };
+
+            let outcome = self.copy_chain_out(mem, desc_addr, size, desc_head);
+            let completed = match outcome {
+                Some(len) if len >= Self::VIRTIO_NET_HDR_LEN => {
+                    self.backend
+                        .transmit(&self.scratch[Self::VIRTIO_NET_HDR_LEN..len]);
+                    self.tx_frames = self.tx_frames.wrapping_add(1);
+                    self.complete_used(mem, Self::QUEUE_TX, desc_head, len as u32)
+                }
+                _ => {
+                    self.tx_dropped = self.tx_dropped.wrapping_add(1);
+                    self.complete_used(mem, Self::QUEUE_TX, desc_head, 0)
+                }
+            };
+            if !completed {
+                self.fail_closed();
+                return;
+            }
+            self.queues[Self::QUEUE_TX].last_avail_idx = last_avail.wrapping_add(1);
+        }
+    }
+
+    /// Advance the rx (queue [`Self::QUEUE_RX`]) engine: while the guest
+    /// has an available receive descriptor *and* [`NetBackend::poll_receive`]
+    /// has a frame ready, prepend the 12-byte header (`num_buffers = 1`,
+    /// module docs on [`Self::VIRTIO_NET_HDR_LEN`]) and copy the whole
+    /// thing into that descriptor's buffer, then publish a used-buffer
+    /// completion. The backend is polled only after a descriptor's
+    /// availability is confirmed (module docs on [`NetBackend::poll_receive`]),
+    /// so a frame is never popped from the backend only to be dropped for
+    /// lack of anywhere to put it -- except when the descriptor itself
+    /// turns out too small or not device-writable, in which case this
+    /// engine fails closed the same way [`Self::process_tx`] does (the
+    /// frame is lost in that case; a hostile-buffer guest gets no more
+    /// service until it resets the device).
+    fn process_rx(&mut self, mem: &mut dyn crate::GuestMemory) {
+        if self.needs_reset() || !self.queues[Self::QUEUE_RX].enabled {
+            return;
+        }
+        loop {
+            let (driver_addr, desc_addr, last_avail) = {
+                let q = &self.queues[Self::QUEUE_RX];
+                (q.driver_addr, q.desc_addr, q.last_avail_idx)
+            };
+            let size = self.effective_queue_size(Self::QUEUE_RX);
+            let Some(avail_idx) = gm_read_u16(mem, driver_addr.wrapping_add(2)) else {
+                self.fail_closed();
+                return;
+            };
+            if avail_idx == last_avail {
+                return; // no rx buffer available; leave any pending frame for later
+            }
+            let Some(frame_len) = self.backend.poll_receive(&mut self.rx_frame_buf) else {
+                return; // nothing to deliver yet
+            };
+
+            let Some(slot_addr) = Self::avail_ring_slot_addr(driver_addr, last_avail % size) else {
+                self.fail_closed();
+                return;
+            };
+            let Some(desc_head) = gm_read_u16(mem, slot_addr) else {
+                self.fail_closed();
+                return;
+            };
+            let Some((addr, len, flags, _next)) = Self::read_desc(mem, desc_addr, size, desc_head)
+            else {
+                self.fail_closed();
+                return;
+            };
+
+            let total = Self::VIRTIO_NET_HDR_LEN + frame_len;
+            if flags & desc_flags::WRITE == 0
+                || flags & desc_flags::INDIRECT != 0
+                || total > (len as usize)
+                || total > self.scratch.len()
+            {
+                self.rx_dropped = self.rx_dropped.wrapping_add(1);
+                self.fail_closed();
+                return;
+            }
+
+            self.scratch[..Self::VIRTIO_NET_HDR_LEN].fill(0);
+            self.scratch[10] = 1; // num_buffers (le16), low byte
+            self.scratch[11] = 0;
+            self.scratch[Self::VIRTIO_NET_HDR_LEN..total]
+                .copy_from_slice(&self.rx_frame_buf[..frame_len]);
+
+            let Some(a) = u32::try_from(addr).ok() else {
+                self.fail_closed();
+                return;
+            };
+            let Some(dst) = mem.ram_slice_mut(a, total as u32) else {
+                self.fail_closed();
+                return;
+            };
+            dst.copy_from_slice(&self.scratch[..total]);
+
+            if !self.complete_used(mem, Self::QUEUE_RX, desc_head, total as u32) {
+                self.fail_closed();
+                return;
+            }
+            self.rx_frames = self.rx_frames.wrapping_add(1);
+            self.queues[Self::QUEUE_RX].last_avail_idx = last_avail.wrapping_add(1);
+        }
+    }
+
+    /// Read from BAR0 at `offset` (module docs, "BAR0 region map").
+    fn bar0_read(&mut self, offset: u64, width: AccessWidth) -> u32 {
+        let rel = offset as u32; // BAR containment already guarantees offset < BAR0_SIZE
+        if rel < Self::COMMON_CFG_BAR_LEN {
+            self.common_cfg_read(rel, width)
+        } else if rel < Self::NOTIFY_CFG_BAR_OFFSET + Self::NOTIFY_CFG_BAR_LEN {
+            0 // write-only in this device's own posture; see this file's report
+        } else if rel < Self::ISR_CFG_BAR_OFFSET + Self::ISR_CFG_BAR_LEN {
+            if rel == Self::ISR_CFG_BAR_OFFSET {
+                let v = self.isr_status;
+                self.isr_status = 0; // read-to-clear
+                v as u32
+            } else {
+                0
+            }
+        } else {
+            // Compose byte lanes so a word/long read of the MAC region is
+            // faithful to natural-width access (virtio 1.x drivers may
+            // read device config at any of the spec's allowed widths),
+            // exactly as `common_cfg_read` composes its own window.
+            let d = rel - Self::DEVICE_CFG_BAR_OFFSET;
+            let mut value = 0u32;
+            for lane in 0..width.bytes() {
+                let byte = Self::MAC.get((d + lane) as usize).copied().unwrap_or(0);
+                value |= (byte as u32) << (8 * lane);
+            }
+            value
+        }
+    }
+
+    /// Write to BAR0 at `offset` (module docs, "BAR0 region map"). The
+    /// notify and device-config windows both discard writes -- notify's
+    /// content is never inspected (this file's own report explains why),
+    /// and device config is read-only from the driver's own perspective.
+    fn bar0_write(&mut self, offset: u64, width: AccessWidth, value: u32) {
+        let rel = offset as u32;
+        if rel < Self::COMMON_CFG_BAR_LEN {
+            self.common_cfg_write(rel, width, value);
+        }
+        // NOTIFY_CFG and DEVICE_CFG: discarded, per this device's own
+        // documented posture above.
     }
 }
 
-impl PciDevice for VirtioNetStub {
+impl<'a> VirtioNetStub<'a> {
+    /// Number of frames [`NetBackend::transmit`] has been handed.
+    /// Host-side introspection only, not a register.
+    pub fn tx_frames(&self) -> u32 {
+        self.tx_frames
+    }
+
+    /// Number of tx descriptor chains this device dropped rather than
+    /// forwarded (too short to contain even the header, or otherwise
+    /// hostile). Host-side introspection only.
+    pub fn tx_dropped(&self) -> u32 {
+        self.tx_dropped
+    }
+
+    /// Number of frames successfully delivered into the guest's rx ring.
+    /// Host-side introspection only.
+    pub fn rx_frames(&self) -> u32 {
+        self.rx_frames
+    }
+
+    /// Number of backend-offered rx frames this device could not deliver
+    /// (no suitable descriptor). Host-side introspection only.
+    pub fn rx_dropped(&self) -> u32 {
+        self.rx_dropped
+    }
+
+    /// The current `device_status` byte -- host-side introspection (a
+    /// guest driver reads the same value through
+    /// [`common_off::DEVICE_STATUS`]).
+    pub fn device_status(&self) -> u8 {
+        self.device_status
+    }
+
+    /// The feature bits the driver has successfully acked so far --
+    /// host-side introspection.
+    pub fn acked_features(&self) -> u64 {
+        self.acked_features
+    }
+}
+
+impl<'a> PciDevice for VirtioNetStub<'a> {
     fn config_read(&mut self, offset: u16, width: AccessWidth) -> u32 {
         self.config.read(offset, width)
     }
@@ -996,6 +2094,29 @@ impl PciDevice for VirtioNetStub {
 
     fn bar_window(&self, bar: usize) -> Option<(u64, u64)> {
         self.config.bar_window(bar)
+    }
+
+    fn bar_read(&mut self, bar: usize, offset: u64, width: AccessWidth) -> u32 {
+        if bar == 0 {
+            self.bar0_read(offset, width)
+        } else {
+            u32::MAX
+        }
+    }
+
+    fn bar_write(&mut self, bar: usize, offset: u64, width: AccessWidth, value: u32) {
+        if bar == 0 {
+            self.bar0_write(offset, width, value);
+        }
+    }
+
+    fn intx_level(&self) -> bool {
+        self.isr_status & 0x1 != 0
+    }
+
+    fn tick(&mut self, mem: &mut dyn crate::GuestMemory) {
+        self.process_tx(mem);
+        self.process_rx(mem);
     }
 }
 
@@ -1187,6 +2308,631 @@ impl PciDevice for IntxTestDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GuestMemory;
+
+    // ---- fixtures for stage 3's virtqueue tests -----------------------------
+
+    /// Flat guest RAM based at 0 -- the same fixture shape `pktport.rs`'s
+    /// own tests use (a distinct newtype per module rather than a shared
+    /// `impl GuestMemory for Vec<u8>`, since trait impls are crate-global
+    /// regardless of module).
+    struct FakeRam(std::vec::Vec<u8>);
+
+    impl FakeRam {
+        fn new(size: usize) -> Self {
+            Self(std::vec![0u8; size])
+        }
+
+        fn write_u16(&mut self, addr: u32, value: u16) {
+            self.0[addr as usize..addr as usize + 2].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn write_u32(&mut self, addr: u32, value: u32) {
+            self.0[addr as usize..addr as usize + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn write_u64(&mut self, addr: u32, value: u64) {
+            self.0[addr as usize..addr as usize + 8].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn read_u16(&self, addr: u32) -> u16 {
+            u16::from_le_bytes(self.0[addr as usize..addr as usize + 2].try_into().unwrap())
+        }
+
+        /// Write one `virtq_desc` entry (16 bytes: `addr:u64, len:u32,
+        /// flags:u16, next:u16`) at descriptor-table index `idx`.
+        fn write_desc(&mut self, table: u32, idx: u16, addr: u64, len: u32, flags: u16, next: u16) {
+            let base = table + 16 * idx as u32;
+            self.write_u64(base, addr);
+            self.write_u32(base + 8, len);
+            self.write_u16(base + 12, flags);
+            self.write_u16(base + 14, next);
+        }
+
+        /// Publish avail ring entry `pos` = `desc_head`, then set
+        /// `avail.idx` to `pos + 1` -- a driver making exactly one more
+        /// descriptor available.
+        fn publish_avail(&mut self, avail: u32, pos: u16, desc_head: u16) {
+            self.write_u16(avail + 4 + 2 * pos as u32, desc_head);
+            self.write_u16(avail + 2, pos + 1);
+        }
+    }
+
+    impl crate::GuestMemory for FakeRam {
+        fn ram_slice(&self, addr: u32, len: u32) -> Option<&[u8]> {
+            let end = addr.checked_add(len)?;
+            if end as usize > self.0.len() {
+                return None;
+            }
+            Some(&self.0[addr as usize..end as usize])
+        }
+
+        fn ram_slice_mut(&mut self, addr: u32, len: u32) -> Option<&mut [u8]> {
+            let end = addr.checked_add(len)?;
+            if end as usize > self.0.len() {
+                return None;
+            }
+            Some(&mut self.0[addr as usize..end as usize])
+        }
+    }
+
+    /// A [`NetBackend`] that records every transmitted frame and lets a
+    /// test queue up frames for [`NetBackend::poll_receive`] to hand
+    /// back -- module docs on [`NetBackend`], "a loopback/recording test
+    /// backend".
+    #[derive(Default)]
+    struct LoopbackNetBackend {
+        transmitted: std::vec::Vec<std::vec::Vec<u8>>,
+        to_inject: std::vec::Vec<std::vec::Vec<u8>>,
+    }
+
+    impl LoopbackNetBackend {
+        fn inject(&mut self, frame: &[u8]) {
+            self.to_inject.push(frame.to_vec());
+        }
+    }
+
+    impl NetBackend for LoopbackNetBackend {
+        fn transmit(&mut self, frame: &[u8]) {
+            self.transmitted.push(frame.to_vec());
+        }
+
+        fn poll_receive(&mut self, buf: &mut [u8]) -> Option<usize> {
+            if self.to_inject.is_empty() {
+                return None;
+            }
+            let frame = self.to_inject.remove(0);
+            buf[..frame.len()].copy_from_slice(&frame);
+            Some(frame.len())
+        }
+    }
+
+    /// Fixed layout for the tests below: descriptor table, avail ring and
+    /// used ring for ONE queue, each given generous headroom so a
+    /// legitimately-sized chain never collides with the next region --
+    /// hostile-address tests deliberately point outside this layout
+    /// instead of anywhere in it.
+    mod layout {
+        pub const DESC: u32 = 0x0000;
+        pub const AVAIL: u32 = 0x1000;
+        pub const USED: u32 = 0x2000;
+        pub const BUF: u32 = 0x3000;
+        pub const RAM_SIZE: usize = 0x10000;
+    }
+
+    /// Select queue `qidx`, then fully configure it (`queue_size`,
+    /// `queue_desc`/`queue_driver`/`queue_device`) and enable it -- the
+    /// common setup every ring test below needs, once feature negotiation
+    /// (a separate concern, its own tests) is out of the way.
+    fn configure_queue(
+        net: &mut VirtioNetStub,
+        qidx: usize,
+        size: u16,
+        desc: u32,
+        avail: u32,
+        used: u32,
+    ) {
+        net.bar_write(
+            0,
+            common_off::QUEUE_SELECT as u64,
+            AccessWidth::W16,
+            qidx as u32,
+        );
+        net.bar_write(
+            0,
+            common_off::QUEUE_SIZE as u64,
+            AccessWidth::W16,
+            size as u32,
+        );
+        net.bar_write(0, common_off::QUEUE_DESC as u64, AccessWidth::W32, desc);
+        net.bar_write(0, common_off::QUEUE_DRIVER as u64, AccessWidth::W32, avail);
+        net.bar_write(0, common_off::QUEUE_DEVICE as u64, AccessWidth::W32, used);
+        net.bar_write(0, common_off::QUEUE_ENABLE as u64, AccessWidth::W16, 1);
+    }
+
+    /// Negotiate exactly what a conformant driver would: ack both offered
+    /// features, then walk `ACKNOWLEDGE -> DRIVER -> FEATURES_OK ->
+    /// DRIVER_OK`, asserting each step lands the way the spec says it
+    /// should (this is also, in effect, this file's own feature-
+    /// negotiation test, inlined into every other test's setup rather
+    /// than repeated).
+    fn negotiate(net: &mut VirtioNetStub) {
+        net.bar_write(
+            0,
+            common_off::DEVICE_FEATURE_SELECT as u64,
+            AccessWidth::W32,
+            0,
+        );
+        let low = net.bar_read(0, common_off::DEVICE_FEATURE as u64, AccessWidth::W32);
+        net.bar_write(
+            0,
+            common_off::DRIVER_FEATURE_SELECT as u64,
+            AccessWidth::W32,
+            0,
+        );
+        net.bar_write(0, common_off::DRIVER_FEATURE as u64, AccessWidth::W32, low);
+
+        net.bar_write(
+            0,
+            common_off::DEVICE_FEATURE_SELECT as u64,
+            AccessWidth::W32,
+            1,
+        );
+        let high = net.bar_read(0, common_off::DEVICE_FEATURE as u64, AccessWidth::W32);
+        net.bar_write(
+            0,
+            common_off::DRIVER_FEATURE_SELECT as u64,
+            AccessWidth::W32,
+            1,
+        );
+        net.bar_write(0, common_off::DRIVER_FEATURE as u64, AccessWidth::W32, high);
+
+        net.bar_write(
+            0,
+            common_off::DEVICE_STATUS as u64,
+            AccessWidth::W8,
+            status_bits::ACKNOWLEDGE as u32,
+        );
+        net.bar_write(
+            0,
+            common_off::DEVICE_STATUS as u64,
+            AccessWidth::W8,
+            (status_bits::ACKNOWLEDGE | status_bits::DRIVER) as u32,
+        );
+        net.bar_write(
+            0,
+            common_off::DEVICE_STATUS as u64,
+            AccessWidth::W8,
+            (status_bits::ACKNOWLEDGE | status_bits::DRIVER | status_bits::FEATURES_OK) as u32,
+        );
+        let after_features_ok = net.bar_read(0, common_off::DEVICE_STATUS as u64, AccessWidth::W8);
+        assert_eq!(
+            after_features_ok as u8 & status_bits::FEATURES_OK,
+            status_bits::FEATURES_OK,
+            "VERSION_1 was offered and acked, so FEATURES_OK must stick"
+        );
+        net.bar_write(
+            0,
+            common_off::DEVICE_STATUS as u64,
+            AccessWidth::W8,
+            (after_features_ok as u8 | status_bits::DRIVER_OK) as u32,
+        );
+        let final_status = net.bar_read(0, common_off::DEVICE_STATUS as u64, AccessWidth::W8) as u8;
+        assert_eq!(
+            final_status,
+            status_bits::ACKNOWLEDGE
+                | status_bits::DRIVER
+                | status_bits::FEATURES_OK
+                | status_bits::DRIVER_OK,
+            "a full, honest negotiation must reach DRIVER_OK with nothing else set"
+        );
+    }
+
+    // ---- feature negotiation -------------------------------------------------
+
+    #[test]
+    fn offered_features_are_exactly_version_1_and_mac() {
+        let mut backend = LoopbackNetBackend::default();
+        let mut net = VirtioNetStub::new(&mut backend);
+        net.bar_write(
+            0,
+            common_off::DEVICE_FEATURE_SELECT as u64,
+            AccessWidth::W32,
+            0,
+        );
+        let low = net.bar_read(0, common_off::DEVICE_FEATURE as u64, AccessWidth::W32);
+        net.bar_write(
+            0,
+            common_off::DEVICE_FEATURE_SELECT as u64,
+            AccessWidth::W32,
+            1,
+        );
+        let high = net.bar_read(0, common_off::DEVICE_FEATURE as u64, AccessWidth::W32);
+        let offered = (low as u64) | ((high as u64) << 32);
+        assert_eq!(offered, VirtioNetStub::F_VERSION_1 | VirtioNetStub::F_MAC);
+    }
+
+    #[test]
+    fn a_full_negotiation_reaches_driver_ok() {
+        let mut backend = LoopbackNetBackend::default();
+        let mut net = VirtioNetStub::new(&mut backend);
+        negotiate(&mut net);
+        assert_eq!(
+            net.acked_features(),
+            VirtioNetStub::F_VERSION_1 | VirtioNetStub::F_MAC
+        );
+    }
+
+    #[test]
+    fn features_ok_is_cleared_when_version_1_was_never_acked() {
+        let mut backend = LoopbackNetBackend::default();
+        let mut net = VirtioNetStub::new(&mut backend);
+        // Ack MAC only (bit 5, select-0 window) -- VERSION_1 (bit 32,
+        // select-1 window) is deliberately never acked.
+        net.bar_write(
+            0,
+            common_off::DRIVER_FEATURE_SELECT as u64,
+            AccessWidth::W32,
+            0,
+        );
+        net.bar_write(
+            0,
+            common_off::DRIVER_FEATURE as u64,
+            AccessWidth::W32,
+            VirtioNetStub::F_MAC as u32,
+        );
+        net.bar_write(
+            0,
+            common_off::DEVICE_STATUS as u64,
+            AccessWidth::W8,
+            (status_bits::ACKNOWLEDGE | status_bits::DRIVER | status_bits::FEATURES_OK) as u32,
+        );
+        let status = net.bar_read(0, common_off::DEVICE_STATUS as u64, AccessWidth::W8) as u8;
+        assert_eq!(
+            status & status_bits::FEATURES_OK,
+            0,
+            "the device must clear FEATURES_OK itself when VERSION_1 was never acked"
+        );
+    }
+
+    #[test]
+    fn driver_ok_without_features_ok_sets_device_needs_reset() {
+        let mut backend = LoopbackNetBackend::default();
+        let mut net = VirtioNetStub::new(&mut backend);
+        // Skip straight to DRIVER_OK -- a driver that never checked
+        // FEATURES_OK first.
+        net.bar_write(
+            0,
+            common_off::DEVICE_STATUS as u64,
+            AccessWidth::W8,
+            (status_bits::ACKNOWLEDGE | status_bits::DRIVER | status_bits::DRIVER_OK) as u32,
+        );
+        let status = net.bar_read(0, common_off::DEVICE_STATUS as u64, AccessWidth::W8) as u8;
+        assert_eq!(
+            status & status_bits::DRIVER_OK,
+            0,
+            "DRIVER_OK must not stick"
+        );
+        assert_eq!(
+            status & status_bits::DEVICE_NEEDS_RESET,
+            status_bits::DEVICE_NEEDS_RESET,
+            "refusal must be narratable, not silent"
+        );
+    }
+
+    #[test]
+    fn writing_zero_to_device_status_resets_negotiated_state() {
+        let mut backend = LoopbackNetBackend::default();
+        let mut net = VirtioNetStub::new(&mut backend);
+        negotiate(&mut net);
+        net.bar_write(0, common_off::DEVICE_STATUS as u64, AccessWidth::W8, 0);
+        assert_eq!(net.device_status(), 0);
+        assert_eq!(net.acked_features(), 0);
+        // queue_size reads back the device's max again post-reset.
+        net.bar_write(0, common_off::QUEUE_SELECT as u64, AccessWidth::W16, 1);
+        let size = net.bar_read(0, common_off::QUEUE_SIZE as u64, AccessWidth::W16);
+        assert_eq!(size, VirtioNetStub::QUEUE_SIZE_MAX as u32);
+    }
+
+    #[test]
+    fn device_config_carries_the_documented_mac_at_offset_zero() {
+        let mut backend = LoopbackNetBackend::default();
+        let mut net = VirtioNetStub::new(&mut backend);
+        for (i, expected) in VirtioNetStub::MAC.iter().enumerate() {
+            let byte = net.bar_read(
+                0,
+                VirtioNetStub::DEVICE_CFG_BAR_OFFSET as u64 + i as u64,
+                AccessWidth::W8,
+            );
+            assert_eq!(byte, *expected as u32, "MAC byte {i}");
+        }
+    }
+
+    // ---- tx: frame extraction and used-buffer completion ---------------------
+
+    #[test]
+    fn tx_frame_reaches_backend_with_exact_bytes_header_stripped() {
+        let mut backend = LoopbackNetBackend::default();
+        let payload = [0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE];
+        let mut ram = FakeRam::new(layout::RAM_SIZE);
+        {
+            let mut net = VirtioNetStub::new(&mut backend);
+            negotiate(&mut net);
+            configure_queue(
+                &mut net,
+                VirtioNetStub::QUEUE_TX,
+                8,
+                layout::DESC,
+                layout::AVAIL,
+                layout::USED,
+            );
+
+            let mut frame = std::vec![0u8; VirtioNetStub::VIRTIO_NET_HDR_LEN + payload.len()];
+            frame[VirtioNetStub::VIRTIO_NET_HDR_LEN..].copy_from_slice(&payload);
+            ram.0[layout::BUF as usize..layout::BUF as usize + frame.len()].copy_from_slice(&frame);
+            ram.write_desc(
+                layout::DESC,
+                0,
+                layout::BUF as u64,
+                frame.len() as u32,
+                0,
+                0,
+            );
+            ram.publish_avail(layout::AVAIL, 0, 0);
+
+            net.tick(&mut ram);
+
+            assert_eq!(net.tx_frames(), 1);
+            assert_eq!(net.tx_dropped(), 0);
+        }
+        assert_eq!(backend.transmitted.len(), 1);
+        assert_eq!(backend.transmitted[0], payload);
+    }
+
+    #[test]
+    fn used_buffer_completion_bumps_used_idx_and_asserts_isr_and_intx() {
+        let mut backend = LoopbackNetBackend::default();
+        let mut net = VirtioNetStub::new(&mut backend);
+        negotiate(&mut net);
+        configure_queue(
+            &mut net,
+            VirtioNetStub::QUEUE_TX,
+            8,
+            layout::DESC,
+            layout::AVAIL,
+            layout::USED,
+        );
+        let mut ram = FakeRam::new(layout::RAM_SIZE);
+        let frame = [0u8; VirtioNetStub::VIRTIO_NET_HDR_LEN + 4];
+        ram.0[layout::BUF as usize..layout::BUF as usize + frame.len()].copy_from_slice(&frame);
+        ram.write_desc(
+            layout::DESC,
+            0,
+            layout::BUF as u64,
+            frame.len() as u32,
+            0,
+            0,
+        );
+        ram.publish_avail(layout::AVAIL, 0, 0);
+
+        assert!(!net.intx_level(), "nothing asserted before any traffic");
+        net.tick(&mut ram);
+
+        assert_eq!(ram.read_u16(layout::USED + 2), 1, "used.idx bumped once");
+        assert!(net.intx_level(), "adding a used buffer must assert INTx");
+        let isr = net.bar_read(0, VirtioNetStub::ISR_CFG_BAR_OFFSET as u64, AccessWidth::W8);
+        assert_eq!(isr & 1, 1, "ISR bit 0 reports the used-buffer notification");
+        assert!(
+            !net.intx_level(),
+            "reading ISR must clear INTx along with the byte"
+        );
+        let isr_again = net.bar_read(0, VirtioNetStub::ISR_CFG_BAR_OFFSET as u64, AccessWidth::W8);
+        assert_eq!(isr_again, 0, "ISR itself reads back cleared");
+    }
+
+    // ---- rx: injected frames land in the guest ring ---------------------------
+
+    #[test]
+    fn rx_injected_frame_lands_in_guest_ring_with_header_and_exact_bytes() {
+        let mut backend = LoopbackNetBackend::default();
+        let payload = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66];
+        backend.inject(&payload);
+        let mut net = VirtioNetStub::new(&mut backend);
+        negotiate(&mut net);
+        configure_queue(
+            &mut net,
+            VirtioNetStub::QUEUE_RX,
+            8,
+            layout::DESC,
+            layout::AVAIL,
+            layout::USED,
+        );
+
+        let mut ram = FakeRam::new(layout::RAM_SIZE);
+        let buf_len = VirtioNetStub::VIRTIO_NET_HDR_LEN as u32 + payload.len() as u32 + 32;
+        ram.write_desc(
+            layout::DESC,
+            0,
+            layout::BUF as u64,
+            buf_len,
+            desc_flags::WRITE,
+            0,
+        );
+        ram.publish_avail(layout::AVAIL, 0, 0);
+
+        net.tick(&mut ram);
+
+        assert_eq!(net.rx_frames(), 1);
+        assert_eq!(net.rx_dropped(), 0);
+        let hdr = ram
+            .ram_slice(layout::BUF, VirtioNetStub::VIRTIO_NET_HDR_LEN as u32)
+            .unwrap();
+        assert_eq!(
+            hdr,
+            [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
+            "num_buffers=1, rest zero"
+        );
+        let got = ram
+            .ram_slice(
+                layout::BUF + VirtioNetStub::VIRTIO_NET_HDR_LEN as u32,
+                payload.len() as u32,
+            )
+            .unwrap();
+        assert_eq!(got, &payload[..]);
+        assert_eq!(ram.read_u16(layout::USED + 2), 1);
+        assert!(net.intx_level());
+    }
+
+    // ---- hostile rings fail closed, never panic --------------------------------
+
+    #[test]
+    fn tx_descriptor_pointing_outside_ram_fails_closed_without_panic() {
+        let mut backend = LoopbackNetBackend::default();
+        let mut net = VirtioNetStub::new(&mut backend);
+        negotiate(&mut net);
+        configure_queue(
+            &mut net,
+            VirtioNetStub::QUEUE_TX,
+            8,
+            layout::DESC,
+            layout::AVAIL,
+            layout::USED,
+        );
+        let mut ram = FakeRam::new(layout::RAM_SIZE);
+        // Descriptor buffer address lies entirely outside this RAM. This
+        // is a bad *frame*, not a corrupt ring -- the queue's own
+        // desc/avail/used tables are all fine -- so this device drops
+        // just this descriptor and keeps the ring moving (module docs on
+        // `VirtioNetStub::process_tx`'s "completed" match), rather than
+        // the harder [`a_hostile_avail_ring_address_fails_closed_without_panic`]
+        // structural failure below.
+        ram.write_desc(layout::DESC, 0, 0xFFFF_0000, 16, 0, 0);
+        ram.publish_avail(layout::AVAIL, 0, 0);
+
+        net.tick(&mut ram); // must not panic
+
+        assert_eq!(
+            net.device_status() & status_bits::DEVICE_NEEDS_RESET,
+            0,
+            "an unreadable descriptor is content, not a ring failure"
+        );
+        assert_eq!(net.tx_frames(), 0);
+        assert_eq!(net.tx_dropped(), 1);
+        assert_eq!(ram.read_u16(layout::USED + 2), 1, "the ring still advances");
+    }
+
+    #[test]
+    fn tx_descriptor_with_a_length_past_the_frame_cap_fails_closed_without_panic() {
+        let mut backend = LoopbackNetBackend::default();
+        let mut net = VirtioNetStub::new(&mut backend);
+        negotiate(&mut net);
+        configure_queue(
+            &mut net,
+            VirtioNetStub::QUEUE_TX,
+            8,
+            layout::DESC,
+            layout::AVAIL,
+            layout::USED,
+        );
+        let mut ram = FakeRam::new(layout::RAM_SIZE);
+        // A single descriptor claiming more bytes than this device will
+        // ever stage at once -- well within RAM, so this exercises the
+        // scratch-buffer cap, not the address check above.
+        let huge_len = (VirtioNetStub::MAX_FRAME_TOTAL + 1) as u32;
+        ram.write_desc(layout::DESC, 0, layout::BUF as u64, huge_len, 0, 0);
+        ram.publish_avail(layout::AVAIL, 0, 0);
+
+        net.tick(&mut ram); // must not panic
+
+        assert_eq!(net.tx_frames(), 0);
+        assert_eq!(
+            net.tx_dropped(),
+            1,
+            "an oversized chain is dropped, not forwarded"
+        );
+    }
+
+    #[test]
+    fn a_descriptor_chain_that_cycles_is_bounded_and_dropped_not_looped_forever() {
+        let mut backend = LoopbackNetBackend::default();
+        let mut net = VirtioNetStub::new(&mut backend);
+        negotiate(&mut net);
+        configure_queue(
+            &mut net,
+            VirtioNetStub::QUEUE_TX,
+            2,
+            layout::DESC,
+            layout::AVAIL,
+            layout::USED,
+        );
+        let mut ram = FakeRam::new(layout::RAM_SIZE);
+        // desc 0 -> desc 1 -> desc 0 -> ... both individually valid,
+        // never terminating.
+        ram.write_desc(layout::DESC, 0, layout::BUF as u64, 4, desc_flags::NEXT, 1);
+        ram.write_desc(layout::DESC, 1, layout::BUF as u64, 4, desc_flags::NEXT, 0);
+        ram.publish_avail(layout::AVAIL, 0, 0);
+
+        net.tick(&mut ram); // must not hang or panic
+
+        assert_eq!(net.tx_frames(), 0);
+        assert_eq!(net.tx_dropped(), 1);
+        // The ring still advances -- a cyclic chain is a bad *frame*, not
+        // a broken ring, so the guest's next descriptor is still served.
+        assert_eq!(ram.read_u16(layout::USED + 2), 1);
+    }
+
+    #[test]
+    fn a_hostile_avail_ring_address_fails_closed_without_panic() {
+        let mut backend = LoopbackNetBackend::default();
+        let mut net = VirtioNetStub::new(&mut backend);
+        negotiate(&mut net);
+        // Point the avail ring itself outside RAM -- a corrupt queue
+        // registration, not merely a bad descriptor.
+        configure_queue(
+            &mut net,
+            VirtioNetStub::QUEUE_TX,
+            8,
+            layout::DESC,
+            0xFFFF_0000,
+            layout::USED,
+        );
+        let mut ram = FakeRam::new(layout::RAM_SIZE);
+
+        net.tick(&mut ram); // must not panic
+
+        assert_eq!(
+            net.device_status() & status_bits::DEVICE_NEEDS_RESET,
+            status_bits::DEVICE_NEEDS_RESET
+        );
+    }
+
+    #[test]
+    fn a_descriptor_index_at_or_past_queue_size_fails_closed_without_panic() {
+        let mut backend = LoopbackNetBackend::default();
+        let mut net = VirtioNetStub::new(&mut backend);
+        negotiate(&mut net);
+        configure_queue(
+            &mut net,
+            VirtioNetStub::QUEUE_TX,
+            4,
+            layout::DESC,
+            layout::AVAIL,
+            layout::USED,
+        );
+        let mut ram = FakeRam::new(layout::RAM_SIZE);
+        // The avail ring names descriptor index 9, past this queue's
+        // size of 4 -- never masked/modulo'd back into range (module
+        // docs on `VirtioNetStub::read_desc`). Content, not structure
+        // (module docs on the test above): dropped and counted, ring
+        // still advances.
+        ram.publish_avail(layout::AVAIL, 0, 9);
+
+        net.tick(&mut ram); // must not panic or index out of bounds
+
+        assert_eq!(net.device_status() & status_bits::DEVICE_NEEDS_RESET, 0);
+        assert_eq!(net.tx_dropped(), 1);
+        assert_eq!(ram.read_u16(layout::USED + 2), 1, "the ring still advances");
+    }
 
     /// A minimal `PciDevice` used only to exercise [`VirtualPciBus`]'s
     /// `mem_read`/`mem_write` containment math with a hostile
@@ -1240,7 +2986,8 @@ mod tests {
     #[test]
     fn enumeration_reads_vendor_and_device_id_correctly_at_every_width() {
         let mut bridge = HostBridge::new();
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mut slots = [
             VirtualSlot {
                 bdf: Bdf {
@@ -1368,7 +3115,8 @@ mod tests {
 
     #[test]
     fn class_code_and_revision_readback_matches_packed_layout() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let value = net.config_read(0x08, AccessWidth::W32);
         let class = (VirtioNetStub::CLASS_BASE as u32) << 16
             | (VirtioNetStub::CLASS_SUB as u32) << 8
@@ -1380,7 +3128,8 @@ mod tests {
 
     #[test]
     fn virtio_net_bar0_sizing_probe_reports_exactly_16kib_masked() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         net.config_write(0x10, AccessWidth::W32, 0xFFFF_FFFF);
         let readback = net.config_read(0x10, AccessWidth::W32);
         assert_eq!(readback, 0xFFFF_C000);
@@ -1388,7 +3137,8 @@ mod tests {
 
     #[test]
     fn virtio_net_bar0_restores_a_base_with_low_bits_masked_off() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mask = !(VirtioNetStub::BAR0_SIZE - 1);
         let candidate = 0x1234_5678u32;
         net.config_write(0x10, AccessWidth::W32, candidate);
@@ -1402,7 +3152,8 @@ mod tests {
 
     #[test]
     fn unimplemented_bars_read_zero_and_stay_zero_after_an_all_ones_write() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         for bar_offset in [0x14u16, 0x18, 0x1C, 0x20, 0x24] {
             assert_eq!(net.config_read(bar_offset, AccessWidth::W32), 0);
             net.config_write(bar_offset, AccessWidth::W32, 0xFFFF_FFFF);
@@ -1429,7 +3180,8 @@ mod tests {
 
     #[test]
     fn command_register_only_accepts_its_three_documented_bits() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         net.config_write(0x04, AccessWidth::W16, 0xFFFF);
         // Only IO/MEM/BUS_MASTER (bits 0-2) may be set; everything else,
         // including the whole high byte, reads back zero.
@@ -1438,7 +3190,8 @@ mod tests {
 
     #[test]
     fn status_capabilities_bit_is_set_on_the_stub_and_clear_on_the_bridge() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mut bridge = HostBridge::new();
         assert_eq!(net.config_read(0x06, AccessWidth::W16) & 0x10, 0x10);
         assert_eq!(bridge.config_read(0x06, AccessWidth::W16) & 0x10, 0);
@@ -1446,7 +3199,8 @@ mod tests {
 
     #[test]
     fn status_writes_are_discarded_no_write_one_to_clear_modelled() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let before = net.config_read(0x06, AccessWidth::W16);
         net.config_write(0x06, AccessWidth::W16, 0xFFFF);
         assert_eq!(net.config_read(0x06, AccessWidth::W16), before);
@@ -1456,7 +3210,8 @@ mod tests {
 
     #[test]
     fn capability_chain_walks_all_four_virtio_structures_correctly() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
 
         // Status bit set -> walk from the capabilities pointer.
         assert_eq!(net.config_read(0x06, AccessWidth::W16) & 0x10, 0x10);
@@ -1656,7 +3411,8 @@ mod tests {
 
     #[test]
     fn offsets_at_or_past_0x100_read_all_ones_and_discard_writes() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         assert_eq!(net.config_read(0x100, AccessWidth::W32), 0xFFFF_FFFF);
         assert_eq!(net.config_read(0xFFF0, AccessWidth::W16), 0xFFFF);
         net.config_write(0x100, AccessWidth::W32, 0x1234_5678);
@@ -1665,7 +3421,8 @@ mod tests {
 
     #[test]
     fn a_width_that_would_straddle_the_0x100_boundary_fails_closed() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         // offset 0xFD + W32 spans 0xFD..0x101 -- past the 256-byte space.
         assert_eq!(net.config_read(0xFD, AccessWidth::W32), 0xFFFF_FFFF);
         net.config_write(0xFD, AccessWidth::W32, 0x1111_1111);

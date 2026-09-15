@@ -342,7 +342,23 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     // no allocator), the same lifetime shape every other card's backing
     // storage has here.
     let mut pcibridge_hostbridge = pci::HostBridge::new();
-    let mut pcibridge_netstub = pci::VirtioNetStub::new();
+    // ADR 0005 stage 3's NetBackend seam (`docs/virtionet.md`): the
+    // harness backend simply replaces `NullNetBackend` whenever
+    // `pcibridge` is attached -- there is no dedicated flag for this,
+    // because there is no real host network path to choose *instead* of
+    // it yet (that remains a later increment's job; `docs/virtionet.md`
+    // records a real tap/socket backend as deliberately deferred).
+    // `net_harness_log` is the reporting handle `--inspect` reads after
+    // the run; `netharness.rs`'s own doc comment explains why it must be
+    // a separate `Rc<RefCell<_>>` clone rather than a field read straight
+    // off `pcibridge_net_backend` (which stays borrowed by the
+    // `pcibridge` chain for as long as `bus` is alive).
+    let net_harness_log = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::netharness::NetHarnessLog::default(),
+    ));
+    let mut pcibridge_net_backend =
+        crate::netharness::HarnessNetBackend::new(std::rc::Rc::clone(&net_harness_log));
+    let mut pcibridge_netstub = pci::VirtioNetStub::new(&mut pcibridge_net_backend);
     let mut pcibridge_slots = [
         pci::VirtualSlot {
             bdf: pci::Bdf {
@@ -615,6 +631,7 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         }
         if args.pcibridge {
             console.diag(&crate::introspect::format_pcibridge_state(&mut bus.0));
+            console.diag(&net_harness_log.borrow().format());
         }
     }
 

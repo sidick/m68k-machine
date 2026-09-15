@@ -794,16 +794,22 @@ impl<'a> MachineBus<'a> {
             }
         }
 
-        // `pcibridge` has no engine of its own to advance (config cycles
-        // stay synchronous, module docs) -- but unlike every card above,
-        // its `INTx` level can change with *no* register write at all:
-        // stage 3's virtio-net ISR will raise/lower its line from its own
-        // function logic, the same reason Graffity's card is polled here
-        // rather than only checked after a write. Polled every host tick
-        // so that edge is never missed just because nothing happened to
-        // touch `INTX_ENABLE`/`INTX_TEST` in between.
-        if let Some(dev) = &mut self.pcibridge {
-            if dev.irq_pending() {
+        // `pcibridge`'s own register file has no engine to advance (config
+        // cycles stay synchronous, module docs), but ADR 0005 stage 3's
+        // virtio-net function behind it does: its virtqueues need a
+        // `&mut dyn GuestMemory` view of the whole bus to walk, exactly
+        // the reason `hostblk`/`pktport` lift themselves out of their own
+        // `Option` above. Ticking it here, unconditionally, is also what
+        // keeps the `INTx` poll below honest: unlike every register-file
+        // write path, a used buffer added by this tick can raise the
+        // card's `INTx` line with no register write involved at all, the
+        // same reason Graffity's card is polled here rather than only
+        // checked after a write.
+        if let Some(mut dev) = self.pcibridge.take() {
+            dev.tick(self);
+            let pending = dev.irq_pending();
+            self.pcibridge = Some(dev);
+            if pending {
                 self.chipset.raise_int(chipset::intbit::PORTS);
             }
         }
@@ -2714,7 +2720,8 @@ mod tests {
         let mut ram = boxed_chip_ram();
         let rom = [0u8; ROM_WINDOW_SIZE];
         let mut hostbridge_dev = pci::HostBridge::new();
-        let mut net_dev = pci::VirtioNetStub::new();
+        let mut net_backend = pci::NullNetBackend;
+        let mut net_dev = pci::VirtioNetStub::new(&mut net_backend);
         let mut slots = [
             pci::VirtualSlot {
                 bdf: pci::Bdf {
@@ -2971,6 +2978,259 @@ mod tests {
             0,
             "acknowledging INTREQ clears it once the source is already quiet"
         );
+    }
+
+    /// A [`pci::NetBackend`] for the end-to-end test below: records every
+    /// transmitted frame, never has one to inject (this test only drives
+    /// tx). Distinct from `pci.rs`'s own `LoopbackNetBackend` -- that one
+    /// is private to `pci`'s test module.
+    struct StubNetBackend {
+        transmitted: std::vec::Vec<std::vec::Vec<u8>>,
+    }
+
+    impl pci::NetBackend for StubNetBackend {
+        fn transmit(&mut self, frame: &[u8]) {
+            self.transmitted.push(frame.to_vec());
+        }
+
+        fn poll_receive(&mut self, _buf: &mut [u8]) -> Option<usize> {
+            None
+        }
+    }
+
+    /// Poke one byte of `pcibridge`'s BAR aperture, address-invariant
+    /// (module docs' §3/§5): aperture byte `k` is BAR0 byte `k`, so this
+    /// is exactly [`pci::VirtioNetStub::bar_write`]`(0, k, W8, byte)` one
+    /// level up.
+    fn vnet_bar_write_byte(bus: &mut MachineBus, pcibridge_base: u32, bar_off: u32, byte: u8) {
+        bus.write_byte(
+            pcibridge_base + pcibridge::APERTURE_BASE_OFFSET + bar_off,
+            byte,
+        );
+    }
+
+    fn vnet_bar_write_bytes(bus: &mut MachineBus, pcibridge_base: u32, bar_off: u32, bytes: &[u8]) {
+        for (i, b) in bytes.iter().enumerate() {
+            vnet_bar_write_byte(bus, pcibridge_base, bar_off + i as u32, *b);
+        }
+    }
+
+    fn vnet_bar_read_byte(bus: &mut MachineBus, pcibridge_base: u32, bar_off: u32) -> u8 {
+        bus.read_byte(pcibridge_base + pcibridge::APERTURE_BASE_OFFSET + bar_off)
+    }
+
+    /// This increment's whole point: `docs/pci-library.md` §6's "one
+    /// unexercised link" -- stage 2 wired `INTx`-to-`INT2` end to end but
+    /// had no device with real function logic to prove it with anything
+    /// but the `INTX_TEST` diagnostic. Here, a real virtio-net used-buffer
+    /// completion (a genuine tx frame, walked through real guest RAM) is
+    /// what raises the line: driven entirely through the register file
+    /// and BAR aperture, exactly as a guest driver would, with
+    /// `bus.tick()` standing in for the driver's own doorbell-to-
+    /// completion latency.
+    #[test]
+    fn virtio_net_used_buffer_is_visible_end_to_end_through_pcibridges_intx_status() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut backend = StubNetBackend {
+            transmitted: std::vec::Vec::new(),
+        };
+        let pcibridge_base;
+        {
+            let mut hostbridge_dev = pci::HostBridge::new();
+            let mut net_dev = pci::VirtioNetStub::new(&mut backend);
+            let mut slots = [
+                pci::VirtualSlot {
+                    bdf: pci::Bdf {
+                        bus: 0,
+                        device: 0,
+                        function: 0,
+                    },
+                    device: &mut hostbridge_dev,
+                },
+                pci::VirtualSlot {
+                    bdf: pci::Bdf {
+                        bus: 0,
+                        device: 1,
+                        function: 0,
+                    },
+                    device: &mut net_dev,
+                },
+            ];
+            let mut vpci = pci::VirtualPciBus::new(&mut slots);
+            let mut bus = new_bus(&mut ram, &rom).with_pcibridge(&mut vpci);
+            pcibridge_base = 0x4000_0000u32;
+            configure_zorro_iii(&mut bus, pcibridge_base);
+
+            // Master-enable INTEN and unmask PORTS, same as the INTX_TEST
+            // test above.
+            bus.write_word(
+                CUSTOM_BASE + chipset::reg::INTENA as u32,
+                0x8000 | (1 << chipset::intbit::INTEN) | (1 << chipset::intbit::PORTS),
+            );
+
+            // Assign 00:01.0's BAR0 and enable memory-space decode.
+            let bar_base = 0x2000_0000u32;
+            pcibridge_write_u32(
+                &mut bus,
+                pcibridge_base + pcibridge::reg::CFG_DATA,
+                bar_base,
+            );
+            pcibridge_stage_and_op(
+                &mut bus,
+                pcibridge_base,
+                pcibridge_pack_cfg_addr(0, 1, 0, 0x10),
+                4,
+                1,
+            );
+            pcibridge_write_u32(&mut bus, pcibridge_base + pcibridge::reg::CFG_DATA, 0x02);
+            pcibridge_stage_and_op(
+                &mut bus,
+                pcibridge_base,
+                pcibridge_pack_cfg_addr(0, 1, 0, 0x04),
+                1,
+                1,
+            );
+            pcibridge_write_u32(
+                &mut bus,
+                pcibridge_base + pcibridge::reg::APERTURE_BASE,
+                bar_base,
+            );
+
+            // Feature negotiation through the aperture, byte at a time.
+            vnet_bar_write_bytes(&mut bus, pcibridge_base, 0x00, &0u32.to_le_bytes()); // device_feature_select = 0
+            let low = {
+                let mut v = [0u8; 4];
+                for (i, b) in v.iter_mut().enumerate() {
+                    *b = vnet_bar_read_byte(&mut bus, pcibridge_base, 0x04 + i as u32);
+                }
+                u32::from_le_bytes(v)
+            };
+            vnet_bar_write_bytes(&mut bus, pcibridge_base, 0x08, &0u32.to_le_bytes()); // driver_feature_select = 0
+            vnet_bar_write_bytes(&mut bus, pcibridge_base, 0x0C, &low.to_le_bytes());
+            vnet_bar_write_bytes(&mut bus, pcibridge_base, 0x00, &1u32.to_le_bytes()); // device_feature_select = 1
+            let high = {
+                let mut v = [0u8; 4];
+                for (i, b) in v.iter_mut().enumerate() {
+                    *b = vnet_bar_read_byte(&mut bus, pcibridge_base, 0x04 + i as u32);
+                }
+                u32::from_le_bytes(v)
+            };
+            vnet_bar_write_bytes(&mut bus, pcibridge_base, 0x08, &1u32.to_le_bytes()); // driver_feature_select = 1
+            vnet_bar_write_bytes(&mut bus, pcibridge_base, 0x0C, &high.to_le_bytes());
+
+            vnet_bar_write_byte(&mut bus, pcibridge_base, 0x14, 1); // ACKNOWLEDGE
+            vnet_bar_write_byte(&mut bus, pcibridge_base, 0x14, 1 | 2); // + DRIVER
+            vnet_bar_write_byte(&mut bus, pcibridge_base, 0x14, 1 | 2 | 8); // + FEATURES_OK
+            let status = vnet_bar_read_byte(&mut bus, pcibridge_base, 0x14);
+            assert_eq!(
+                status & 8,
+                8,
+                "FEATURES_OK must stick (VERSION_1 was acked)"
+            );
+            vnet_bar_write_byte(&mut bus, pcibridge_base, 0x14, status | 4); // + DRIVER_OK
+            assert_eq!(
+                vnet_bar_read_byte(&mut bus, pcibridge_base, 0x14),
+                1 | 2 | 8 | 4,
+                "negotiation must reach DRIVER_OK"
+            );
+
+            // Select and configure the tx queue (index 1).
+            vnet_bar_write_bytes(&mut bus, pcibridge_base, 0x16, &1u16.to_le_bytes()); // queue_select
+            vnet_bar_write_bytes(&mut bus, pcibridge_base, 0x18, &8u16.to_le_bytes()); // queue_size
+            let desc_addr = 0x1000u32;
+            let avail_addr = 0x2000u32;
+            let used_addr = 0x3000u32;
+            let buf_addr = 0x4000u32;
+            vnet_bar_write_bytes(
+                &mut bus,
+                pcibridge_base,
+                0x20,
+                &(desc_addr as u64).to_le_bytes(),
+            );
+            vnet_bar_write_bytes(
+                &mut bus,
+                pcibridge_base,
+                0x28,
+                &(avail_addr as u64).to_le_bytes(),
+            );
+            vnet_bar_write_bytes(
+                &mut bus,
+                pcibridge_base,
+                0x30,
+                &(used_addr as u64).to_le_bytes(),
+            );
+            vnet_bar_write_bytes(&mut bus, pcibridge_base, 0x1C, &1u16.to_le_bytes()); // queue_enable
+
+            // Lay out one tx descriptor: a 12-byte virtio-net header
+            // (all zero) followed by a 4-byte "frame".
+            let payload = [0xDEu8, 0xAD, 0xBE, 0xEF];
+            let mut frame = std::vec![0u8; 12 + payload.len()];
+            frame[12..].copy_from_slice(&payload);
+            for (i, b) in frame.iter().enumerate() {
+                bus.write_byte(buf_addr + i as u32, *b);
+            }
+            // virtq_desc: addr:u64, len:u32, flags:u16(=0), next:u16(=0).
+            for (i, b) in (buf_addr as u64).to_le_bytes().iter().enumerate() {
+                bus.write_byte(desc_addr + i as u32, *b);
+            }
+            for (i, b) in (frame.len() as u32).to_le_bytes().iter().enumerate() {
+                bus.write_byte(desc_addr + 8 + i as u32, *b);
+            }
+            bus.write_byte(desc_addr + 12, 0);
+            bus.write_byte(desc_addr + 13, 0);
+            bus.write_byte(desc_addr + 14, 0);
+            bus.write_byte(desc_addr + 15, 0);
+            // avail ring: flags(=0), idx=1, ring[0]=0.
+            bus.write_byte(avail_addr, 0);
+            bus.write_byte(avail_addr + 1, 0);
+            bus.write_byte(avail_addr + 2, 1); // idx low byte
+            bus.write_byte(avail_addr + 3, 0);
+            bus.write_byte(avail_addr + 4, 0); // ring[0] = 0
+            bus.write_byte(avail_addr + 5, 0);
+
+            assert_eq!(
+                bus.pending_irq_level(),
+                0,
+                "nothing pending before any traffic"
+            );
+
+            // Drive the engine: MachineBus::tick's pcibridge dance walks
+            // the tx ring, hands the frame to the backend, and publishes
+            // a used-buffer completion -- see `MachineBus::tick`'s own
+            // doc comment on this.
+            bus.tick(1);
+
+            assert_eq!(
+                pcibridge_read_u32(&mut bus, pcibridge_base + pcibridge::reg::INTX_STATUS) & 1,
+                1,
+                "INTA must be visible in INTX_STATUS after a used buffer is added"
+            );
+            pcibridge_write_u32(&mut bus, pcibridge_base + pcibridge::reg::INTX_ENABLE, 1);
+            assert_eq!(
+                bus.pending_irq_level(),
+                2,
+                "PORTS (level 2) must be pending once INTA is unmasked"
+            );
+
+            // The ISR read (through the register file's real BAR
+            // aperture, not a host-side shortcut) clears both the byte
+            // and the line -- but the chipset's own INTREQ latch, like
+            // every other card here, stays set until acknowledged.
+            let isr = vnet_bar_read_byte(&mut bus, pcibridge_base, 0x2000);
+            assert_eq!(isr & 1, 1);
+            assert_eq!(
+                pcibridge_read_u32(&mut bus, pcibridge_base + pcibridge::reg::INTX_STATUS) & 1,
+                0,
+                "INTX_STATUS drops the instant the device's own ISR is read"
+            );
+            let ports = 1u16 << chipset::intbit::PORTS;
+            bus.write_word(CUSTOM_BASE + chipset::reg::INTREQ as u32, ports);
+            assert_eq!(bus.pending_irq_level(), 0);
+        }
+
+        assert_eq!(backend.transmitted.len(), 1);
+        assert_eq!(backend.transmitted[0], [0xDEu8, 0xAD, 0xBE, 0xEF]);
     }
 
     /// A machine that never calls `with_pcibridge` is completely

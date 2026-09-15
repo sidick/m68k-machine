@@ -12,6 +12,7 @@ mod console;
 mod hd_image;
 mod input_script;
 mod introspect;
+mod netharness;
 mod pktvol;
 mod rom_image;
 mod run;

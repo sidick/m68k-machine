@@ -332,11 +332,12 @@ pub struct Args {
     /// Attach the `pcibridge` Zorro III PCI shim (ADR 0005 stage 1,
     /// `machine_core::pcibridge`), backed by the host-side virtual PCI
     /// topology (`machine_core::pci`): a QEMU-root-shaped host bridge at
-    /// 00:00.0 and a config-space-complete modern virtio-net device
-    /// (1af4:1041) at 00:01.0. See `docs/pcibridge-protocol.md`. This is
-    /// enumeration surface only this increment: no `pci.library`, no
-    /// driver -- attaching it with no guest software is inert but
-    /// harmless, the same posture every card's first increment took.
+    /// 00:00.0 and a modern virtio-net function (1af4:1041) at 00:01.0.
+    /// See `docs/pcibridge-protocol.md`. Stage 3 (`docs/virtionet.md`)
+    /// landed the virtio-net function's own logic and a SANA-II driver
+    /// (`Devs:virtionet.device`) to drive it; attaching this flag with no
+    /// guest driver installed is still inert but harmless, the same
+    /// posture every card's first increment took.
     #[arg(long, default_value_t = false)]
     pub pcibridge: bool,
 }

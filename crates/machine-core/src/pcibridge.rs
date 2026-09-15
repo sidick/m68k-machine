@@ -503,6 +503,17 @@ impl<'a> PciBridge<'a> {
         (self.intx_status() & self.intx_enable) != 0
     }
 
+    /// Advance whatever engine the backend holds by one step -- ADR 0005
+    /// stage 3's virtio-net ring processing, forwarded straight through
+    /// (module docs on [`PciBackend::tick`]). `pcibridge` itself has no
+    /// engine of its own (config cycles stay synchronous, module docs),
+    /// so this is pure delegation; [`crate::MachineBus::tick`] drives it
+    /// with the same lift-out-of-the-`Option`, call, put-back dance
+    /// `hostblk`/`pktport`'s own engines use.
+    pub fn tick(&mut self, mem: &mut dyn crate::GuestMemory) {
+        self.backend.tick(mem);
+    }
+
     /// Host-side cross-check of a guest-assigned BAR (or any other config
     /// register): reads straight through the backend, bypassing every
     /// guest-visible register ([`reg::CFG_ADDR`]/[`reg::CFG_WIDTH`]/
@@ -654,7 +665,8 @@ fn set_byte_of(value: &mut u32, lane: u32, byte: u8) {
 mod tests {
     use super::*;
     use crate::pci::{
-        HostBridge, IntxTestDevice, TestMemDevice, VirtioNetStub, VirtualPciBus, VirtualSlot,
+        HostBridge, IntxTestDevice, NullNetBackend, TestMemDevice, VirtioNetStub, VirtualPciBus,
+        VirtualSlot,
     };
 
     fn read_u32(dev: &mut PciBridge, base: u32) -> u32 {
@@ -728,7 +740,8 @@ mod tests {
     #[test]
     fn a_full_w32_config_read_cycle_reports_device_and_vendor_id() {
         let mut bridge = HostBridge::new();
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mut slots = [
             VirtualSlot {
                 bdf: Bdf {
@@ -760,7 +773,8 @@ mod tests {
 
     #[test]
     fn a_w16_read_at_offset_zero_reports_vendor_id_with_high_bits_zero() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mut slots = [VirtualSlot {
             bdf: Bdf {
                 bus: 0,
@@ -779,7 +793,8 @@ mod tests {
 
     #[test]
     fn a_w8_read_at_offset_one_reports_the_vendor_ids_high_byte() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mut slots = [VirtualSlot {
             bdf: Bdf {
                 bus: 0,
@@ -826,7 +841,8 @@ mod tests {
 
     #[test]
     fn a_config_write_then_read_round_trips_the_command_register() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mut slots = [VirtualSlot {
             bdf: Bdf {
                 bus: 0,
@@ -852,7 +868,8 @@ mod tests {
 
     #[test]
     fn bar_sizing_probe_through_the_card_reports_the_masked_size() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mut slots = [VirtualSlot {
             bdf: Bdf {
                 bus: 0,
@@ -889,7 +906,8 @@ mod tests {
 
     #[test]
     fn an_unknown_op_value_is_rejected_and_leaves_cfg_data_untouched() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mut slots = [VirtualSlot {
             bdf: Bdf {
                 bus: 0,
@@ -915,7 +933,8 @@ mod tests {
 
     #[test]
     fn a_reserved_high_bit_in_cfg_addr_is_rejected_and_leaves_cfg_data_untouched() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mut slots = [VirtualSlot {
             bdf: Bdf {
                 bus: 0,
@@ -939,7 +958,8 @@ mod tests {
 
     #[test]
     fn an_invalid_width_is_rejected_and_leaves_cfg_data_untouched() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mut slots = [VirtualSlot {
             bdf: Bdf {
                 bus: 0,
@@ -963,7 +983,8 @@ mod tests {
 
     #[test]
     fn a_misaligned_width_four_offset_is_rejected_and_leaves_cfg_data_untouched() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mut slots = [VirtualSlot {
             bdf: Bdf {
                 bus: 0,
@@ -1213,7 +1234,8 @@ mod tests {
         // writes, exactly like every other u32 register's non-hot lanes
         // on this card (`CFG_WIDTH`/`CFG_STATUS`'s own "hot at offset+3"
         // shape).
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mut slots = [VirtualSlot {
             bdf: Bdf {
                 bus: 0,
@@ -1241,7 +1263,8 @@ mod tests {
 
     #[test]
     fn the_gap_between_reserved_and_the_aperture_reads_zero_and_discards_writes() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mut slots = [VirtualSlot {
             bdf: Bdf {
                 bus: 0,
@@ -1264,7 +1287,8 @@ mod tests {
 
     #[test]
     fn intx_enable_and_test_only_keep_their_low_nibble() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mut slots = [VirtualSlot {
             bdf: Bdf {
                 bus: 0,
@@ -1346,7 +1370,8 @@ mod tests {
 
     #[test]
     fn irq_pending_is_true_only_while_status_and_enable_are_both_nonzero() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mut slots = [VirtualSlot {
             bdf: Bdf {
                 bus: 0,
@@ -1381,7 +1406,8 @@ mod tests {
 
     #[test]
     fn register_file_and_aperture_do_not_alias() {
-        let mut net = VirtioNetStub::new();
+        let mut net_backend = NullNetBackend;
+        let mut net = VirtioNetStub::new(&mut net_backend);
         let mut slots = [VirtualSlot {
             bdf: Bdf {
                 bus: 0,
