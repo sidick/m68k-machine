@@ -14,17 +14,19 @@ See `docs/m68k-machine-proposal.md` for the full design rationale and
 
 ## Status
 
-**Phase 2 — complete; Phase 3 (the m68k stack under emulation) under
-way.** Both target OSes boot and render their real boot screens with no
-boot device attached: Kickstart 3.2.2's checkered ball, Hyperion banner
-and floppy graphic; AROS 68k's cat-eyes logo, wordmark, "Waiting for
-bootable media" and device icons. See `docs/screenshots.md` for the
-evidence and the diagnostic traps found along the way, and proposal
-§8.1 for what the stop-gap renderer behind this does and does not
-cover.
+**Phase 3 — complete: "basically usable (emulated)".** One unattended
+boot of one maintained image reaches Workbench on the native RTG board
+with working input, storage and network — held as a single composed
+gate test (`scripts/phase3-gate.sh` is the one command; `docs/ci.md`
+records what runs where, since Kickstart is licensed media the public
+runners cannot boot). The roadmap's Phase 3 exit line carries a
+recorded scope note rather than a quiet pass: the gate proves the
+shared `machine-core` end to end, which both bare-metal board layers
+embed byte-identically, but those layers' own device bring-up is Phase
+4/5 hardware work — see the annotation in `docs/combined-roadmap.md`.
 
-Phase 3 is building this machine's own devices behind that renderer,
-tracked device-by-device in `docs/device-ledger.md`:
+The devices behind that boot, tracked device-by-device in
+`docs/device-ledger.md`:
 
 - **Storage:** `hostblk`, a doorbell-plus-descriptor Zorro III block
   card with a host-side transfer engine (ADR 0003), boots Kickstart
@@ -42,16 +44,24 @@ tracked device-by-device in `docs/device-ledger.md`:
   DiskSpeed 4.2: 2–7× faster, largest gains in file-create and -delete
   (`docs/pktport-measurement.md`), confirming the ADR's prediction.
 - **Display:** `rtgboard`, a generic native RTG board per ADR 0002
-  (rejecting a `uaegfx`-compatible approach as a dead end), has its
-  host side and register interface built (`docs/rtgboard-protocol.md`);
-  no P96 `.card` driver yet. The emulated Cirrus CL-GD542x/Graffity
-  path (which already renders a real Workbench desktop on RTG via
-  P96's own shipped driver) stays as the zero-install compatibility
-  tier once the native board's driver lands.
-- **Input:** a native input card (`input.rs`) has its host side built —
-  event queue, register interface (`docs/input-protocol.md`) — but no
-  m68k driver or DiagArea ROM yet, so no guest has seen a keypress
-  through it.
+  (rejecting a `uaegfx`-compatible approach as a dead end), drives a
+  real Workbench desktop through its own P96 `.card` driver
+  (`m68k/rtgboard-card/`, `docs/rtgboard-protocol.md`), screenshot-
+  and serial-verified. The emulated Cirrus CL-GD542x/Graffity path
+  stays as the zero-install compatibility tier.
+- **Input:** the native input card (`input.rs`,
+  `docs/input-protocol.md`) delivers pointer motion, clicks and
+  keypresses through its own DiagArea driver ROM (`m68k/input-rom/`),
+  proven end to end on the rtgboard RTG screen — P96 soft-renders the
+  pointer, Intuition routes the clicks, scripted double-clicks open
+  real drawers.
+- **Network and PCI:** `pcibridge` exposes a real PCI surface (ADR
+  0005) behind `pci.library` — the Prometheus API, implemented by
+  `LIBS:prometheus.library` (`m68k/prometheus-library/`,
+  `docs/pci-library.md`) — and a virtio-net function driven by
+  `virtionet.device` (`m68k/virtionet-device/`, SANA-II,
+  `docs/virtionet.md`): first-packet round trip and a SanaConform
+  conformance pass, all narrated over serial.
 - Zorro III AUTOCONFIG (`autoconfig.rs`) and fast RAM (`fastram.rs`,
   on by default at 256 MB) underpin all of the above; addresses are
   always asked from `MachineBus`, never hardcoded.

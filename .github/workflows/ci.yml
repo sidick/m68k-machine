@@ -55,6 +55,17 @@ jobs:
       - name: cargo test -p machine-hosted
         run: cargo test -p machine-hosted
 
+      # The Phase 3 unattended-boot gate (docs/ci.md) cannot RUN here:
+      # it boots licensed Kickstart media, which only private/local
+      # runners have. The step above already compiles it; this step
+      # asserts it stays listed, so public CI still fails if the gate
+      # test is renamed away or dropped. `scripts/phase3-gate.sh` is
+      # what actually runs it, on a machine with the media.
+      - name: Phase 3 unattended-boot gate test compiled and listed
+        run: |
+          cargo test -p machine-hosted --test real_rom -- --list \
+            | grep -F "kickstart_3_2_2_a1200_boots_unattended_to_rtg_workbench_with_input_storage_network"
+
   # aarch64 harness: build board-qemu-virt, boot it under QEMU's `virt`
   # machine, and assert it runs its bus/CPU checks and then boots the
   # embedded AROS ROM pair on bare metal, narrating over the PL011 UART.

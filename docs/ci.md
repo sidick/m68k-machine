@@ -3,7 +3,10 @@
 `.github/workflows/ci.yml` runs on every push to `main` and every pull
 request, all on `ubuntu-latest`. Five jobs: the Phase 0 skeleton ("CI
 skeleton: amiga-gcc toolchain container; both QEMU harnesses") plus the
-Phase 1 `aros-smoke` gate described below.
+Phase 1 `aros-smoke` gate described below. The Phase 3 unattended-boot
+gate has its own section at the end of this document, recording exactly
+what of it runs where — that split (public runners vs local media) is
+deliberate and load-bearing.
 
 ## `test`
 
@@ -91,13 +94,14 @@ the toolchain at `/opt/amiga` with `m68k-amigaos-gcc` etc. on `PATH`),
 then verifies the output is a real AmigaOS hunk executable by checking
 its first four bytes equal the hunk magic `0x000003F3`.
 
-This is **not** the start of the real m68k-side stack — per
-`docs/combined-roadmap.md` and the README's "Related" section, that
-(drivers, boot ROMs, DiagArea modules — code that runs *on* the emulated
-68k) is planned to live in its own repository, not yet created. This job
-only proves the amiga-gcc container itself works and produces valid
-output, so the toolchain risk is caught early and doesn't surface for the
-first time once the real m68k stack exists to build.
+This is **not** the build of the real m68k-side stack — that (drivers,
+boot ROMs, DiagArea modules — code that runs *on* the emulated 68k) now
+lives in this repo under `m68k/`, built locally by `scripts/build-*.sh`
+with the binaries committed (see the README's "Related" section for why
+in-repo rather than the separate repository originally planned). This
+job only proves the amiga-gcc container itself works and produces valid
+output, so toolchain rot is caught on every commit rather than at the
+next local driver build.
 
 ## `aros-smoke`
 
@@ -240,3 +244,54 @@ version bump should not spuriously break this job):
 (`if: always()`, matching the QEMU jobs), and a missing marker makes
 `check-serial-markers.sh` dump the whole captured log to the job's output
 before failing, so a failure is diagnosable from the Actions UI alone.
+
+## The Phase 3 unattended-boot gate
+
+The roadmap's Phase 3 exit criterion ("boots unattended to Workbench on
+RTG with input, storage, network under QEMU") exists as one composed
+real-ROM test:
+`kickstart_3_2_2_a1200_boots_unattended_to_rtg_workbench_with_input_storage_network`
+in `crates/machine-hosted/tests/real_rom.rs` — a SINGLE boot of a single
+image proving all four properties at once, composing the three existing
+proofs (rtgboard desktop, rtgboard×input pointer/click, virtionet
+first-packet round trip) plus a guest storage write read back out of the
+booted image with xdftool. The image is built by
+`scripts/patch-unattended-hdf.sh`, which chains the rtgboard and
+virtionet patch scripts onto the amibake base and adds the one
+storage-evidence line; the individual per-feature tests all remain.
+
+### What runs where
+
+**Locally (the gate proper):** `scripts/phase3-gate.sh` is the single
+command. It refuses to run without the licensed inputs (a gate that can
+silently skip is not a gate — the underlying cargo test, correctly,
+skips clean clones without media), rebuilds the composed image fresh
+from the base, and runs the one test. This is what a release-gating
+machine with the media actually executes.
+
+**Public runners (`test` job):** the gate test cannot run there —
+Kickstart 3.2.2 is licensed media that cannot be redistributed to
+GitHub's runners, the same split the `aros-smoke` section above records
+— but `cargo test -p machine-hosted` compiles it on every commit, and a
+dedicated step asserts it stays *listed* (`cargo test --test real_rom
+-- --list | grep`), so renaming it away or dropping it fails public CI
+even though running it cannot.
+
+**The AROS side stays smoke-level, deliberately.** `aros-smoke` remains
+the public boot gate ("ROM pair loads, exec starts, serial output
+reached"). An AROS-to-Workbench-on-RTG assertion is NOT part of the
+Phase 3 gate: it depends on resolving P96-vs-HIDD, which is Phase 4's
+recorded AROS work (`docs/combined-roadmap.md`), and pulling it forward
+here would gate Phase 3 on Phase 4's open question.
+
+### Scope: "both platforms" and the board crates
+
+The roadmap's exit line says "both platforms". What this gate proves,
+and what it deliberately does not, is recorded as an annotation on that
+exit line in `docs/combined-roadmap.md` rather than restated here —
+read it there. The short form: the gate runs the shared `machine-core`
+through `machine-hosted` (the same core the board layers embed, byte
+for byte), while the bare-metal board crates have no storage/RTG/input/
+PCI devices wired and their device bring-up (real-ECAM `PciBackend` and
+the rest) moves explicitly to the Phase 4/5 hardware work where ADR
+0001's decision needs it.

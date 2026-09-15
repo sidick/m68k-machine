@@ -108,6 +108,22 @@ fn sanaconform_hd_image() -> String {
     fixture("M68K_TEST_SANACONFORM_HDF", "m68k-machine-sanaconform.hdf")
 }
 
+/// The Phase 3 unattended-boot gate's single composed image
+/// (`scripts/patch-unattended-hdf.sh`): it chains `patch-rtgboard-hdf.sh`
+/// and `patch-virtionet-hdf.sh` onto the same `amibake` base as the other
+/// fixtures above -- so this one HDF carries both the `rtgboard.card` P96
+/// driver and the `virtionet.device`/`VNetTest` pair, on the one image --
+/// and then prepends one further storage-evidence line above `C:VNetTest`
+/// in `S/Startup-Sequence`: `Echo >SYS:unattended-boot.txt
+/// "UNATTENDED-BOOT-STORAGE-OK"`. That line is this composed image's own
+/// addition, not present on either sibling HDF, and exists so an
+/// unattended run leaves positive, guest-written proof that storage itself
+/// was writable and read back, rather than relying on "the boot proceeded
+/// past `C:VNetTest`" as implicit evidence.
+fn unattended_hd_image() -> String {
+    fixture("M68K_UNATTENDED_HDF", "m68k-machine-unattended.hdf")
+}
+
 /// Locate `xdftool` (amitools) the same way every `scripts/patch-*-hdf.sh`
 /// script does: `$XDFTOOL`, else `xdftool` on `PATH`, else the usual venv/
 /// pipx install locations. Used here to extract `SYS:sanaconform.log`
@@ -2049,6 +2065,280 @@ fn kickstart_3_2_2_a1200_sanaconform_gates_virtionet_device() {
     // line (unlike VNetTest/PCIProbe's own "result: ALL PASS"), so there
     // is nothing to additionally assert the negative of here.
 
+    let _ = std::fs::remove_file(&serial_log_path);
+    let _ = std::fs::remove_file(&hd);
+}
+
+/// The roadmap's Phase 3 exit criterion made into a single boot: ONE
+/// unattended run of the composed `unattended_hd_image()` fixture, proving
+/// Workbench on the rtgboard RTG screen AND scripted pointer/click input
+/// AND a virtio-net first-packet round trip AND a positive storage write/
+/// readback -- all in the same boot, not four separate ones. This test
+/// composes three sibling proofs already pinned elsewhere in this file
+/// rather than inventing new markers or floors:
+/// - `kickstart_3_2_2_a1200_workbench_renders_through_the_rtgboard_card_driver`
+///   and `scripted_pointer_and_double_click_work_on_the_rtgboard_rtg_screen`
+///   for the RTG desktop, pointer and click evidence;
+/// - `kickstart_3_2_2_a1200_virtionet_first_packet_round_trip` for the
+///   virtio-net DevInit/tx/rx chain and its host-side frame capture.
+///
+/// Every floor below is either the cited sibling's own pinned number, or
+/// re-measured directly on THIS composed fixture by the supervisor's own
+/// probe runs on this machine, 2026-09-15:
+/// - the input timeline is copied verbatim from the pointer/click sibling
+///   (same `SLEEP`/`MOVE`/double-click script and frame numbers) -- the
+///   probe confirmed the composed boot's desktop is already up by frame
+///   4600, with the same 31,9xx non-background-pixel / 6-colour stats as
+///   the rtgboard-only sibling, so that sibling's timeline transfers here
+///   unchanged;
+/// - all ten virtio-net serial markers and the host-side frame capture
+///   from `kickstart_3_2_2_a1200_virtionet_first_packet_round_trip` were
+///   confirmed present, verbatim, in the composed boot's serial log;
+/// - click evidence was re-measured on this exact composed image rather
+///   than assumed from the sibling: closed desktop (captures 1-2) measured
+///   9,093 white / 6,599 black pixels, the open SYS drawer (capture 3)
+///   measured 13,110 white / 11,298 black -- close to, but not identical
+///   to, the pointer/click sibling's own 13,181/11,221 and 13,121/11,281
+///   run-to-run readings, so the same floors (white >= 11,000, black
+///   >= 9,500) apply here with the same margin logic.
+///
+/// The one deliberate addition over all three siblings: after the run,
+/// `SYS:unattended-boot.txt` is read back with `xdftool_read` and must
+/// contain `UNATTENDED-BOOT-STORAGE-OK`. Booting successfully from
+/// `--hostblk` is only ever *implicit* storage evidence -- the guest could
+/// still be silently failing to actually write back to the medium, and
+/// silent failure is this platform's norm (see this file's other tests'
+/// own doc comments for examples). This is the first test in this file to
+/// demand a positive, guest-written readback as its storage proof.
+///
+/// Like `kickstart_3_2_2_a1200_sanaconform_gates_virtionet_device` above,
+/// the fixture is copied to a temp path and booted `--hostblk-writable`:
+/// the guest writes `unattended-boot.txt` onto it, and mutating the
+/// checked-in fixture in place would break idempotency across runs.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and the patched unattended HDF on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_boots_unattended_to_rtg_workbench_with_input_storage_network() {
+    let rom = kickstart_a1200();
+    let hd_fixture = unattended_hd_image();
+    if !have_fixtures(&[&rom, &hd_fixture]) {
+        return;
+    }
+
+    // Never boot the checked-in fixture directly -- the guest writes
+    // SYS:unattended-boot.txt onto it, so every run must start from a
+    // fresh copy (same pattern as the sanaconform test above).
+    let hd = std::env::temp_dir().join(format!(
+        "machine-hosted-unattended-{}.hdf",
+        std::process::id()
+    ));
+    std::fs::copy(&hd_fixture, &hd).unwrap_or_else(|e| panic!("copy {hd_fixture} -> {hd:?}: {e}"));
+    let hd = hd.to_str().unwrap().to_string();
+
+    let script_path = std::env::temp_dir().join(format!(
+        "machine-hosted-unattended-{}.input",
+        std::process::id()
+    ));
+    std::fs::write(
+        &script_path,
+        "SLEEP 5100\n\
+         MOVE 100 100\nSLEEP 150\n\
+         MOVE 500 380\nSLEEP 200\n\
+         MOVE 42 73\nSLEEP 10\n\
+         BUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 5\n\
+         BUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 300\n",
+    )
+    .expect("write input script");
+
+    let serial_log_path = std::env::temp_dir().join(format!(
+        "machine-hosted-unattended-{}.serial.log",
+        std::process::id()
+    ));
+
+    let base_path = screenshot_path("unattended");
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--hostblk-writable",
+        "--pcibridge",
+        "--rtgboard",
+        "640x480",
+        "--rtgboard-format",
+        "rgb565",
+        "--input-script",
+        script_path.to_str().unwrap(),
+        "--screenshot",
+        base_path.to_str().unwrap(),
+        "--screenshot-frame",
+        "5200",
+        "--screenshot-every",
+        "220",
+        "--max-frames",
+        "5700",
+        "--max-instructions",
+        "5000000000",
+        "--serial-log",
+        serial_log_path.to_str().unwrap(),
+        "--inspect",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    // Assertion (a): the final --screenshot-every capture actually fired
+    // (kickstart_3_2_2_a1200_workbench... / scripted_pointer... sibling
+    // pattern).
+    assert!(
+        stdout.contains("screenshot: frame 5640"),
+        "expected the final --screenshot-every capture to actually fire by frame 5640"
+    );
+
+    let serial_log = std::fs::read_to_string(&serial_log_path)
+        .unwrap_or_else(|e| panic!("read serial log {serial_log_path:?}: {e}"));
+
+    // Assertion (b): rtgboard driver-narration markers, verbatim from
+    // scripted_pointer_and_double_click_work_on_the_rtgboard_rtg_screen.
+    for marker in [
+        "rtgboard: FindCard: board at",
+        "rtgboard: InitCard: rtg.library version",
+        "rtgboard: SetGC 640x480 committed: APPLIED",
+        "rtgboard: SetPanning: offset 0x0 committed: APPLIED",
+    ] {
+        assert!(
+            serial_log.contains(marker),
+            "expected the driver's serial narration to contain {marker:?}; \
+             serial log:\n{serial_log}"
+        );
+    }
+    assert!(
+        !serial_log.contains("committed: REJECTED"),
+        "expected no rejected mode/panning commit; serial log:\n{serial_log}"
+    );
+
+    // Assertion (c): virtio-net serial markers, verbatim from
+    // kickstart_3_2_2_a1200_virtionet_first_packet_round_trip.
+    for marker in [
+        "VNETDEV: DevInit entry",
+        "VNETDEV: DevInit: capabilities common ",
+        "VNETDEV: DevInit: features negotiated (VERSION_1, NET_F_MAC)",
+        "VNETDEV: DevInit: MAC 02:6D:36:4B:00:01",
+        "VNETDEV: DevInit complete, DRIVER_OK set",
+        "VNETTEST opendevice: PASS",
+        "VNETTEST tx frame: dst FF:FF:FF:FF:FF:FF ethertype $88B5 payload \"M68KVNET-TX-0001\" (16 bytes)",
+        "VNETDEV: isr: first queue interrupt observed (device INTx via INT2)",
+        "VNETTEST cmd_read: PASS received frame ethertype $88B5 payload \"M68KVNET-RX-REPLY-0001\" (22 bytes)",
+        "VNETTEST result: ALL PASS",
+    ] {
+        assert!(
+            serial_log.contains(marker),
+            "expected the serial narration to contain {marker:?} -- \
+             serial log:\n{serial_log}"
+        );
+    }
+    assert!(
+        !serial_log.contains(" FAIL"),
+        "expected no failing check anywhere in the serial log:\n{serial_log}"
+    );
+
+    // Assertion (d): host-side network evidence, verbatim from
+    // kickstart_3_2_2_a1200_virtionet_first_packet_round_trip.
+    let expected_frame_hex = "ff ff ff ff ff ff 02 6d 36 4b 00 01 88 b5 4d 36 \
+        38 4b 56 4e 45 54 2d 54 58 2d 30 30 30 31 00 00 00 00 00 00 00 00 00 \
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
+    assert!(
+        stdout.contains("pcibridge net harness: 1 frame(s) transmitted by the guest"),
+        "expected --inspect to report exactly one transmitted frame:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("frame 0: 60 byte(s): {expected_frame_hex}")),
+        "expected the recorded frame's exact bytes:\n{stdout}"
+    );
+
+    // Assertion (e): pointer/click input evidence, verbatim from
+    // scripted_pointer_and_double_click_work_on_the_rtgboard_rtg_screen.
+    assert!(
+        stdout.contains("MouseX 42  MouseY 73"),
+        "expected IntuitionBase->MouseX/MouseY to read back exactly (42, 73) \
+         on this RTG screen, un-doubled: {stdout}"
+    );
+    assert!(
+        stdout.contains("EVENT_COUNT 0  EVENT_OVERFLOW 0"),
+        "expected the input card's queue fully drained with no drops by the end of the run: {stdout}"
+    );
+
+    // Assertion (f): all three captures decode to exactly 640x480.
+    let capture1 = base_path.with_file_name(format!(
+        "{}-005200.png",
+        base_path.file_stem().unwrap().to_string_lossy()
+    ));
+    let capture2 = base_path.with_file_name(format!(
+        "{}-005420.png",
+        base_path.file_stem().unwrap().to_string_lossy()
+    ));
+    let capture3 = base_path.with_file_name(format!(
+        "{}-005640.png",
+        base_path.file_stem().unwrap().to_string_lossy()
+    ));
+
+    let (width1, height1, rgba1) = decode_png(&capture1);
+    let (width2, height2, rgba2) = decode_png(&capture2);
+    let (width3, height3, rgba3) = decode_png(&capture3);
+    for (width, height) in [(width1, height1), (width2, height2), (width3, height3)] {
+        assert_eq!(
+            (width, height),
+            (640, 480),
+            "an RTG screenshot's dimensions come from the driver-programmed mode"
+        );
+    }
+
+    // Assertion (g): pointer evidence on all three captures -- see
+    // `red_pointer_pixels` and this test's doc comment.
+    red_pointer_pixels(width1, &rgba1, 100, 100);
+    red_pointer_pixels(width2, &rgba2, 500, 380);
+    red_pointer_pixels(width3, &rgba3, 42, 73);
+
+    // Assertion (h): click evidence, same floors as the pointer/click
+    // sibling, re-measured on this composed fixture (see this test's doc
+    // comment for the measured numbers and comparison against the
+    // sibling's own readings).
+    const WHITE: [u8; 4] = [255, 255, 255, 255];
+    const BLACK: [u8; 4] = [0, 0, 0, 255];
+    let white3 = rgba3.chunks(4).filter(|px| *px == WHITE).count();
+    let black3 = rgba3.chunks(4).filter(|px| *px == BLACK).count();
+    assert!(
+        white3 >= 11_000,
+        "expected the SYS drawer's white furniture on capture 3, got {white3} \
+         white pixels -- 9,093 would mean the closed desktop (click opened \
+         nothing); see this test's doc comment"
+    );
+    assert!(
+        black3 >= 9_500,
+        "expected the SYS drawer's black furniture/text on capture 3, got \
+         {black3} black pixels -- 6,599 would mean the closed desktop (click \
+         opened nothing); see this test's doc comment"
+    );
+
+    let white1 = rgba1.chunks(4).filter(|px| *px == WHITE).count();
+    assert!(
+        white1 < 11_000,
+        "expected capture 1's closed-desktop white count (measured 9,093) to \
+         sit below the open-drawer floor used above, as a control showing \
+         that floor genuinely discriminates within this same run -- got \
+         {white1}"
+    );
+
+    // Assertion (i): storage -- the one deliberate addition over the three
+    // siblings above (see this test's doc comment).
+    let log = xdftool_read(&hd, "unattended-boot.txt");
+    assert!(
+        log.contains("UNATTENDED-BOOT-STORAGE-OK"),
+        "expected SYS:unattended-boot.txt to contain UNATTENDED-BOOT-STORAGE-OK -- log:\n{log}"
+    );
+
+    // Assertion (j): cleanup, matching the siblings (screenshots are left
+    // behind, same as every other test in this file).
+    let _ = std::fs::remove_file(&script_path);
     let _ = std::fs::remove_file(&serial_log_path);
     let _ = std::fs::remove_file(&hd);
 }
