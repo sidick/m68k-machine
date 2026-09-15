@@ -24,6 +24,22 @@ pub struct Args {
     #[arg(long)]
     pub ext_rom: Option<PathBuf>,
 
+    /// Path to a Cloanto/Amiga Forever `rom.key` file, used to decode a
+    /// Cloanto-encoded (`AMIROMTYPE1`-framed) ROM image passed via `--rom`
+    /// or `--ext-rom` (`crate::rom_image`, over `amiga_rom::Loader`).
+    /// Amiga Forever ships this file alongside its own ROM images; it is
+    /// a small XOR key, not itself Cloanto-encoded, and safe to keep
+    /// alongside those ROMs rather than in this repository.
+    ///
+    /// Without this flag, a Cloanto-encoded image is refused with an
+    /// explanation naming this flag -- never booted as the raw XOR'd
+    /// bytes it would otherwise be, which is not a ROM at all, just noise
+    /// that happens to be the right length. Ignored (not read) when
+    /// neither `--rom` nor `--ext-rom` turns out to be Cloanto-encoded --
+    /// an ordinary raw Kickstart dump never touches this key.
+    #[arg(long)]
+    pub rom_key: Option<PathBuf>,
+
     /// CPU model to present to the guest. Only `68040` is implemented
     /// today (proposal §6.2); the flag exists so the choice is explicit
     /// and future models are a non-breaking addition.

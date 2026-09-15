@@ -169,20 +169,44 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     console.diag("m68k Machine hosted runner -- Phase 1 blind boot");
     console.diag(&format!("main ROM: {}", args.rom.display()));
 
+    // Read once up front, outside either ROM's loading below: both
+    // `--rom` and `--ext-rom` can be Cloanto-encoded (in principle;
+    // `--ext-rom` being encoded is unusual but not refused specially),
+    // and a failure to read a *given* `--rom-key` path is itself a setup
+    // error, distinct from "no key was needed at all" -- reported before
+    // either ROM's own load so a bad `--rom-key` path is diagnosed
+    // immediately rather than only surfacing once a Cloanto image
+    // happens to need it.
+    let rom_key = match &args.rom_key {
+        Some(path) => match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                return setup_error(
+                    console,
+                    format!("reading --rom-key {}: {e}", path.display()),
+                )
+            }
+        },
+        None => None,
+    };
+
     let rom_bytes = match load_rom("main", &args.rom) {
         Ok(b) => b,
         Err(e) => return setup_error(console, e),
     };
-    rom_image::report_identify(console, "main", &rom_bytes);
+    let rom_bytes = match rom_image::prepare(console, "main", rom_bytes, rom_key.as_deref()) {
+        Ok(b) => b,
+        Err(e) => return setup_error(console, e),
+    };
 
     let ext_rom_bytes = match &args.ext_rom {
         Some(path) => {
             console.diag(&format!("ext ROM: {}", path.display()));
             match load_rom("ext", path) {
-                Ok(b) => {
-                    rom_image::report_identify(console, "ext", &b);
-                    Some(b)
-                }
+                Ok(b) => match rom_image::prepare(console, "ext", b, rom_key.as_deref()) {
+                    Ok(b) => Some(b),
+                    Err(e) => return setup_error(console, e),
+                },
                 Err(e) => return setup_error(console, e),
             }
         }

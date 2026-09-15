@@ -50,3 +50,27 @@ license = "MIT OR Apache-2.0"
 # pieces (see the fork's Cargo.toml); this project only wants the core
 # interpreter, which works no_std + libm.
 m68k = { git = "https://github.com/sidick/m68k-rs", rev = "5d27b8c083e1e6db6c13596f96c36dcc5f347e7f", default-features = false }
+
+# The project owner's own crate (like `m68k` above -- same author, same
+# pin-by-rev posture, but a different cause). `amiga-rom` 0.3.0 on
+# crates.io lacks doubled-image detection (`KickRom::check_doubled` /
+# `RomInfo::doubled_ok`) -- a fact this project's real `kickstart-34.5.rom`
+# fixture (Kickstart 1.3's doubled 512 KB layout: a 256 KB image mirrored
+# twice to fill a 512 KB EEPROM footprint) directly exercises. That fix
+# landed in `42ae522` ("Add KickRom::check_doubled and RomInfo::doubled_ok");
+# this pin sits one commit further, at `8ae26a4` ("Add machine
+# identification: machine_hints and identify/KnownRom"), which is a strict
+# superset -- it additionally carries `KickRom::machine_hints()` (best-
+# effort machine-identity signals from resident names) and a checksum-
+# table `identify`/`KnownRom` lookup, neither required by this crate's own
+# use here but harmless to pick up along the way. Neither commit is
+# released to crates.io yet -- the release is being held back for further
+# work on the crate, unrelated to this project's needs -- so pinning by
+# `rev`, not `branch`, is the only way to get either fix at all right now.
+# Same reasoning as the `m68k` pin above (a branch moves under us, a rev
+# doesn't, and an unplanned change landing under this project's test suite
+# must be a deliberate, reviewed step), just arrived at from the opposite
+# direction: there `crates.io` was deliberately avoided because no release
+# exists yet; here a release exists but is stale, so the fix has to come
+# from a specific commit past it instead.
+amiga-rom = { git = "https://github.com/sidick/amiga-rom-rs", rev = "8ae26a4a6c14365544666cbf92f416ec030d56ed" }

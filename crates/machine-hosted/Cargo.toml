@@ -50,6 +50,18 @@ png = "0.18.1"
 amiga-rdb = "0.4"
 amiga-ffs = "0.3"
 
+# ROM normalization/identification for the hosted runner (`rom_image.rs`):
+# byte-order detection/correction, Cloanto/Amiga Forever decode, and
+# `KickRom` inspection. Pinned by `rev` in [workspace.dependencies] (root
+# Cargo.toml) -- see that pin's own comment for why. This replaces the
+# duplicated logic `machine-core`'s own `rom.rs` keeps: that module stays
+# allocator-free (`no_std`, no `alloc`) because the bare-metal board
+# crates depend on it too, so it cannot pull in this crate's `Vec`-owning
+# `Loader`. `machine-hosted` is `std` regardless, so there is no reason for
+# it to hand-roll the same byte-order/Cloanto logic machine-core already
+# has to keep minimal for a different set of constraints.
+amiga-rom = { workspace = true }
+
 [dev-dependencies]
 # **New dev-only dependency, flagged prominently per this crate's task
 # constraints.** Used solely by `tests/blitter_differential.rs` (`#[ignore]`d,

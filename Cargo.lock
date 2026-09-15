@@ -21,6 +21,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "362f43b2e4bb6094407669798235df5a9747d182eb74ce5aba2d65605b5ba6b3"
 
 [[package]]
+name = "amiga-rom"
+version = "0.3.0"
+source = "git+https://github.com/sidick/amiga-rom-rs?rev=8ae26a4a6c14365544666cbf92f416ec030d56ed#8ae26a4a6c14365544666cbf92f416ec030d56ed"
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -231,6 +236,7 @@ version = "0.1.0"
 dependencies = [
  "amiga-ffs",
  "amiga-rdb",
+ "amiga-rom",
  "clap",
  "m68k",
  "machine-core",
