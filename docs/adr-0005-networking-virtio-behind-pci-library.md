@@ -1,9 +1,9 @@
 # ADR 0005 — Networking is virtio-net behind a real `pci.library`
 
-**Status:** proposed, 2026-09-15. Drafted before the networking work
-starts, because every other device family has diverged from the
-proposal's paravirtual plan by now and networking should either diverge
-for the same reasons or record why it does not.
+**Status:** accepted, 2026-09-15. Drafted and decided before the
+networking work starts, because every other device family has diverged
+from the proposal's paravirtual plan by now and networking should
+either diverge for the same reasons or record why it does not.
 
 **Context:** proposal §10.1–§10.2 (the `pci.library` and virtio-as-
 first-bus plan this ADR re-examines); `docs/device-ledger.md` (the
