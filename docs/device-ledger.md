@@ -321,11 +321,18 @@ it existed — the second time this file went stale the same way; when a
 device's "not yet built" claim matters to a decision, check the
 `m68k/` directory before trusting it.)
 
-**Not yet proven:** the input driver against an RTG screen driven by
+**Proven (2026-09-15):** the input driver against an RTG screen driven by
 `rtgboard.card` — `docs/rtgboard-protocol.md` §9's combination (P96
 soft-renders the pointer into rtgboard VRAM; Intuition routes clicks by
-pointer position). Both drivers now exist, so this combination test is
-unblocked.
+pointer position) — is now verified end to end against real Kickstart
+3.2.2, pinned by `crates/machine-hosted/tests/real_rom.rs`'s
+`scripted_pointer_and_double_click_work_on_the_rtgboard_rtg_screen`: the
+pointer soft-renders into rtgboard VRAM and moves with scripted `MOVE`s
+to the exact commanded coordinate, and a scripted double-click at the
+SYS icon opens the SYS drawer window on the RTG screen (white pixels
+9,093 → 13,181, black 6,599 → 11,221). Neither driver needed
+modification — see `docs/rtgboard-protocol.md` §10 for the full
+measurements.
 
 The design brief this card was built against initially described
 `IECLASS_POINTERPOS` as the class an external driver injects for absolute

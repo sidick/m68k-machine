@@ -1203,6 +1203,290 @@ fn kickstart_3_2_2_a1200_workbench_renders_through_the_rtgboard_card_driver() {
     let _ = std::fs::remove_file(&serial_log_path);
 }
 
+/// Every `(x, y)` in `rgba` (a `width`-wide RGBA8 image) whose pixel is
+/// exact `[239, 69, 66, 255]` -- the red body colour of the Workbench
+/// pointer P96 soft-renders into rtgboard VRAM (see this test's own doc
+/// comment for why that colour, rather than the pointer's cream highlight
+/// or black outline, is the discriminant used here).
+fn red_pointer_pixels(width: u32, rgba: &[u8], expected_x: u32, expected_y: u32) -> Vec<(u32, u32)> {
+    const RED: [u8; 4] = [239, 69, 66, 255];
+    let mut found = Vec::new();
+    for (i, px) in rgba.chunks(4).enumerate() {
+        if *px == RED {
+            let x = (i as u32) % width;
+            let y = (i as u32) / width;
+            found.push((x, y));
+        }
+    }
+    assert!(
+        found.len() >= 20,
+        "expected at least 20 red pointer pixels near ({expected_x}, {expected_y}), \
+         got {} -- see this test's doc comment (measured: exactly 31 in every capture)",
+        found.len()
+    );
+    for &(x, y) in &found {
+        assert!(
+            (expected_x..=expected_x + 15).contains(&x) && (expected_y..=expected_y + 15).contains(&y),
+            "expected every red pointer pixel within a 16x16 box at \
+             ({expected_x}, {expected_y}), but found one at ({x}, {y}) -- this is exactly \
+             the 'pointer stale-rendered somewhere else too' failure mode this helper \
+             exists to catch; see this test's doc comment"
+        );
+    }
+    found
+}
+
+/// `docs/rtgboard-protocol.md` §9's named combination: pointer motion and
+/// clicks from the native input card working on a real Picasso96 RTG
+/// screen driven by `rtgboard.card`, not the planar renderer or the
+/// built-in Cirrus emulation. Verified manually 2026-09-15 by the
+/// supervisor; every number in this test is measured from that exact run,
+/// deterministic across runs except where noted below.
+///
+/// Why this combination is non-trivial: `rtgboard.card` declines a
+/// hardware sprite (it sets `SoftSpriteFlags = RGBFF_R5G6B5` in its
+/// `BoardInfo`, telling P96 "render the pointer image into my framebuffer
+/// yourself"), so on this driver the mouse pointer only ever appears on
+/// screen if P96's own soft-sprite path actually engages and writes real
+/// pixels into rtgboard VRAM -- there is no hardware cursor plane to fall
+/// back on. Separately, Intuition has to route each click to the window
+/// under the pointer using *its own* idea of where the pointer is
+/// (`IntuitionBase->MouseX`/`MouseY`, updated by the input driver resolving
+/// `IntuitionBase->ActiveScreen` for each `IECLASS_NEWPOINTERPOS`/
+/// `IESUBCLASS_PIXEL` event -- `docs/input-protocol.md` §13) -- on an RTG
+/// screen this is a different code path from the planar screens the other
+/// scripted-click tests in this file exercise. This test is the first to
+/// exercise both at once.
+///
+/// This distinguishes two failure modes that a plain "the drawer opened"
+/// or "some pixels changed" assertion would miss:
+/// - **(a) no pointer at all**: the `SoftSpriteFlags`/soft-sprite path
+///   silently fails to engage (e.g. the driver's declared format doesn't
+///   match what P96 tries to render into) -- zero red pixels anywhere on
+///   screen, even though clicks might still happen to land correctly.
+/// - **(b) pointer renders but clicks land elsewhere**: the soft-sprite
+///   pointer follows `MOVE` correctly (proving pointer-motion plumbing
+///   alone works) but Intuition's click routing uses stale or wrong
+///   coordinates -- the SYS drawer never opens even though the pointer
+///   visibly reached the icon.
+///
+/// Input script and timeline (frames): Workbench on the RTG screen is up
+/// well before frame 5100 (the sibling
+/// `kickstart_3_2_2_a1200_workbench_renders_through_the_rtgboard_card_
+/// driver` test above captures its desktop at frame 5000). `MOVE 100 100`
+/// fires at frame 5100; `MOVE 500 380` at 5250; `MOVE 42 73` (the SYS
+/// icon -- the same canvas position the planar double-click test above
+/// uses, since the icon sits at the same place on this 640x480 desktop)
+/// at 5450; the double-click follows at 5460-5466. The SYS drawer window
+/// is fully open within ~35 frames of the click (measured directly: it
+/// was already open by frame 5450 in an earlier, mistimed run of this
+/// scenario), so the third capture at frame 5640 sees it settled.
+///
+/// `--screenshot-every 220` alongside `--screenshot-frame 5200` produces
+/// three captures at frames 5200, 5420 and 5640 (`screenshot.rs`'s
+/// `sequence_path`: the base name gets `-NNNNNN` inserted before its
+/// extension), landing respectively just after the first move, just after
+/// the second move, and just after the double-click has had time to open
+/// the drawer.
+///
+/// Pointer evidence (assertion 6, via [`red_pointer_pixels`]): the
+/// Workbench pointer soft-rendered into rtgboard VRAM is 57 pixels on this
+/// fixture -- 31 exact `[239, 69, 66, 255]` (red body), 13 exact
+/// `[239, 239, 206, 255]` (cream highlight), 13 black -- and red occurs
+/// nowhere else on this desktop, making it the discriminant. Measured
+/// bounding boxes put the pointer's hotspot (its top-left tip) at exactly
+/// the commanded coordinate: capture 1 (100, 100) has all red pixels
+/// within x 100..110, y 100..110; capture 2 (500, 380) within x 500..510,
+/// y 380..390; capture 3 (42, 73) within x 42..52, y 73..83.
+///
+/// Click evidence (assertion 7): exact-white (`[255, 255, 255, 255]`) and
+/// exact-black (`[0, 0, 0, 255]`) pixel counts on capture 3. The closed
+/// desktop measures white 9,093 / black 6,599; with the SYS drawer open
+/// (title bar, borders, six drawer icons with labels) measured white
+/// 13,181 / black 11,221 in the pinned run and 13,121 / 11,281 in a second
+/// run of the same scenario (~60px run-to-run variation, hence the margin
+/// below the lower measurement). Floors of white >= 11,000 and
+/// black >= 9,500 sit well above the closed-desktop reading and well below
+/// both open-drawer readings, so the RELATIVEMOUSE-trap failure mode
+/// (`docs/input-protocol.md`: clicks landing at the screen's top-left
+/// corner regardless of pointer position) -- pointer moves correctly but
+/// the click opens nothing -- fails loudly rather than passing on a
+/// "something changed" floor. Capture 1's white count is also asserted
+/// below the closed-desktop measurement, as a control showing these floors
+/// genuinely discriminate within this same run rather than always passing.
+///
+/// Also asserted (assertion 3): `MouseX 42  MouseY 73` (two spaces) shows
+/// up verbatim in `--inspect`'s stdout narration. On a planar hires
+/// screen `docs/input-protocol.md` §13 documents a legacy 2x-on-hires
+/// doubling of `MouseY`; this asserts that does NOT happen here -- an RTG
+/// screen reads `MouseY` back exactly as requested -- so a regression that
+/// started doubling it on RTG screens too would be caught.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and the patched rtgboard HDF on disk; run with --ignored"]
+fn scripted_pointer_and_double_click_work_on_the_rtgboard_rtg_screen() {
+    let rom = kickstart_a1200();
+    let hd = rtgboard_hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+
+    let script_path = std::env::temp_dir().join(format!(
+        "machine-hosted-rtgboard-pointer-{}.input",
+        std::process::id()
+    ));
+    std::fs::write(
+        &script_path,
+        "SLEEP 5100\n\
+         MOVE 100 100\nSLEEP 150\n\
+         MOVE 500 380\nSLEEP 200\n\
+         MOVE 42 73\nSLEEP 10\n\
+         BUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 5\n\
+         BUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 300\n",
+    )
+    .expect("write input script");
+
+    let serial_log_path = std::env::temp_dir().join(format!(
+        "machine-hosted-rtgboard-pointer-{}.serial.log",
+        std::process::id()
+    ));
+
+    let base_path = screenshot_path("rtgboard-pointer");
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--rtgboard",
+        "640x480",
+        "--rtgboard-format",
+        "rgb565",
+        "--input-script",
+        script_path.to_str().unwrap(),
+        "--screenshot",
+        base_path.to_str().unwrap(),
+        "--screenshot-frame",
+        "5200",
+        "--screenshot-every",
+        "220",
+        "--max-frames",
+        "5700",
+        "--max-instructions",
+        "4200000000",
+        "--serial-log",
+        serial_log_path.to_str().unwrap(),
+        "--inspect",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    // Assertion 1: the last of the three captures actually fired.
+    assert!(
+        stdout.contains("screenshot: frame 5640"),
+        "expected the final --screenshot-every capture to actually fire by frame 5640"
+    );
+
+    // Assertion 2: the same driver-narration markers the sibling rtgboard
+    // test above pins, plus no rejected commit.
+    let serial_log = std::fs::read_to_string(&serial_log_path)
+        .unwrap_or_else(|e| panic!("read serial log {serial_log_path:?}: {e}"));
+    for marker in [
+        "rtgboard: FindCard: board at",
+        "rtgboard: InitCard: rtg.library version",
+        "rtgboard: SetGC 640x480 committed: APPLIED",
+        "rtgboard: SetPanning: offset 0x0 committed: APPLIED",
+    ] {
+        assert!(
+            serial_log.contains(marker),
+            "expected the driver's serial narration to contain {marker:?}; \
+             serial log:\n{serial_log}"
+        );
+    }
+    assert!(
+        !serial_log.contains("committed: REJECTED"),
+        "expected no rejected mode/panning commit; serial log:\n{serial_log}"
+    );
+
+    // Assertion 3: MouseY reads back un-doubled on this RTG screen -- see
+    // this test's doc comment.
+    assert!(
+        stdout.contains("MouseX 42  MouseY 73"),
+        "expected IntuitionBase->MouseX/MouseY to read back exactly (42, 73) \
+         on this RTG screen, un-doubled -- see this test's doc comment: {stdout}"
+    );
+
+    // Assertion 4: the input card's queue fully drained with nothing
+    // dropped as an overflow.
+    assert!(
+        stdout.contains("EVENT_COUNT 0  EVENT_OVERFLOW 0"),
+        "expected the input card's queue fully drained with no drops by the end of the run: {stdout}"
+    );
+
+    // Assertion 5: all three captures decode to exactly 640x480.
+    let capture1 = base_path.with_file_name(format!(
+        "{}-005200.png",
+        base_path.file_stem().unwrap().to_string_lossy()
+    ));
+    let capture2 = base_path.with_file_name(format!(
+        "{}-005420.png",
+        base_path.file_stem().unwrap().to_string_lossy()
+    ));
+    let capture3 = base_path.with_file_name(format!(
+        "{}-005640.png",
+        base_path.file_stem().unwrap().to_string_lossy()
+    ));
+
+    let (width1, height1, rgba1) = decode_png(&capture1);
+    let (width2, height2, rgba2) = decode_png(&capture2);
+    let (width3, height3, rgba3) = decode_png(&capture3);
+    for (width, height) in [(width1, height1), (width2, height2), (width3, height3)] {
+        assert_eq!(
+            (width, height),
+            (640, 480),
+            "an RTG screenshot's dimensions come from the driver-programmed mode"
+        );
+    }
+
+    // Assertion 6: pointer evidence on all three captures -- see
+    // [`red_pointer_pixels`] and this test's doc comment for the measured
+    // bounding boxes.
+    red_pointer_pixels(width1, &rgba1, 100, 100);
+    red_pointer_pixels(width2, &rgba2, 500, 380);
+    red_pointer_pixels(width3, &rgba3, 42, 73);
+
+    // Assertion 7: click evidence -- the SYS drawer's white/black
+    // furniture on capture 3, plus capture 1 as a closed-desktop control.
+    // See this test's doc comment for the measured floors and margins.
+    const WHITE: [u8; 4] = [255, 255, 255, 255];
+    const BLACK: [u8; 4] = [0, 0, 0, 255];
+    let white3 = rgba3.chunks(4).filter(|px| *px == WHITE).count();
+    let black3 = rgba3.chunks(4).filter(|px| *px == BLACK).count();
+    assert!(
+        white3 >= 11_000,
+        "expected the SYS drawer's white furniture on capture 3, got {white3} \
+         white pixels -- 9,093 would mean the closed desktop (click opened \
+         nothing); see this test's doc comment"
+    );
+    assert!(
+        black3 >= 9_500,
+        "expected the SYS drawer's black furniture/text on capture 3, got \
+         {black3} black pixels -- 6,599 would mean the closed desktop (click \
+         opened nothing); see this test's doc comment"
+    );
+
+    let white1 = rgba1.chunks(4).filter(|px| *px == WHITE).count();
+    assert!(
+        white1 < 11_000,
+        "expected capture 1's closed-desktop white count (measured 9,093) to \
+         sit below the open-drawer floor used above, as a control showing \
+         that floor genuinely discriminates within this same run -- got \
+         {white1}"
+    );
+
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&serial_log_path);
+}
+
 #[test]
 #[ignore = "requires the AROS ROM pair on disk; run with --ignored"]
 fn aros_68k_pair() {

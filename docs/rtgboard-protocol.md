@@ -243,12 +243,17 @@ useful. This is driver-side work with no host-side equivalent in this
 increment — `SoftSpriteFlags` and the render-vector-declines-everything
 posture §2 describes both need to agree with whatever pointer shape
 Intuition expects — and it is the one point where this board's own
-protocol and the input card's protocol are not independent: **an RTG
-screen on this board plus the native input card is the combination that
-will eventually need testing together**, once both a `.card` driver and
-an `input` driver exist. Nothing to build here yet; recorded now so it
-isn't rediscovered at the cost `docs/input-protocol.md`'s own
-`RELATIVEMOUSE` correction already paid once.
+protocol and the input card's protocol are not independent: an RTG
+screen on this board plus the native input card was the combination that
+would eventually need testing together, once both a `.card` driver and
+an `input` driver existed.
+
+That combination is now proven (2026-09-15), not merely built: P96
+soft-renders the pointer into rtgboard VRAM and moves it on scripted
+`MOVE`s, and a scripted double-click at the SYS icon opens the SYS
+drawer on the RTG screen, pinned by
+`scripted_pointer_and_double_click_work_on_the_rtgboard_rtg_screen`. See
+§10 for the measured evidence.
 
 ## 10. Verification
 
@@ -336,6 +341,33 @@ touches this driver or this register file:
   test above asserts the serial log carries no `"committed: REJECTED"`
   for exactly this reason.
 
+**Pointer-and-click combination verified (2026-09-15).** §9's open
+combination — the native `input` card driving a pointer and clicks on a
+P96 RTG screen backed by this board — is now proven against real
+Kickstart 3.2.2, not just built: `crates/machine-hosted/tests/
+real_rom.rs`'s
+`scripted_pointer_and_double_click_work_on_the_rtgboard_rtg_screen` boots
+the patched HDF with `--rtgboard 640x480 --rtgboard-format rgb565
+--input-script` and confirms all three links in §9's chain hold. P96
+declines the hardware sprite and soft-renders the pointer into this
+board's VRAM (`SoftSpriteFlags = RGBFF_R5G6B5`, stub `SetSprite*`
+vectors): screenshots at frames 5200 and 5420 show the pointer's
+57-pixel, three-colour image entirely inside a 16x16 box at exactly the
+commanded `MOVE` coordinate, first (100,100) then (500,380), and nowhere
+else on the desktop. `IntuitionBase->ActiveScreen` resolution against
+this RTG screen works unmodified — `--inspect` reports `MouseX 42  MouseY
+73` exactly as commanded, not doubled the way `input-protocol.md` §13's
+legacy hires readback is, with `EVENT_COUNT 0  EVENT_OVERFLOW 0`. And a
+scripted double-click at the SYS icon (42,73) opens the SYS drawer window
+on the RTG screen, measured by white pixels rising 9,093 → 13,181 and
+black 6,599 → 11,221 against a closed desktop — proof the
+`IEQUALIFIER_RELATIVEMOUSE` trap did not resurface and that clicks route
+by position on this screen exactly as on the legacy one. Neither driver
+needed a single change; this was verification of an existing design, not
+a fix, with the driver's serial narration staying clean throughout
+(`FindCard`/`InitCard`/`SetGC APPLIED`/`SetPanning APPLIED`, zero
+`REJECTED` commits).
+
 ## 11. What this increment does not include
 
 - No DiagArea boot ROM. The P96 `.card` driver (`m68k/rtgboard-card/`)
@@ -356,8 +388,11 @@ touches this driver or this register file:
 - A guest-visible baseline test now exists
   (`crates/machine-hosted/tests/real_rom.rs`'s
   `kickstart_3_2_2_a1200_workbench_renders_through_the_rtgboard_card_driver`,
-  §10), proving a real Workbench desktop through this driver end to end.
-  What does not yet exist is acceptance testing at the depth of
+  §10), proving a real Workbench desktop through this driver end to end,
+  and a second real-ROM test in the same file,
+  `scripted_pointer_and_double_click_work_on_the_rtgboard_rtg_screen`,
+  now proves §9's pointer-and-click combination the same way. What does
+  not yet exist is acceptance testing at the depth of
   `hostblk-protocol.md` §13's devsoak run or `input-protocol.md` §12's
-  full guest-fixture plan — this is one baseline screenshot-and-serial-log
-  test, not a soak.
+  full guest-fixture plan — these are two baseline screenshot-and-serial-log
+  tests, not a soak.
