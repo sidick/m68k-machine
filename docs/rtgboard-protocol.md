@@ -4,13 +4,16 @@
 wired into `MachineBus::with_rtgboard` and `machine-hosted`'s `--rtgboard
 WIDTHxHEIGHT` flag, with the screenshot present path (`crates/machine-hosted/
 src/screenshot.rs`) able to walk this board's VRAM the same way it already
-does Graffity's. **No P96 `.card` driver and no DiagArea boot ROM exist
-yet** — this is the same "register interface and transfer engine first,
-driver and boot ROM as a later increment" shape `hostblk`'s and `input`'s
-own first increments took. There is therefore no end-to-end guest test
-here: every register write this document describes has been exercised
-from host-side tests standing in for a driver, never from real 68k code.
-Say this plainly rather than implying more.
+does Graffity's. **A P96 `.card` driver now exists** at
+`m68k/rtgboard-card/` — disk-loaded and AUTOINIT'd (there is still no
+DiagArea boot ROM; that scope line is unchanged), delivered onto a
+bootable image by `scripts/patch-rtgboard-hdf.sh`. This is verified
+end to end (2026-09-15): a real Workbench desktop rendered through this
+board and this driver, not a host-side test standing in for one --
+`crates/machine-hosted/tests/real_rom.rs`'s
+`kickstart_3_2_2_a1200_workbench_renders_through_the_rtgboard_card_driver`
+pins it as a regression test. §10 records the driver-side facts a future
+reader needs.
 
 **Context:** `docs/adr-0002-rtg-on-generic-display-hardware.md` (the
 decision this implements — read it first); `docs/device-ledger.md` (where
@@ -277,16 +280,67 @@ written into this board's VRAM through the register interface, with no
 guest and no driver involved, comes out through the *real* screenshot
 present path (`capture()`) as the expected pixels in a captured frame —
 one red pixel against a black background, distinct-colour and
-non-background-pixel counts both confirming it. This is not an
-end-to-end guest test — say so plainly, per the brief — but it is real
-evidence the VRAM-to-pixels path this board's eventual driver will rely
-on already works correctly today.
+non-background-pixel counts both confirming it. This was, at the time it
+was written, real evidence the VRAM-to-pixels path this board's eventual
+driver would rely on already worked correctly -- superseded now by the
+end-to-end driver evidence below, but left in place because it still
+independently confirms the same path with no driver involved at all.
+
+**Driver-side verification (2026-09-15).** The P96 `.card` driver
+(`m68k/rtgboard-card/`) reached first light: `crates/machine-hosted/
+tests/real_rom.rs`'s
+`kickstart_3_2_2_a1200_workbench_renders_through_the_rtgboard_card_driver`
+boots a patched HDF (`scripts/build-rtgboard-card.sh` then
+`scripts/patch-rtgboard-hdf.sh`) with `--rtgboard 640x480 --rtgboard-format
+rgb565`, and gets a real 640x480 grey Workbench desktop -- title bar,
+`RAM Disk`/`SYS` icons, window chrome -- confirmed both by the driver's
+own serial narration (`FindCard`, `InitCard`, `SetGC ... committed:
+APPLIED`, `SetPanning ... committed: APPLIED`) and by decoding the
+captured screenshot. A few facts worth recording here for whoever next
+touches this driver or this register file:
+
+- **`CUR_*` keeps no shadow state.** The driver does not cache the
+  applied mode anywhere of its own; §4's `CUR_WIDTH`/`CUR_HEIGHT`/
+  `CUR_FORMAT`/`CUR_STRIDE`/`CUR_FB_OFFSET` registers *are* the truth the
+  driver reads back after every `COMMIT`, exactly as designed.
+- **Byte registers' hot byte, from the 68k side, is `offset+3`.** §4's
+  "one hot byte per 4-byte-aligned slot" idiom means a `byte`-width
+  register such as `MODE_INDEX` (`0x04`) or `COMMIT` (`0x28`) has to be
+  written to the *last* byte of its 4-byte slot (`0x07`, `0x2B`, ...) from
+  68k code, not its first -- a big-endian bus fact easy to get backwards
+  once when first wiring a driver's register accessors, and silent when
+  gotten wrong (the write lands on a byte the register file discards, so
+  nothing visibly breaks until the next register read shows stale data).
+- **The `FakeNativeModes`/CLUT trap.** The first first-light attempt
+  copied the Graffity image's `FakeNativeModes=Yes` monitor tooltype (the
+  mechanism that gets Workbench onto RTG with no prefs step there) -- but
+  fake native modes are fabricated as 8-bit CLUT screens, Graffity has
+  palette hardware for those, and this board deliberately has none. P96
+  rendered 8-bit pen indices into the framebuffer and this board scanned
+  them straight back out as RGB565 -- a black-dominant, green-tinted
+  screen (measured: 21 distinct colours, 13,637/307,200 non-background
+  pixels), not a crash or a rejected `COMMIT`. The fix is both halves,
+  not either alone: the monitor icon ships `FakeNativeModes` inactive
+  (`tools/rtgboard/make_monitor_info.py` -- do not re-enable it), and
+  `scripts/patch-rtgboard-hdf.sh` writes `Prefs/Env-Archive/Sys/
+  ScreenMode.prefs` pinning Workbench to `DisplayID 0x60001102` (this
+  driver's advertised 640x480/16-bit mode) before Workbench ever asks P96
+  to pick.
+- **`--rtgboard-format rgb565` is a required flag, not a default.**
+  `machine-hosted --rtgboard` defaults to `rgbx8888`; with that default
+  the board's one-entry catalog holds a format this driver never proposes
+  to `GetCompatibleFormats`, so every mode the driver tries to set gets
+  rejected (`STATUS & STATUS_REJECTED`, never `APPLIED`) -- a live
+  instance of §6's "close gives a black screen" point, except here it is
+  a rejected commit rather than a wrong-but-applied one. The real-ROM
+  test above asserts the serial log carries no `"committed: REJECTED"`
+  for exactly this reason.
 
 ## 11. What this increment does not include
 
-- No P96 `.card` driver and no DiagArea boot ROM. This board cannot be
-  seen by a guest yet; every register access described above has only
-  ever been driven from a host-side test standing in for a driver.
+- No DiagArea boot ROM. The P96 `.card` driver (`m68k/rtgboard-card/`)
+  now exists and is disk-loaded/AUTOINIT'd instead -- see the Status
+  paragraph above and §10's driver-side verification.
 - No palette/CLUT support of any kind. ADR 0002 explicitly favours
   advertising direct-colour formats over CLUT to avoid the palette-
   expansion class of bug this project's own red-backdrop defect lived
@@ -299,10 +353,11 @@ on already works correctly today.
   itself — there is no equivalent of `TD_ADDCHANGEINT`/an interrupt a
   driver could wait on, per §8's reasoning that none is needed for a
   synchronous operation.
-- Acceptance testing analogous to `hostblk-protocol.md` §13's devsoak run
-  or `input-protocol.md` §12's guest-fixture plan does not exist yet,
-  for the same reason: there is no driver for it to exercise. The
-  natural next increment's first task is exactly what those two
-  documents already said before their own drivers existed — build the
-  `.card`, then build the guest-visible test that proves it against a
-  real Workbench.
+- A guest-visible baseline test now exists
+  (`crates/machine-hosted/tests/real_rom.rs`'s
+  `kickstart_3_2_2_a1200_workbench_renders_through_the_rtgboard_card_driver`,
+  §10), proving a real Workbench desktop through this driver end to end.
+  What does not yet exist is acceptance testing at the depth of
+  `hostblk-protocol.md` §13's devsoak run or `input-protocol.md` §12's
+  full guest-fixture plan — this is one baseline screenshot-and-serial-log
+  test, not a soak.

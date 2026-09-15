@@ -1,8 +1,10 @@
 # Scoping the `rtgboard` P96 `.card` driver
 
-**Status:** scoping note, 2026-09-15 — no code yet. Read before the
-driver session starts; this exists so that session begins with decisions,
-not archaeology.
+**Status:** scoping note, written 2026-09-15 to open the driver session
+below. Executed the same day: the driver landed and reached first light.
+See `docs/rtgboard-protocol.md` and `docs/device-ledger.md` for the
+verified result; this note is kept as-written for the reasoning that
+shaped it.
 
 **Context:** `docs/rtgboard-protocol.md` (the register contract the
 driver programs); `docs/adr-0002-rtg-on-generic-display-hardware.md`

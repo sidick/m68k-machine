@@ -175,7 +175,7 @@ only once `hostblk` no longer occupies one of them for the duration.
 | Cirrus CL-GD542x | **bring-up** | generic virtual board (ADR 0002) | demoted to compatibility tier, not removed |
 | Graffity Z2/Z3 | **bring-up** | as Cirrus | as Cirrus |
 | `input` native input card | permanent | — | never; the machine's own keyboard/mouse path |
-| `rtgboard` native RTG display board | permanent, host side only | — | never; ADR 0002's generic-board tier. No P96 `.card` driver yet — see below |
+| `rtgboard` native RTG display board | permanent | — | never; ADR 0002's generic-board tier. P96 `.card` driver landed, first light verified — see below |
 
 ### Permanent
 
@@ -345,17 +345,22 @@ than an internal one — a rich list for a host with real modesetting, a
 single entry for a fixed-mode board, so the interface can express
 "exactly these modes and no others" without lying when that is the
 honest answer (a UEFI GOP framebuffer fixed at `ExitBootServices`) — and
-the `machine-hosted --rtgboard WIDTHxHEIGHT` flag to attach it. **Not yet
-built:** the P96 `.card` driver and any DiagArea boot ROM — the same
-scope line `hostblk`'s and `input`'s own first increments drew, and the
-same honest limitation: no guest has ever seen a pixel through this
-board yet, only a host-side test committing a mode and writing VRAM
-directly through the register interface a driver will eventually use.
-`machine-hosted`'s screenshot path can present this board's VRAM the same
-way it already does Graffity's, which is what proves a known pattern
-written into VRAM really does become pixels — see
-`docs/rtgboard-protocol.md` for the register contract the driver is
-written against next.
+the `machine-hosted --rtgboard WIDTHxHEIGHT` flag to attach it. **The P96
+`.card` driver now exists** (`m68k/rtgboard-card/`), disk-loaded and
+AUTOINIT'd rather than found through a DiagArea boot ROM (still not
+built — the same scope line as before). `scripts/patch-rtgboard-hdf.sh`
+delivers it onto a bootable image: installs
+`Libs/Picasso96/rtgboard.card`, replaces `Devs/Picasso96Settings`, clones
+the P96 monitor stub as `Devs/Monitors/rtgboard`, and writes
+`Prefs/Env-Archive/Sys/ScreenMode.prefs` to steer Workbench at a mode the
+driver actually proposes. First light is verified end to end
+(2026-09-15): the driver's own serial narration
+(`FindCard`/`InitCard`/`SetGC ... committed: APPLIED`/`SetPanning ...
+committed: APPLIED`) followed by a real 640x480 grey Workbench desktop
+captured in a screenshot, with `crates/machine-hosted/tests/real_rom.rs`
+pinning both as a regression test. See `docs/rtgboard-protocol.md` for
+the register contract and the driver-side facts worth knowing (its
+format/DisplayID coupling, in particular).
 
 ### Capped
 

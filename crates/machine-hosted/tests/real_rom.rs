@@ -54,6 +54,19 @@ fn hd_image() -> String {
     fixture("M68K_TEST_HDF", "m68k-machine.hdf")
 }
 
+/// The `rtgboard` P96 `.card` driver's own patched HDF -- a *different*
+/// image from `hd_image()` above (that one is built against the Cirrus/
+/// Graffity path). Produced from the same `amibake` base by
+/// `scripts/build-rtgboard-card.sh` (builds `Libs/Picasso96/rtgboard.card`
+/// from `m68k/rtgboard-card/`) followed by `scripts/patch-rtgboard-hdf.sh`
+/// (installs the driver, clones the P96 monitor stub as
+/// `Devs/Monitors/rtgboard`, removes the Graffity monitor pair, and writes
+/// `Prefs/Env-Archive/Sys/ScreenMode.prefs` steering Workbench to
+/// `DisplayID 0x60001102` / 16-bit) -- see `docs/rtgboard-protocol.md`.
+fn rtgboard_hd_image() -> String {
+    fixture("M68K_TEST_RTG_HDF", "m68k-machine-rtgboard.hdf")
+}
+
 /// Skip the calling test unless every fixture it needs is present, so a
 /// clean clone with no licensed media still goes green.
 fn have_fixtures(paths: &[&str]) -> bool {
@@ -1011,6 +1024,183 @@ fn kickstart_3_2_2_a1200_rtg_workbench_desktop_is_grey_not_blank_or_corrupt() {
         quadrant_has_content.iter().all(|&has| has),
         "expected non-background content in every screen quadrant, got {quadrant_has_content:?}"
     );
+}
+
+/// First light for the native `rtgboard` P96 `.card` driver
+/// (`m68k/rtgboard-card/`, `docs/rtgboard-protocol.md`) -- the same claim
+/// as `kickstart_3_2_2_a1200_rtg_workbench_desktop_is_grey_not_blank_or_
+/// corrupt` above, but through a disk-loaded AUTOINIT `.card` driver
+/// talking to the native `rtgboard` device (`--rtgboard`), not the
+/// built-in Cirrus emulation (`--graphics`). Verified 2026-09-15.
+///
+/// The fixture is `scripts/patch-rtgboard-hdf.sh`'s output: it installs
+/// `Libs/Picasso96/rtgboard.card`, replaces `Devs/Picasso96Settings`,
+/// clones the P96 monitor stub as `Devs/Monitors/rtgboard` with a
+/// `BOARDTYPE=rtgboard` icon, removes the Graffity monitor pair, and writes
+/// `Prefs/Env-Archive/Sys/ScreenMode.prefs` steering Workbench to
+/// `DisplayID 0x60001102` / 16-bit -- build it with
+/// `scripts/build-rtgboard-card.sh` then `scripts/patch-rtgboard-hdf.sh`
+/// if `M68K_TEST_RTG_HDF`/`nondistribution/m68k-machine-rtgboard.hdf` is
+/// missing.
+///
+/// `--rtgboard-format rgb565` is not optional set-dressing: the flag
+/// defaults to `rgbx8888`, and with the default the board's one-entry
+/// catalog holds a format the driver never proposes to `GetCompatible
+/// Formats`, so every `SetGC` the driver commits gets rejected (a live
+/// instance of the format-catalog coupling `docs/rtgboard-protocol.md`
+/// documents). This test asserts the serial log carries no
+/// `"committed: REJECTED"` for exactly that reason -- a regression that
+/// dropped the flag, or broke the catalog/proposal match some other way,
+/// would still produce *a* screenshot (the planar fallback path), just not
+/// the right one, which is why the pixel assertions below matter as much
+/// as the marker-string ones.
+///
+/// Two known failure signatures shaped the thresholds here (both observed
+/// live while bringing this driver up, not hypothesised):
+/// - **`FakeNativeModes` CLUT trap**: without `ScreenMode.prefs` steering,
+///   P96 offers Workbench an 8-bit CLUT mode; the driver (which only
+///   speaks RGB565) renders 8-bit pen indices and the board scans them
+///   back as RGB565, producing a black-dominant, green-tinted screen --
+///   measured 21 distinct colours, only 13,637 non-background pixels.
+/// - **wrong `DisplayID` / no steering at all**: no `SetGC`/`COMMIT` ever
+///   happens and the screenshot is the unrelated 752x576 planar fallback
+///   (caught here by the exact `(640, 480)` dimension assert, independent
+///   of pixel content).
+///
+/// The real desktop this test pins measured 640x480, 6 distinct colours,
+/// 31,906 non-background pixels, dominant background `[173, 170, 173,
+/// 255]` -- mid-grey, but not *exactly* R==G==B: RGB565 packs 5 bits each
+/// for R/B and 6 for G, so an 8-bit-per-gun grey that started life as
+/// `0xAD` (173) loses its low bit going in and comes back `0xAA` (170) on
+/// the 6-bit G channel while R/B round-trip exactly through their 5-bit
+/// path -- a quantization artefact of the wire format, not a broken pixel.
+/// Floors below sit between the real desktop and the CLUT-broken screen on
+/// both axes.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and the patched rtgboard HDF on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_workbench_renders_through_the_rtgboard_card_driver() {
+    let rom = kickstart_a1200();
+    let hd = rtgboard_hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+
+    let path = screenshot_path("kickstart-rtgboard");
+    let serial_log_path = std::env::temp_dir().join(format!(
+        "machine-hosted-kickstart-rtgboard-{}.serial.log",
+        std::process::id()
+    ));
+
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--rtgboard",
+        "640x480",
+        "--rtgboard-format",
+        "rgb565",
+        "--max-frames",
+        "5200",
+        "--max-instructions",
+        "3000000000",
+        "--screenshot",
+        path.to_str().unwrap(),
+        "--screenshot-frame",
+        "5000",
+        "--serial-log",
+        serial_log_path.to_str().unwrap(),
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    assert!(
+        stdout.contains("screenshot: frame 5000"),
+        "expected the capture to actually fire by frame 5000"
+    );
+
+    let serial_log = std::fs::read_to_string(&serial_log_path)
+        .unwrap_or_else(|e| panic!("read serial log {serial_log_path:?}: {e}"));
+    for marker in [
+        "rtgboard: FindCard: board at",
+        "rtgboard: InitCard: rtg.library version",
+        "rtgboard: SetGC 640x480 committed: APPLIED",
+        "rtgboard: SetPanning: offset 0x0 committed: APPLIED",
+    ] {
+        assert!(
+            serial_log.contains(marker),
+            "expected the driver's serial narration to contain {marker:?}; \
+             see this test's doc comment for the full expected chain -- \
+             serial log:\n{serial_log}"
+        );
+    }
+    assert!(
+        !serial_log.contains("committed: REJECTED"),
+        "expected no rejected mode/panning commit -- a REJECTED commit here \
+         usually means --rtgboard-format rgb565 was dropped or the catalog/ \
+         proposal match broke; see this test's doc comment. serial log:\n{serial_log}"
+    );
+
+    let (width, height, rgba) = decode_png(&path);
+    assert_eq!(
+        (width, height),
+        (640, 480),
+        "an RTG screenshot's dimensions come from the driver-programmed \
+         mode -- (752, 576) here would mean SetGC never committed and the \
+         capture fell back to the planar path; see this test's doc comment"
+    );
+
+    let background = dominant_pixel(&rgba);
+    // RGB565's 5-bit R/B vs 6-bit G channels mean an exact R==G==B grey
+    // does not round-trip losslessly -- see this test's doc comment
+    // (measured on this exact fixture: [173, 170, 173, 255]). A tolerance
+    // band rather than exact equality still catches the CLUT trap, whose
+    // background is black (near-zero, not merely off by a couple of
+    // levels) with a green tint from stray pen-index bits.
+    let channels = [background[0], background[1], background[2]];
+    let max = *channels.iter().max().unwrap();
+    let min = *channels.iter().min().unwrap();
+    assert!(
+        max - min <= 8,
+        "expected a neutral-ish grey background (R/G/B within 8 of each \
+         other, allowing for RGB565's 5/6/5-bit quantization), got \
+         {background:?} -- see this test's doc comment for the CLUT-trap \
+         failure mode this guards against"
+    );
+    assert!(
+        (120..200).contains(&background[0]),
+        "expected a mid-grey Workbench background, got {background:?} \
+         (measured on this exact fixture: [173, 170, 173, 255])"
+    );
+
+    let non_background = rgba.chunks(4).filter(|px| *px != background).count();
+    // Real desktop measured 31,906; the FakeNativeModes/CLUT-broken screen
+    // measured 13,637 -- see this test's doc comment. The floor sits well
+    // above the broken reading.
+    assert!(
+        non_background >= 20_000,
+        "expected the real Workbench desktop through the rtgboard driver, \
+         got {non_background} non-background pixels -- 13,637 would mean \
+         the FakeNativeModes/CLUT trap fired instead; see this test's doc \
+         comment"
+    );
+
+    let mut colours: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    for px in rgba.chunks(4) {
+        colours.insert(px);
+    }
+    // Real desktop measured 6 distinct colours; the CLUT-broken screen
+    // measured 21 -- see this test's doc comment.
+    assert!(
+        colours.len() <= 10,
+        "expected a clean few-colour Workbench desktop, got {} distinct \
+         colours -- the CLUT-broken screen measured 21; see this test's \
+         doc comment",
+        colours.len()
+    );
+
+    let _ = std::fs::remove_file(&serial_log_path);
 }
 
 #[test]
