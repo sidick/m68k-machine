@@ -71,9 +71,12 @@ non-transitional devices), class `020000`, a 16 KiB 32-bit
 non-prefetchable BAR0 with genuine sizing semantics, and the four
 hand-encoded `virtio_pci_cap` capability structures
 (COMMON/NOTIFY/ISR/DEVICE, `notify_off_multiplier` = 4) a real
-capability walk expects. Its *function* is deliberately absent — BAR
-reads answer all-ones — because enumeration must see a real-shaped
-device and stage 3 owns the rings.
+capability walk expects. Through stage 2 its *function* was
+deliberately absent — BAR reads answered all-ones, because enumeration
+had to see a real-shaped device before stage 3 owned the rings.
+**Stage 3 has since landed that function** (`docs/virtionet.md`): the
+BAR now carries real feature negotiation, two virtqueues, a fixed MAC,
+and a SANA-II driver (`virtionet.device`) driving it end to end.
 
 **The real-ECAM backing is documented, not built** (the QEMU boards do
 not even have storage yet). The trait's own doc comment carries the
@@ -282,22 +285,25 @@ computed fresh on every call — `MachineBus` polls it after every
 register write that could change the answer (`INTX_ENABLE`/`INTX_TEST`
 writes, and, indirectly, a config-cycle write that changes a device's
 own asserted state) and once per host tick besides, because
-`PciBackend::intx_levels()` can change with no register write at all
-(stage 3's virtio-net ISR will raise/lower it from its own function
-logic). The chipset's own shared `INT2` (`PORTS`) latch is unaffected by
-this liveness, though: like every other card on this bus, it stays
-asserted until the driver acknowledges it via `INTREQ`, even once the
-underlying condition has already cleared.
+`PciBackend::intx_levels()` can change with no register write at all --
+**stage 3's virtio-net ISR now does exactly that**, raising/lowering it
+from its own function logic (`docs/virtionet.md`). The chipset's own
+shared `INT2` (`PORTS`) latch is unaffected by this liveness, though:
+like every other card on this bus, it stays asserted until the driver
+acknowledges it via `INTREQ`, even once the underlying condition has
+already cleared.
 
-**`INTX_TEST`'s role.** With no device having real function logic yet
-(the virtio-net stub still answers all-ones behind every BAR — §2),
-there is nothing else that could exercise the INTA–D-to-INT2 wiring end
-to end before stage 3 exists. `INTX_TEST` is a diagnostic assertion
-source ORed into `INTX_STATUS` alongside whatever the backend itself
-reports, indistinguishable to a driver from a real device's line —
-deliberately: stage 3's virtio-net ISR replaces `INTX_TEST` as *a*
-source of asserted bits without changing anything else about the
-contract (`docs/pci-library.md` §6's probe-tool step 4).
+**`INTX_TEST`'s role.** Through stage 2, with no device having real
+function logic yet (the virtio-net stub answered all-ones behind every
+BAR — §2), there was nothing else that could exercise the INTA–D-to-INT2
+wiring end to end. `INTX_TEST` is a diagnostic assertion source ORed
+into `INTX_STATUS` alongside whatever the backend itself reports,
+indistinguishable to a driver from a real device's line — deliberately:
+**stage 3's virtio-net ISR has since landed as a second, real source**
+of asserted bits (`docs/virtionet.md`'s one-shot "device INTx via INT2"
+marker) without changing anything else about the contract (`docs/
+pci-library.md` §6's probe-tool step 4 still exercises `INTX_TEST`
+itself, unaffected).
 
 ## 9. Verification
 
@@ -363,6 +369,17 @@ baselines (`kickstart_3_2_2_a1200`, the introspection test, the
 boot-screen screenshot, the AROS boot screen) all re-ran green
 alongside it.
 
+**Stage 3 verification (2026-09-15)** lives with the virtio-net
+function itself: `docs/virtionet.md` §9 carries the full list, in
+particular `kickstart_3_2_2_a1200_pciprobe_proves_the_prometheus_
+library_api` re-proven against a *live* device behind BAR0 (two
+amended checks, `docs/pci-library.md` §6) and
+`kickstart_3_2_2_a1200_virtionet_first_packet_round_trip`, the
+first-packet proof: driver `DevInit` through `DRIVER_OK`, one
+transmitted frame asserted byte for byte, the device's own `INTx`
+observed through this exact INT2 path (the one-shot marker `INTX_TEST`
+could never produce), and a completed `CMD_READ`.
+
 ## 10. What this increment does not include
 
 - **No `pci.library`, no 68k code of any kind, from this document's own
@@ -373,18 +390,20 @@ alongside it.
   mapping) are that document's, not this one's.
 - **No BAR allocation.** The shim proves sizing works; the library owns
   assignment policy (32-bit, below the Zorro III window).
-- **Interrupts landed (§8), but only the routing, not a real source.**
-  `INTx`-to-`INT2` is fully wired and provable end to end via
-  `INTX_TEST`; no device in this virtual topology has real function
-  logic yet, so nothing *other than* `INTX_TEST` can assert a line until
-  stage 3.
+- **Interrupts landed (§8).** `INTx`-to-`INT2` is fully wired and
+  provable end to end via `INTX_TEST` since stage 2; stage 3 added a
+  second, real source (the virtio-net function's own ISR, §8's own
+  amendment), still through the identical routing.
 - **Sized aperture accesses landed (§5).** Word/long accesses lying
   entirely within the aperture and naturally aligned now reach the
   backend as a single sized access; everything else (misaligned, or the
   register file) is unchanged from stage 1's byte-granular path.
-- **No virtio function.** The stub answers enumeration, capability
-  walks and BAR probes; its BARs have no registers behind them. Rings,
-  queues and the SANA-II driver are stage 3.
+- **The virtio function landed in stage 3** (`docs/virtionet.md`): real
+  feature negotiation, two virtqueues, a fixed MAC, and a SANA-II driver
+  (`virtionet.device`) driving it end to end through
+  `prometheus.library`'s public API alone. What stage 3 does *not*
+  include is recorded there, not here: a real host tap/socket
+  `NetBackend` is deliberately deferred.
 - **No board-crate wiring.** `board-qemu-virt`/`board-qemu-q35` gain a
   real-ECAM `PciBackend` implementation when they gain devices at all;
   this increment owes them a demonstrably ECAM-backable trait contract

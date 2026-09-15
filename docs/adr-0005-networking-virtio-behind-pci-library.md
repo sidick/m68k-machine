@@ -128,6 +128,23 @@ time:
 3. **virtio-net + SANA-II driver last**, as the library's first real
    client — modern virtio (not legacy), MSI-X deferred in favour of
    INTx-style routing per §10.1's driver discipline.
+   *Done, 2026-09-15* — `VirtioNetStub` (`docs/virtionet.md`) gained
+   real feature negotiation, two virtqueues and a fixed MAC behind the
+   BAR `pcibridge` had left function-less since stage 1; `virtionet.
+   device` drives it through `prometheus.library`'s public API alone,
+   proven end to end by `C:VNetTest` on real Kickstart 3.2.2: `DevInit`
+   through `DRIVER_OK`, one transmitted frame asserted byte for byte, the
+   device's own `INTx` observed through INT2 (not stage 2's `INTX_TEST`
+   diagnostic), and a completed `CMD_READ`. Two honest notes. `NOTIFY` is
+   a no-op by design — the device polls both virtqueues once per host
+   tick regardless of whether the guest ever writes it, so nothing is
+   lost, but this is not how a latency-sensitive real device would
+   behave. And the SANA-II surface is scoped down, not incomplete by
+   accident: one opener, no multicast, minimal `S2_GETGLOBALSTATS`, and
+   `CMD_READ` matched against one pending-read FIFO rather than the full
+   multi-listener fan-out (`docs/virtionet.md` §7 has the complete list).
+   A real host tap/socket `NetBackend` remains deliberately deferred —
+   this stage proves the chain, not a network path.
 
 ## Alternatives rejected
 

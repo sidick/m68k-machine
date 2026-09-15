@@ -78,6 +78,89 @@ fn pciprobe_hd_image() -> String {
     fixture("M68K_TEST_PCIPROBE_HDF", "m68k-machine-pciprobe.hdf")
 }
 
+/// The `virtionet.device`/`VNetTest` patched HDF (ADR 0005 stage 3,
+/// `docs/virtionet.md`) -- the same `amibake` base as `hd_image()`,
+/// patched by `scripts/build-prometheus-library.sh` +
+/// `scripts/build-virtionet-device.sh` + `scripts/build-vnettest.sh` +
+/// `scripts/patch-virtionet-hdf.sh`: installs `Libs/prometheus.library`
+/// (if not already present), `Devs/virtionet.device` and `C/VNetTest`,
+/// and prepends `C:VNetTest` to `S/Startup-Sequence` so a plain
+/// unattended boot produces the driver's and tool's serial evidence.
+fn virtionet_hd_image() -> String {
+    fixture("M68K_TEST_VIRTIONET_HDF", "m68k-machine-virtionet.hdf")
+}
+
+/// The `virtionet.device`/`SanaConform` patched HDF (`docs/virtionet.md`
+/// §9's SANA-II conformance gate) -- the same `amibake` base as
+/// `hd_image()`, patched by `scripts/patch-sanaconform-hdf.sh`: installs
+/// `Libs/prometheus.library` (if not already present), `Devs/
+/// virtionet.device`, and `C/SanaConform` (a prebuilt m68k binary from
+/// `~/src/sana2loop`, the project owner's own hardware-free SANA-II
+/// `loopback.device` project, BSD 2-Clause -- freely copyable/
+/// redistributable here, same provenance posture `docs/virtionet.md` §7
+/// already records for this driver's own `sana2.h`), and prepends one
+/// `C:SanaConform 0 DEVICE virtionet.device CONFIG ONLINE` invocation
+/// (redirected to `SYS:sanaconform.log`) to `S/Startup-Sequence`.
+/// Deliberately carries no `VNetTest` (see that script's own file-top
+/// comment): this image is a clean single-opener conformance gate, not a
+/// compose target.
+fn sanaconform_hd_image() -> String {
+    fixture("M68K_TEST_SANACONFORM_HDF", "m68k-machine-sanaconform.hdf")
+}
+
+/// Locate `xdftool` (amitools) the same way every `scripts/patch-*-hdf.sh`
+/// script does: `$XDFTOOL`, else `xdftool` on `PATH`, else the usual venv/
+/// pipx install locations. Used here to extract `SYS:sanaconform.log`
+/// from a temp copy of the sanaconform HDF after a boot run -- the guest
+/// writes that file, so reading it back is the only way to see
+/// `SanaConform`'s own narration (unlike `VNetTest`/`PCIProbe`, which
+/// narrate over serial instead).
+fn find_xdftool() -> String {
+    if let Ok(path) = std::env::var("XDFTOOL") {
+        return path;
+    }
+    if Command::new("xdftool").arg("--help").output().is_ok() {
+        return "xdftool".to_string();
+    }
+    for candidate in [
+        concat!(env!("HOME"), "/.local/bin/xdftool"),
+        concat!(env!("HOME"), "/src/amitools/.venv/bin/xdftool"),
+        concat!(env!("HOME"), "/.venvs/amitools/bin/xdftool"),
+    ] {
+        if Path::new(candidate).exists() {
+            return candidate.to_string();
+        }
+    }
+    "xdftool".to_string()
+}
+
+/// Read one file out of an HDF image with `xdftool -r <hdf> read <path>
+/// <out>`, returning its contents as a `String`. Panics with the tool's
+/// own stderr on failure -- there is no graceful-skip path here, since by
+/// the time this is called the boot run itself already succeeded and the
+/// fixture is known present.
+fn xdftool_read(hdf: &str, guest_path: &str) -> String {
+    let xdftool = find_xdftool();
+    let out_path = std::env::temp_dir().join(format!(
+        "machine-hosted-xdftool-read-{}-{}",
+        std::process::id(),
+        guest_path.replace(['/', ':'], "_")
+    ));
+    let output = Command::new(&xdftool)
+        .args(["-r", hdf, "read", guest_path, out_path.to_str().unwrap()])
+        .output()
+        .unwrap_or_else(|e| panic!("spawn {xdftool} -r {hdf} read {guest_path}: {e}"));
+    assert!(
+        output.status.success(),
+        "{xdftool} -r {hdf} read {guest_path} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let contents =
+        std::fs::read_to_string(&out_path).unwrap_or_else(|e| panic!("read {out_path:?}: {e}"));
+    let _ = std::fs::remove_file(&out_path);
+    contents
+}
+
 /// Skip the calling test unless every fixture it needs is present, so a
 /// clean clone with no licensed media still goes green.
 fn have_fixtures(paths: &[&str]) -> bool {
@@ -1585,8 +1668,9 @@ fn scripted_pointer_and_double_click_work_on_the_rtgboard_rtg_screen() {
 /// address-translation cross-checks, the aperture master-abort read, the
 /// DMA identity check, and an INTA assertion observed through a real INT2
 /// dispatch into a `Prm_AddIntServer`-installed server (the INTX_TEST
-/// harness poke standing in for stage 3's device function logic -- said
-/// plainly in `docs/pci-library.md` §6).
+/// harness poke, still exercised here even though stage 3 has since
+/// landed the virtio-net function's own logic -- said plainly in
+/// `docs/pci-library.md` §6).
 ///
 /// BAR consistency is asserted from both sides: the guest's own
 /// `PCIPROBE bar0:` line carries the PCI address the library assigned and
@@ -1594,6 +1678,16 @@ fn scripted_pointer_and_double_click_work_on_the_rtgboard_rtg_screen() {
 /// back through the backend (what the device itself latched), and the two
 /// must agree -- plus sit inside the policy region below the Zorro III
 /// window (`$20000000..$20800000`, `docs/pci-library.md` §2).
+///
+/// **Amended for stage 3** (`docs/pci-library.md` §6, `docs/virtionet.md`):
+/// now that the virtio-net function's own logic lives behind BAR0, the
+/// master-abort read no longer targets `memaddr0` itself (that address
+/// now has live registers behind it) but `memaddr0 + memsize0`, derived
+/// from the probed BAR values -- still comfortably inside the banked
+/// aperture and still unclaimed. A new check follows it: the MAC read
+/// back through the aperture at `BAR0+$3000`, compared against the
+/// device's own identity -- positive evidence this probe is talking to
+/// the actual device, not just a board with the right config-space IDs.
 ///
 /// Measured on this exact fixture (2026-09-15, first run): the probe
 /// completes well within 3000 frames, guest and host both report BAR0 at
@@ -1649,6 +1743,7 @@ fn kickstart_3_2_2_a1200_pciprobe_proves_the_prometheus_library_api() {
         "PCIPROBE byteorder cfgbyte@3: expected $000000F4 got $000000F4 PASS",
         "PCIPROBE bar0 pci range: PASS",
         "PCIPROBE aperture read (master-abort): expected $FFFFFFFF got $FFFFFFFF PASS",
+        "PCIPROBE bar0 device mac: expected 02:6D:36:4B:00:01 got 02:6D:36:4B:00:01 PASS",
         "PCIPROBE dma physaddr identity:",
         "PCIPROBE intx: observed INTA via INT2 (count 1)",
         "PCIPROBE result: ALL PASS",
@@ -1701,6 +1796,261 @@ fn kickstart_3_2_2_a1200_pciprobe_proves_the_prometheus_library_api() {
     );
 
     let _ = std::fs::remove_file(&serial_log_path);
+}
+
+/// ADR 0005 stage 3's first-packet proof (`docs/virtionet.md`): boot real
+/// Kickstart 3.2.2 with the `virtionet`-patched HDF and `--pcibridge`
+/// (the harness `NetBackend`, `crate::netharness`, is wired in
+/// unconditionally whenever `pcibridge` is attached -- there is no
+/// separate flag for it, see `run.rs`'s own comment on
+/// `pcibridge_net_backend`). This is positive, end-to-end evidence for
+/// every piece of stage 3's own brief: the driver's DevInit chain, one
+/// transmitted frame whose exact bytes the host recorded, the device's
+/// own INTx firing (the one-shot ISR marker -- not stage 2's INTX_TEST
+/// harness poke), and a completed `CMD_READ` carrying this harness's
+/// fixed echo-reply payload.
+///
+/// Measured on this exact fixture (2026-09-15, first run): the whole
+/// chain -- DevInit, one transmit, the ISR marker, and the completed
+/// `CMD_READ` -- lands well within 3000 frames.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and the patched virtionet HDF on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_virtionet_first_packet_round_trip() {
+    let rom = kickstart_a1200();
+    let hd = virtionet_hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+
+    let serial_log_path = std::env::temp_dir().join(format!(
+        "machine-hosted-kickstart-virtionet-{}.serial.log",
+        std::process::id()
+    ));
+
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--pcibridge",
+        "--max-frames",
+        "3000",
+        "--max-instructions",
+        "2000000000",
+        "--serial-log",
+        serial_log_path.to_str().unwrap(),
+        "--inspect",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    let serial_log = std::fs::read_to_string(&serial_log_path)
+        .unwrap_or_else(|e| panic!("read serial log {serial_log_path:?}: {e}"));
+
+    // Every marker here is positive evidence, in the serial order the
+    // driver/tool emit (docs/virtionet.md's Verification section).
+    for marker in [
+        "VNETDEV: DevInit entry",
+        "VNETDEV: DevInit: capabilities common ",
+        "VNETDEV: DevInit: features negotiated (VERSION_1, NET_F_MAC)",
+        "VNETDEV: DevInit: MAC 02:6D:36:4B:00:01",
+        "VNETDEV: DevInit complete, DRIVER_OK set",
+        "VNETTEST opendevice: PASS",
+        "VNETTEST tx frame: dst FF:FF:FF:FF:FF:FF ethertype $88B5 payload \"M68KVNET-TX-0001\" (16 bytes)",
+        "VNETDEV: isr: first queue interrupt observed (device INTx via INT2)",
+        "VNETTEST cmd_read: PASS received frame ethertype $88B5 payload \"M68KVNET-RX-REPLY-0001\" (22 bytes)",
+        "VNETTEST result: ALL PASS",
+    ] {
+        assert!(
+            serial_log.contains(marker),
+            "expected the serial narration to contain {marker:?} -- \
+             serial log:\n{serial_log}"
+        );
+    }
+    // The single-verdict discipline's other half (same reasoning as the
+    // pciprobe test above): no individual check anywhere printed FAIL.
+    assert!(
+        !serial_log.contains(" FAIL"),
+        "expected no failing check anywhere in the serial log:\n{serial_log}"
+    );
+
+    // The host side: `--inspect`'s net-harness report shows exactly one
+    // transmitted frame, and its bytes are the exact 60-byte frame
+    // `m68k/vnettest` sends (dst broadcast, src the device's own MAC,
+    // ethertype $88B5, "M68KVNET-TX-0001", zero-padded to the Ethernet
+    // minimum -- the driver's own padding, not this test's).
+    let expected_frame_hex = "ff ff ff ff ff ff 02 6d 36 4b 00 01 88 b5 4d 36 \
+        38 4b 56 4e 45 54 2d 54 58 2d 30 30 30 31 00 00 00 00 00 00 00 00 00 \
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
+    assert!(
+        stdout.contains("pcibridge net harness: 1 frame(s) transmitted by the guest"),
+        "expected --inspect to report exactly one transmitted frame:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("frame 0: 60 byte(s): {expected_frame_hex}")),
+        "expected the recorded frame's exact bytes:\n{stdout}"
+    );
+
+    let _ = std::fs::remove_file(&serial_log_path);
+}
+
+/// A SANA-II conformance gate for `virtionet.device`, using `SanaConform`
+/// -- a prebuilt m68k Shell tool from `~/src/sana2loop` (the project
+/// owner's own hardware-free SANA-II `loopback.device` project, BSD
+/// 2-Clause -- freely copyable/redistributable here, provenance recorded
+/// in `scripts/patch-sanaconform-hdf.sh` and `docs/virtionet.md` §7/§8).
+/// This is an ADDITIVE gate on top of the first-packet test above: it
+/// pins today's honest SANA-II surface -- including the driver's
+/// recorded scope-downs (`docs/virtionet.md` §7) -- as POSITIVE evidence
+/// read back from the probe's own redirected log, not absence of
+/// complaint.
+///
+/// Read `sanaconform.c` (`~/src/sana2loop/src/tools/sanaconform.c`)
+/// before touching this test: every probe step it runs against a real
+/// device is bounded --
+///
+/// - every command other than the self-echo round trip's `CMD_WRITE`/
+///   `CMD_READ` is a plain synchronous `DoIO()` against a command
+///   `virtionet_device.c`'s own `VNetBeginIO` completes immediately
+///   (`TermIO()` inline, confirmed by reading that switch statement:
+///   every case other than `CMD_READ`/`CMD_WRITE` sets `io_Error` and
+///   falls through to `TermIO(io)`);
+/// - the self-echo round trip's own wait is an explicit bounded poll
+///   (`CheckIO()` in a 50-iteration `Delay(1)` loop, ~1 second ceiling,
+///   then `AbortIO()` -- never a raw blocking `WaitIO()`) --
+///
+/// and, specific to THIS driver: `sanaconform.c`'s self-echo step opens
+/// its second (write-partner) handle with a HARDCODED `"loopback.device"`
+/// string, not the `DEVICE` argument SanaConform was actually invoked
+/// with (confirmed by reading the source -- an upstream quirk of the
+/// tool, not this project's doing). Since this image carries no
+/// `loopback.device` at all, that second `OpenDevice()` always fails and
+/// the tool takes its own graceful "couldn't open a second handle" path
+/// -- bounded either way, and, separately, `virtionet.device` is itself
+/// single-opener (`docs/virtionet.md` §7: a second `Open` of unit 0 is
+/// refused with `IOERR_UNITBUSY`), so the self-echo round trip was never
+/// going to complete against this driver regardless of that upstream
+/// quirk. Both are asserted below as the expected, graceful skip.
+///
+/// `scripts/patch-sanaconform-hdf.sh`'s image has no `VNetTest` (see that
+/// script's own comment): `SanaConform`'s `CONFIG ONLINE` invocation is
+/// the only opener, and its own probe -- not `VNetTest` -- exercises the
+/// driver's full `DevInit` chain via `OpenDevice`.
+///
+/// The image is COPIED to a temp path before boot (never the checked-in
+/// fixture): the guest writes `SYS:sanaconform.log`, and mutating the
+/// fixture in place would make repeat runs stop being idempotent.
+///
+/// `--max-frames`: sized up from the first-packet test's own 3000 (which
+/// covers one `VNetTest` open/tx/rx). `SanaConform`'s own probe issues
+/// several more synchronous commands before its one bounded ~1s poll, so
+/// this test uses 4000 for margin; the original `Startup-Sequence`'s own
+/// later commands (`EndCLI` included) still run well inside that budget,
+/// which is itself positive evidence the redirected log was closed and
+/// flushed to disk before cutoff.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and the patched sanaconform HDF on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_sanaconform_gates_virtionet_device() {
+    let rom = kickstart_a1200();
+    let hd_fixture = sanaconform_hd_image();
+    if !have_fixtures(&[&rom, &hd_fixture]) {
+        return;
+    }
+
+    // Never boot the checked-in fixture directly -- the guest writes
+    // SYS:sanaconform.log onto it, so every run must start from a fresh
+    // copy.
+    let hd = std::env::temp_dir().join(format!(
+        "machine-hosted-sanaconform-{}.hdf",
+        std::process::id()
+    ));
+    std::fs::copy(&hd_fixture, &hd).unwrap_or_else(|e| panic!("copy {hd_fixture} -> {hd:?}: {e}"));
+    let hd = hd.to_str().unwrap().to_string();
+
+    let serial_log_path = std::env::temp_dir().join(format!(
+        "machine-hosted-kickstart-sanaconform-{}.serial.log",
+        std::process::id()
+    ));
+
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--hostblk-writable",
+        "--pcibridge",
+        "--max-frames",
+        "4000",
+        "--max-instructions",
+        "2500000000",
+        "--serial-log",
+        serial_log_path.to_str().unwrap(),
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    let log = xdftool_read(&hd, "sanaconform.log");
+    eprintln!("SYS:sanaconform.log:\n{log}");
+
+    // Positive evidence, in the exact order sanaconform.c emits it
+    // (read directly from ~/src/sana2loop/src/tools/sanaconform.c).
+    for marker in [
+        // Header: which device/unit was probed, and that OpenDevice
+        // itself succeeded (DevInit ran here -- this is the only opener
+        // on this image).
+        "SanaConform: probing virtionet.device unit 0",
+        "OpenDevice: OK (Rev 2/3/7 buffer/DMA hooks all accepted without error --",
+        // CONFIG (opt-in): a fresh Open always resets `configured` to
+        // false (virtionet_device.c's own DevInit-time reseed), so the
+        // first S2_CONFIGINTERFACE on this unit always succeeds.
+        "CONFIG: configured with the driver's own factory address",
+        // ONLINE (opt-in): now configured, S2_ONLINE succeeds.
+        "S2_ONLINE: OK",
+        // S2_DEVICEQUERY: the driver's actual reported values --
+        // computed from virtionet_device.h's VNET_FRAME_MAX (1526) minus
+        // VNET_ETH_HDR_LEN (14) = 1512 (docs/virtionet.md records this
+        // is the driver's own honest MTU claim, not the conventional
+        // 1500), BPS is this driver's placeholder link-speed constant
+        // (1000000000, virtio-net models no real link speed), and
+        // HardwareType 1 is S2WireType_Ethernet.
+        "S2_DEVICEQUERY: MTU=1512 BPS=1000000000 HardwareType=1",
+        // Rev 4 RawMTU: this driver's own struct Sana2DeviceQuery (no
+        // RawMTU field at all) is smaller than SanaConform's own
+        // extended query struct, so SizeSupplied comes back clamped to
+        // the driver's native (pre-Rev-4) size -- an expected, honest
+        // scope-down, not a probe failure.
+        "  Rev 4 RawMTU: not supported (SizeSupplied=30 bytes, pre-Rev-4 driver)",
+        // Station address: current == factory at a fresh open (both
+        // reseeded from the same VNET_HW_MAC at every 0->1 Open).
+        "Station address: 02:6d:36:4b:00:01",
+        // Rev 4 additions this driver doesn't recognise at all (not in
+        // its BeginIO switch -- confirmed by reading virtionet_device.c:
+        // both fall through to `default: io_Error = IOERR_NOCMD`).
+        "S2_GETPEERADDRESS: not implemented (pre-Rev-4 driver)",
+        "S2_GETDNSADDRESS: not implemented (pre-Rev-4 driver)",
+        // Self-echo round trip: expected, graceful skip (see this test's
+        // own doc comment for the two independent reasons this always
+        // takes this path against this driver/tool combination).
+        "Self-echo round trip: skipped (couldn't open a second handle on unit 0)",
+    ] {
+        assert!(
+            log.contains(marker),
+            "expected SYS:sanaconform.log to contain {marker:?} -- \
+             log:\n{log}"
+        );
+    }
+
+    // No assertion may pass on absence alone (task discipline): the
+    // markers above are POSITIVE lines sanaconform.c prints for exactly
+    // this driver's exact behavior, not the mere absence of a `FAIL` or
+    // `PASS` verdict -- SanaConform itself has no single overall verdict
+    // line (unlike VNetTest/PCIProbe's own "result: ALL PASS"), so there
+    // is nothing to additionally assert the negative of here.
+
+    let _ = std::fs::remove_file(&serial_log_path);
+    let _ = std::fs::remove_file(&hd);
 }
 
 #[test]

@@ -430,6 +430,34 @@ does and does not exercise until stage 3 supplies a real device
 source). Delivery is post-generation HDF patching
 (`scripts/patch-pciprobe-hdf.sh`), not an amibake change.
 
+**Stage 3 landed (2026-09-15), the virtio-net function and its SANA-II
+driver.** Host side: `VirtioNetStub` (`crates/machine-core/src/pci.rs`)
+gives the stub real logic behind BAR0 — feature negotiation
+(`VIRTIO_F_VERSION_1`/`VIRTIO_NET_F_MAC` only), two bounded, hostile-
+input-hardened split virtqueues, a fixed MAC, and the `NetBackend` seam
+a host network path attaches through. `machine-hosted` wires
+`HarnessNetBackend` (`crates/machine-hosted/src/netharness.rs`) behind
+it unconditionally with `--pcibridge`: records every transmitted frame
+for `--inspect`, and makes a small, bounded number of *spaced* attempts
+to deliver one fixed echo-reply frame — not a single delayed delivery,
+not a continuous offer, both tried and both confirmed wrong by direct
+measurement (`docs/virtionet.md` §6 has the full story). A real host
+tap/socket backend is deliberately deferred; this is proof-of-chain, not
+a network path. Guest side: `virtionet.device`
+(`m68k/virtionet-device/`), a SANA-II driver against
+`prometheus.library`'s public API alone, and `C:VNetTest`
+(`m68k/vnettest/`), its test tool. Proven end to end by
+`kickstart_3_2_2_a1200_virtionet_first_packet_round_trip`: the driver's
+full `DevInit` chain, one transmitted frame asserted byte for byte
+through the harness's own report, the device's own `INTx` observed
+through INT2 (the positive evidence `docs/pci-library.md` §6 said was
+missing until this stage), and a completed `CMD_READ` carrying the
+harness's reply. The stage-2 probe test was re-proven too, amended for a
+BAR0 that now has a live device behind it (`docs/pci-library.md` §6).
+Delivery is post-generation HDF patching (`scripts/patch-virtionet-hdf.
+sh`), the same pattern as stage 2. See `docs/virtionet.md` for the BAR0
+map, the driver's own scope-downs, and the full verification list.
+
 ### Capped
 
 **Planar renderer and blitter.** These can never be fully retired: the

@@ -222,8 +222,12 @@ one server does not deafen another. Servers follow the shared-chain
 discipline `m68k/hostblk-rom` established (Z-flag set on exit unless
 exclusively claimed).
 
-Until stage 3, no device fires INTx; `INTX_TEST` exists so the routing
-is provable end to end anyway (§6).
+Through stage 2, no device fired INTx; `INTX_TEST` existed so the
+routing was provable end to end anyway (§6). **Stage 3 has since landed
+a real source**: `virtionet.device`'s own ISR narrates a one-shot marker
+the first time the virtio-net function's own `INTx` reaches it through
+this identical INT2 path (`docs/virtionet.md` §7/§9) — `INTX_TEST`
+remains exactly as provable as before, unaffected.
 
 ## 6. The probe tool, and what is proven
 
@@ -239,10 +243,21 @@ narrating `PCIPROBE`-prefixed markers over serial (`KPrintF`):
    with the concrete values.
 3. Reads `PRM_MemoryAddr0`/`PRM_MemorySize0`, asserts a real assigned
    BAR (non-zero, 16 KiB, PCI address below the Zorro III window,
-   printed for cross-checking against host introspection), and reads
-   through the aperture at that address (the stub answers all-ones —
-   asserted as the master-abort contract, and as evidence the
-   banked window is plumbed).
+   printed for cross-checking against host introspection). **Amended
+   for stage 3** (`docs/virtionet.md`, `docs/pcibridge-protocol.md`
+   §2/§8/§10): now that the virtio-net function's own logic lives
+   behind this BAR, memaddr0 itself no longer answers the master-abort
+   value — reading it proves only that this one device responds. The
+   master-abort check instead targets `memaddr0 + memsize0`, DERIVED
+   from the two values this probe just read back (never a hardcoded
+   constant, this file's own address rule): the BAR sits at the policy
+   region's own base, so one step past its own claimed 16 KiB still
+   sits comfortably inside the 8 MB banked aperture and is unclaimed by
+   any board. A second, new check follows it: the MAC read back from
+   `DEVICE_CFG` (BAR0 + `$3000`) through the aperture, compared against
+   the device's own identity (`02:6D:36:4B:00:01`) — positive evidence
+   this probe is talking to the actual virtio-net device, not merely a
+   board matching the right vendor/device IDs in config space.
 4. Installs an interrupt server via `Prm_AddIntServer`, pokes
    `INTX_TEST` on the card (found via its own `FindConfigDev`, the
    one deliberately out-of-band step, labelled as harness), and
@@ -252,11 +267,21 @@ narrating `PCIPROBE`-prefixed markers over serial (`KPrintF`):
 **Said plainly:** step 4 proves the routing surface host-to-guest end
 to end — a line asserted on the card side arrives as a real
 level-triggered INT2, through exec's server chain, into a
-Prometheus-installed server, which acknowledges by deassertion. What
-it does not prove is a PCI *device* raising INTx from its own
-function logic; no device has function logic until stage 3, whose
-virtio-net ISR replaces `INTX_TEST` as the source while every other
-link stays as proven here.
+Prometheus-installed server, which acknowledges by deassertion. Until
+stage 3 this was also true of a PCI *device* raising `INTx` from its
+own function logic: no device had function logic yet. **Stage 3 closed
+that gap** (`docs/virtionet.md`): `virtionet.device`'s own ISR now
+narrates a one-shot marker the first time the device's own `INTx`
+(not this probe's `INTX_TEST`) reaches it through the identical INT2
+path proven here.
+
+The two amended lines, exactly, on a live device (`docs/
+pcibridge-protocol.md` §2, `docs/virtionet.md` §2):
+
+```
+PCIPROBE aperture read (master-abort): expected $FFFFFFFF got $FFFFFFFF PASS
+PCIPROBE bar0 device mac: expected 02:6D:36:4B:00:01 got 02:6D:36:4B:00:01 PASS
+```
 
 BAR consistency is checked from both sides: the guest prints the BAR0
 PCI address the library assigned; `--inspect`'s host-side pcibridge
@@ -322,3 +347,6 @@ of complaint.
   post-generation HDF patching (`scripts/patch-pciprobe-hdf.sh`,
   extending `patch-rtgboard-hdf.sh`'s pattern) — amibake is not
   modified, per the standing instruction.
+
+Stage 3 has since landed against exactly this contract, unchanged: see
+`docs/virtionet.md`.
