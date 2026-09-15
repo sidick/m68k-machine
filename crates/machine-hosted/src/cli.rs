@@ -328,6 +328,17 @@ pub struct Args {
     /// not fit. Ignored without `--rtgboard`.
     #[arg(long, default_value_t = 8)]
     pub rtgboard_vram_mb: u32,
+
+    /// Attach the `pcibridge` Zorro III PCI shim (ADR 0005 stage 1,
+    /// `machine_core::pcibridge`), backed by the host-side virtual PCI
+    /// topology (`machine_core::pci`): a QEMU-root-shaped host bridge at
+    /// 00:00.0 and a config-space-complete modern virtio-net device
+    /// (1af4:1041) at 00:01.0. See `docs/pcibridge-protocol.md`. This is
+    /// enumeration surface only this increment: no `pci.library`, no
+    /// driver -- attaching it with no guest software is inert but
+    /// harmless, the same posture every card's first increment took.
+    #[arg(long, default_value_t = false)]
+    pub pcibridge: bool,
 }
 
 /// CLI surface for [`machine_core::rtgboard::format`] -- kept as a

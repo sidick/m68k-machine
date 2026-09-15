@@ -48,7 +48,7 @@ use std::path::Path;
 use m68k::{CpuCore, CycleBatchControl, CycleBatchExit};
 
 use machine_core::block::BlockDevice;
-use machine_core::{MachineBus, CHIP_RAM_SIZE};
+use machine_core::{pci, MachineBus, CHIP_RAM_SIZE};
 
 use crate::bus::Bus;
 use crate::cli::Args;
@@ -330,6 +330,39 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         }
     }
 
+    // `pcibridge`'s host-side virtual PCI topology (ADR 0005 stage 1,
+    // `machine_core::pci`/`machine_core::pcibridge`): a QEMU-root-shaped
+    // host bridge at 00:00.0 and a config-space-complete virtio-net stub
+    // at 00:01.0. Neither device allocates on the heap (unlike
+    // `graphics_vram`/`fast_ram`/`rtgboard_vram` above), so -- unlike
+    // those -- there is no reason to gate their *construction* behind
+    // `args.pcibridge`; only *attaching* them to the bus below is
+    // conditional. `pcibridge_vpci` still needs to exist in this frame
+    // regardless (`with_pcibridge` borrows it `&'a mut`, machine-core has
+    // no allocator), the same lifetime shape every other card's backing
+    // storage has here.
+    let mut pcibridge_hostbridge = pci::HostBridge::new();
+    let mut pcibridge_netstub = pci::VirtioNetStub::new();
+    let mut pcibridge_slots = [
+        pci::VirtualSlot {
+            bdf: pci::Bdf {
+                bus: 0,
+                device: 0,
+                function: 0,
+            },
+            device: &mut pcibridge_hostbridge,
+        },
+        pci::VirtualSlot {
+            bdf: pci::Bdf {
+                bus: 0,
+                device: 1,
+                function: 0,
+            },
+            device: &mut pcibridge_netstub,
+        },
+    ];
+    let mut pcibridge_vpci = pci::VirtualPciBus::new(&mut pcibridge_slots);
+
     let machine_bus = MachineBus::new(&mut chip_ram, &rom_bytes);
     let machine_bus = match &ext_rom_bytes {
         Some(ext) => machine_bus.with_ext_rom(ext),
@@ -418,6 +451,24 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
             args.rtgboard_vram_mb
         ));
         machine_bus.with_rtgboard(&mut rtgboard_vram, &rtgboard_modes)
+    } else {
+        machine_bus
+    };
+    // Attached *last* among the AUTOCONFIG registrations, deliberately:
+    // every board above this line keeps the exact chain position (and so
+    // the exact base address) it had before `pcibridge` existed --
+    // `pcibridge_coexists_with_the_full_native_chain_without_moving_anyone`
+    // in `machine-core`'s own test suite is written against precisely
+    // this ordering, the same reasoning `--fast-ram` registering after
+    // `--graphics` documents above. This board carries no DiagArea and no
+    // driver (this increment's own scope), so attaching it with no guest
+    // software is inert but harmless.
+    let machine_bus = if args.pcibridge {
+        console.diag(
+            "pcibridge: Zorro III PCI shim attached (ADR 0005 stage 1) -- host bridge at \
+             00:00.0, virtio-net stub (1af4:1041) at 00:01.0",
+        );
+        machine_bus.with_pcibridge(&mut pcibridge_vpci)
     } else {
         machine_bus
     };
@@ -561,6 +612,9 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         }
         if args.input_script.is_some() {
             console.diag(&crate::introspect::format_input_state(&mut bus.0));
+        }
+        if args.pcibridge {
+            console.diag(&crate::introspect::format_pcibridge_state(&mut bus.0));
         }
     }
 

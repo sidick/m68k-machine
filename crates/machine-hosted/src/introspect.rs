@@ -1201,6 +1201,82 @@ pub fn format_input_state(bus: &mut MachineBus) -> String {
     out
 }
 
+/// One `pcibridge` `ConfigDev` located in guest memory -- see
+/// [`find_pcibridge_config_dev`], the `pcibridge`-card twin of
+/// [`find_hostblk_config_dev`]/[`find_input_config_dev`] (identical
+/// reasoning, different manufacturer/product pair, and no DiagArea
+/// fields -- this board has none, `er_InitDiagVec` `0`).
+struct PcibridgeConfigDev {
+    address: u32,
+    er_type: u8,
+    board_addr: u32,
+    board_size: u32,
+}
+
+/// [`find_hostblk_config_dev`]/[`find_input_config_dev`], adapted for the
+/// `pcibridge` card's own `MANUFACTURER`/`PRODUCT` pair
+/// (`machine_core::pcibridge::{MANUFACTURER, PRODUCT}`). See
+/// [`find_hostblk_config_dev`]'s doc comment for the full reasoning (why
+/// a scan against known-good ground truth rather than a guess at
+/// `ExpansionBase`'s private list layout) -- this is the positive
+/// evidence that real Kickstart's `expansion.library` itself accepted
+/// and configured the board, the same silent-rejection trap `hostblk`'s
+/// introspection exists to catch.
+fn find_pcibridge_config_dev(
+    bus: &mut MachineBus,
+    expected_base: u32,
+) -> Option<PcibridgeConfigDev> {
+    use machine_core::pcibridge;
+    let mut addr = 0u32;
+    while (addr as usize) < machine_core::CHIP_RAM_SIZE {
+        if bus.read_long(addr + configdev::CD_BOARD_ADDR) == expected_base
+            && bus.read_word(addr + configdev::CD_ROM + expansionrom::ER_MANUFACTURER)
+                == pcibridge::MANUFACTURER
+            && bus.read_byte(addr + configdev::CD_ROM + expansionrom::ER_PRODUCT)
+                == pcibridge::PRODUCT
+        {
+            return Some(PcibridgeConfigDev {
+                address: addr,
+                er_type: bus.read_byte(addr + configdev::CD_ROM + expansionrom::ER_TYPE),
+                board_addr: expected_base,
+                board_size: bus.read_long(addr + configdev::CD_BOARD_SIZE),
+            });
+        }
+        addr += 4;
+    }
+    None
+}
+
+/// Summarise what Kickstart did with the `pcibridge` board (`--pcibridge`):
+/// whether AUTOCONFIG placed it, and whether `expansion.library` created
+/// a `ConfigDev` for it -- the `pcibridge`-card twin of
+/// [`format_hostblk_state`]/[`format_input_state`], but with no DiagArea
+/// section: this board carries none (`er_InitDiagVec` `0`, this
+/// increment's own scope -- `docs/pcibridge-protocol.md` §1).
+pub fn format_pcibridge_state(bus: &mut MachineBus) -> String {
+    let Some(base) = bus.pcibridge_board_base() else {
+        return "pcibridge state: no board attached, or not yet configured by AUTOCONFIG"
+            .to_string();
+    };
+    let mut out = format!("pcibridge state: AUTOCONFIG placed the board at {base:#010x}\n");
+
+    match find_pcibridge_config_dev(bus, base) {
+        Some(cd) => {
+            out.push_str(&format!(
+                "  ConfigDev found at {:#010x}: er_Type {:#04x}  cd_BoardAddr {:#010x}  \
+                 cd_BoardSize {:#010x}\n",
+                cd.address, cd.er_type, cd.board_addr, cd.board_size,
+            ));
+        }
+        None => out.push_str(
+            "  no ConfigDev matched this board's manufacturer/product/address -- \
+             expansion.library either hasn't run yet or never adopted the board\n",
+        ),
+    }
+
+    out
+}
+
 fn find_diag_rom_copy_by_signature(bus: &mut MachineBus) -> Option<(u32, u32)> {
     // First 8 bytes of the embedded ROM's own DiagArea header (da_Config,
     // da_Flags, da_Size, da_DiagPoint) -- read from `hostblk::DIAG_ROM`

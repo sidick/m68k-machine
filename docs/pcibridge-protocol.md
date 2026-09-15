@@ -272,12 +272,21 @@ AUTOCONFIG-assigned placement, and coexistence — the full native chain
 (`hostblk`, `input`, `rtgboard`, `fastram`, `pktport`) placed
 byte-identically with and without this board attached last.
 
-Real-ROM verification: `machine-hosted --pcibridge --inspect` against
-Kickstart 3.2.2, confirming `expansion.library` itself configures the
-board (a `ConfigDev` with this manufacturer/product exists in the
-guest's own list at the base our bus recorded) — positive evidence, not
-absence-of-complaint — and the cheap real-ROM baselines re-run
-unchanged.
+Real-ROM verification (2026-09-15):
+`kickstart_3_2_2_a1200_configures_the_pcibridge_board`
+(`crates/machine-hosted/tests/real_rom.rs`) boots the real Kickstart
+3.2.2 A1200 ROM with `--pcibridge --inspect` and confirms
+`expansion.library` itself configured the board — positive evidence,
+not absence-of-complaint. Measured: AUTOCONFIG placed the board at
+`$50000000` (last in the chain, after fast RAM's own Zorro III board,
+per the deliberate attach-last ordering `run.rs` documents), and the
+guest's own `ConfigDev` for it was found at chip RAM `$000018A0` with
+`er_Type $80`, `cd_BoardAddr $50000000`, `cd_BoardSize $01000000` —
+Kickstart's own record agreeing with our bus's, with the
+healthy-`ExecBase` guard (`$4000089C`) intact. The cheap real-ROM
+baselines (`kickstart_3_2_2_a1200`, the introspection test, the
+boot-screen screenshot, the AROS boot screen) all re-ran green
+alongside it.
 
 ## 10. What this increment does not include
 

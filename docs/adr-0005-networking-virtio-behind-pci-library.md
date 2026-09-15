@@ -92,6 +92,17 @@ time:
    host-side tests proving enumeration against QEMU's real topology —
    before any 68k code exists, the same "register interface first,
    driver later" shape every card here has taken.
+   *Done, 2026-09-15* — `pcibridge` (`docs/pcibridge-protocol.md`), the
+   `PciBackend` seam, and enumeration/BAR-sizing/coexistence proven
+   through the real bus, with real Kickstart 3.2.2 adopting the board
+   (its own `ConfigDev`, verified by introspection). One honest scope
+   note against this line's own wording: the enumeration tests run
+   against the host-side *virtual* topology (a QEMU-root-shaped host
+   bridge plus a config-space-complete virtio-net), because
+   `machine-hosted` has no real PCI bus and the QEMU board crates do
+   not yet have devices at all; "against QEMU's real topology" becomes
+   true when a board crate implements `PciBackend` over its real ECAM —
+   the trait documents that mapping, and nothing in stage 2 waits on it.
 2. **`pci.library` second, conformance-shaped from day one.** The
    Prometheus API against that shim: config accessors with the
    *actual* byte-swap semantics (not a tidied reinterpretation),

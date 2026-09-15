@@ -211,6 +211,76 @@ fn kickstart_3_2_2_a1200_introspection_finds_a_healthy_exec_base() {
     );
 }
 
+/// The `pcibridge` verification this test documents (ADR 0005 stage 1,
+/// `docs/pcibridge-protocol.md`): `--pcibridge --inspect` on the same real
+/// Kickstart 3.2.2 A1200 ROM the healthy-`ExecBase` test above uses, this
+/// time asserting `--inspect`'s `pcibridge state:` section finds a
+/// `ConfigDev` `expansion.library` itself created for the board -- the
+/// positive evidence that real Kickstart's own AUTOCONFIG code accepted
+/// and configured the board, not merely that our own bus answers for it.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_configures_the_pcibridge_board() {
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
+        return;
+    }
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--max-frames",
+        "200",
+        "--max-instructions",
+        "50000000",
+        "--inspect",
+        "--pcibridge",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    // Same healthy-boot guard the model test makes, so a broken boot
+    // can't pass this test vacuously just because pcibridge's own lines
+    // happen to be present.
+    assert!(
+        stdout.contains("introspect: ExecBase at"),
+        "expected a well-formed ExecBase to be found on a real Kickstart boot"
+    );
+    assert!(
+        !stdout.contains("no plausible ExecBase"),
+        "exec should have finished initialising by frame 200"
+    );
+
+    let placed_line = stdout
+        .lines()
+        .find(|line| line.contains("pcibridge state: AUTOCONFIG placed the board at"))
+        .unwrap_or_else(|| {
+            panic!("expected a pcibridge AUTOCONFIG-placed line; full output:\n{stdout}")
+        });
+    let base_str = placed_line
+        .rsplit("at ")
+        .next()
+        .expect("line contains 'at '");
+    let base = u32::from_str_radix(base_str.trim_start_matches("0x"), 16)
+        .unwrap_or_else(|e| panic!("parsing base address from {base_str:?}: {e}"));
+    assert!(
+        base >= 0x1000_0000,
+        "AUTOCONFIG should place a Zorro III board at a plausible Zorro III address, got \
+         {base:#010x}"
+    );
+
+    assert!(
+        stdout.contains("ConfigDev found at"),
+        "expected the ConfigDev-found line -- evidence Kickstart's expansion.library adopted \
+         the pcibridge board; full output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("no ConfigDev matched this board's manufacturer/product/address"),
+        "a ConfigDev-not-matched line would mean Kickstart did NOT adopt the board; full \
+         output:\n{stdout}"
+    );
+}
+
 /// The ROMWack break-in this test documents (`docs/serial-debugging.md`):
 /// forcing an illegal-instruction exception opens Kickstart's alert/LED-
 /// blink loop, and flooding DEL across its six-poll break-in window
