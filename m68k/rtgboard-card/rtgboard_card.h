@@ -37,6 +37,13 @@
 /* VRAM aperture starts here, within the same 16 MB AUTOCONFIG window. */
 #define RTG_VRAM_BASE_OFFSET  0x100000
 
+/* The whole Zorro III AUTOCONFIG window (docs/rtgboard-protocol.md SS1) --
+ * needed here only to derive how much of VRAM_BYTES is actually reachable
+ * through this one aperture (RTG_VRAM_BASE_OFFSET onward): at most
+ * RTG_WINDOW_BYTES - RTG_VRAM_BASE_OFFSET (0x00F00000, 15 MB), never the
+ * board's full VRAM_BYTES if that happens to be larger. */
+#define RTG_WINDOW_BYTES      0x01000000
+
 /* ---- pixel formats (docs/rtgboard-protocol.md SS6) ---------------------- */
 
 #define RTG_FMT_RGB_565    0     /* 16 bpp, big-endian RRRRRGGGGGGBBBBB */
@@ -57,5 +64,33 @@
 
 #define RTG_BOARD_MANUFACTURER 0x07DB  /* er_Manufacturer, docs SS1 */
 #define RTG_BOARD_PRODUCT      4       /* er_Product, docs SS1 */
+
+/* ---- the one blessed mode (increment 2 scope) ---------------------------
+ * A three-way coupling, kept in sync BY HAND across all three (no shared
+ * code links them -- same discipline amirfb_card.c's g_modes[] documents
+ * for its own settings-file/driver split):
+ *   1. this driver (SetGC/SetPanning/ResolvePixelClock/GetPixelClock all
+ *      assume 640x480 RGB_565 is the mode that will be requested);
+ *   2. the host's `--rtgboard WIDTHxHEIGHT` flag (machine-hosted), which
+ *      builds the one-entry catalog this board's COMMIT validates against;
+ *   3. tools/rtgboard/make_settings.py, whose
+ *      Devs:Picasso96Settings entry is what actually gets P96 to request
+ *      this geometry in the first place.
+ * The board's own COMMIT (docs/rtgboard-protocol.md SS7 check 1) refuses
+ * any (width, height, format) that isn't an exact catalog entry -- so a
+ * mismatch here doesn't corrupt anything, it just means COMMIT rejects
+ * every mode this driver ever proposes. */
+#define RTG_BLESSED_WIDTH  640
+#define RTG_BLESSED_HEIGHT 480
+
+/* Single source of truth for this board's PixelClock formula, shared by
+ * ResolvePixelClock/GetPixelClock (amirfb's AMIRFB_MODE_PIXELCLOCK,
+ * issue #51: two independent copies of "width*height*60" drifted apart
+ * once a driver had more than one mode -- this board only ever has one,
+ * but there's no reason to invite the same mistake). Whatever generates
+ * a Devs:Picasso96Settings entry for this board (tools/rtgboard/
+ * make_settings.py) must use the identical formula for
+ * its own MIHD pixel-clock field, by hand, same coupling as above. */
+#define RTG_PIXELCLOCK(w, h) ((ULONG)(w) * (ULONG)(h) * 60)
 
 #endif /* RTGBOARD_CARD_H */
