@@ -56,6 +56,7 @@ pub mod hostblk;
 pub mod input;
 pub mod mirage;
 pub mod pci;
+pub mod pcibridge;
 pub mod pktport;
 pub mod render;
 pub mod rom;
@@ -70,6 +71,7 @@ use graffity::Graffity;
 use hostblk::Hostblk;
 use input::NativeInput;
 use mirage::Mirage;
+use pcibridge::PciBridge;
 use pktport::Pktport;
 use rtgboard::{ModeDescriptor, RtgBoard};
 
@@ -262,6 +264,17 @@ pub struct MachineBus<'a> {
     /// shape as [`Self::mirage_board`]/[`Self::hostblk_board`].
     rtg_board: Option<usize>,
 
+    /// The `pcibridge` Zorro III shim (ADR 0005 stage 1, [`pcibridge`]),
+    /// when the board layer has attached one via [`Self::with_pcibridge`].
+    /// Absent by default -- a machine with no pcibridge attached is
+    /// completely unaffected, the same guarantee every other optional
+    /// card on this bus gives.
+    pcibridge: Option<PciBridge<'a>>,
+    /// AUTOCONFIG chain index `pcibridge`'s single board landed at, once
+    /// [`Self::with_pcibridge`] has registered it -- the same seam shape
+    /// as [`Self::mirage_board`]/[`Self::hostblk_board`].
+    pcibridge_board: Option<usize>,
+
     /// While set, the ROM is mirrored over the bottom of the address
     /// space so the CPU's reset vector fetch from `$000000`/`$000004`
     /// lands in ROM. Real hardware does this with Gary, driven by CIA-A
@@ -343,6 +356,8 @@ impl<'a> MachineBus<'a> {
             pktport_board: None,
             rtg: None,
             rtg_board: None,
+            pcibridge: None,
+            pcibridge_board: None,
             overlay: true,
         }
     }
@@ -485,6 +500,19 @@ impl<'a> MachineBus<'a> {
     pub fn with_rtgboard(mut self, vram: &'a mut [u8], catalog: &'a [ModeDescriptor]) -> Self {
         self.rtg_board = self.autoconfig.add_board(RtgBoard::board_spec());
         self.rtg = Some(RtgBoard::new(vram, catalog));
+        self
+    }
+
+    /// Attach the `pcibridge` Zorro III shim (ADR 0005 stage 1,
+    /// [`pcibridge`]) over a caller-owned [`pci::PciBackend`] -- borrowed,
+    /// like every other card's backing store on this bus (this crate has
+    /// no allocator). Registers `pcibridge`'s single Zorro III AUTOCONFIG
+    /// board. Absent a call to this, the chain and every address this
+    /// card would occupy are untouched -- the same "nothing changes
+    /// unless attached" guarantee every other optional card here gives.
+    pub fn with_pcibridge(mut self, backend: &'a mut dyn pci::PciBackend) -> Self {
+        self.pcibridge_board = self.autoconfig.add_board(PciBridge::board_spec());
+        self.pcibridge = Some(PciBridge::new(backend));
         self
     }
 
@@ -652,6 +680,28 @@ impl<'a> MachineBus<'a> {
     /// configured it. See [`Self::hostblk_board_base`], the same shape.
     pub fn rtgboard_base(&self) -> Option<u32> {
         self.autoconfig.placement(self.rtg_board?).map(|p| p.base)
+    }
+
+    /// Borrow the attached `pcibridge` card, if [`Self::with_pcibridge`]
+    /// was called.
+    pub fn pcibridge(&self) -> Option<&PciBridge<'a>> {
+        self.pcibridge.as_ref()
+    }
+
+    /// Mutable access to the attached `pcibridge` card, see
+    /// [`Self::pcibridge`].
+    pub fn pcibridge_mut(&mut self) -> Option<&mut PciBridge<'a>> {
+        self.pcibridge.as_mut()
+    }
+
+    /// Where AUTOCONFIG placed `pcibridge`'s single Zorro III board, once
+    /// `expansion.library` has configured it -- `None` before
+    /// [`Self::with_pcibridge`] was called or before the guest has
+    /// configured it. See [`Self::hostblk_board_base`], the same shape.
+    pub fn pcibridge_board_base(&self) -> Option<u32> {
+        self.autoconfig
+            .placement(self.pcibridge_board?)
+            .map(|p| p.base)
     }
 
     /// Advance time by `cpu_clocks`, ticking the frame clock and both
@@ -900,6 +950,14 @@ impl<'a> MachineBus<'a> {
                 Some(dev) => dev.read(offset),
                 None => OPEN_BUS_BYTE,
             }
+        } else if let Some(offset) = self.pcibridge_target(address) {
+            match &mut self.pcibridge {
+                // No interrupt to check here either -- `pcibridge`'s
+                // module docs: config cycles are synchronous and this
+                // card raises no interrupt at all, this increment.
+                Some(dev) => dev.read(offset),
+                None => OPEN_BUS_BYTE,
+            }
         } else {
             OPEN_BUS_BYTE
         }
@@ -928,6 +986,21 @@ impl<'a> MachineBus<'a> {
     /// to some other board. See [`Self::hostblk_target`], the same shape.
     fn rtg_target(&self, address: u32) -> Option<u32> {
         let idx = self.rtg_board?;
+        if self.autoconfig.board_at(address) != Some(idx) {
+            return None;
+        }
+        let base = self.autoconfig.placement(idx)?.base;
+        Some(address - base)
+    }
+
+    /// Whether `address` falls inside `pcibridge`'s configured AUTOCONFIG
+    /// window, and if so, the board-relative offset -- the input to
+    /// [`pcibridge::PciBridge::read`]/[`pcibridge::PciBridge::write`].
+    /// `None` whenever no card is attached ([`Self::pcibridge_board`] is
+    /// `None` until [`Self::with_pcibridge`] runs) or the address belongs
+    /// to some other board. See [`Self::hostblk_target`], the same shape.
+    fn pcibridge_target(&self, address: u32) -> Option<u32> {
+        let idx = self.pcibridge_board?;
         if self.autoconfig.board_at(address) != Some(idx) {
             return None;
         }
@@ -1203,6 +1276,12 @@ impl<'a> MachineBus<'a> {
                 dev.write(offset, value);
                 // No interrupt check here -- see `read_byte`'s matching
                 // arm above.
+            }
+        } else if let Some(offset) = self.pcibridge_target(address) {
+            if let Some(dev) = &mut self.pcibridge {
+                dev.write(offset, value);
+                // No interrupt check here either -- see `read_byte`'s
+                // matching arm above.
             }
         }
         // ROM and open-bus writes: discarded.
@@ -2463,6 +2542,284 @@ mod tests {
             bus.rtgboard().unwrap().vram()[0..3],
             [0x11, 0x22, 0x33],
             "the bus's VRAM aperture and the board's own borrowed slice must be the same bytes"
+        );
+    }
+
+    // ---- pcibridge wiring: ADR 0005 stage 1's guest-visible half -----------
+
+    /// Configure a Zorro II board at `base_byte << 16` -- the single-byte
+    /// `EC_BASEADDRESS` sequence, the shape `with_mirage`'s own tests use.
+    fn configure_zorro_ii(bus: &mut MachineBus, base_byte: u8) {
+        bus.write_byte(
+            autoconfig::AUTOCONFIG_BASE + autoconfig::ec::BASEADDRESS,
+            base_byte,
+        );
+    }
+
+    /// A [`pktport::PacketBackend`] stub for the coexistence test below --
+    /// this test only cares that `pktport`'s board lands at a stable
+    /// address, never that a real request completes, so a fixed no-op
+    /// answer is enough (the same minimal-fixture posture `MirageDisk`
+    /// takes for `BlockDevice` above).
+    struct StubPacketBackend;
+
+    impl pktport::PacketBackend for StubPacketBackend {
+        fn execute(
+            &mut self,
+            _action: u32,
+            _args: [u32; 7],
+            _mem: &mut dyn GuestMemory,
+        ) -> (u32, u32) {
+            (0, 0)
+        }
+    }
+
+    fn pcibridge_read_u32(bus: &mut MachineBus, addr: u32) -> u32 {
+        u32::from_be_bytes([
+            bus.read_byte(addr),
+            bus.read_byte(addr + 1),
+            bus.read_byte(addr + 2),
+            bus.read_byte(addr + 3),
+        ])
+    }
+
+    fn pcibridge_write_u32(bus: &mut MachineBus, addr: u32, value: u32) {
+        let b = value.to_be_bytes();
+        bus.write_byte(addr, b[0]);
+        bus.write_byte(addr + 1, b[1]);
+        bus.write_byte(addr + 2, b[2]);
+        bus.write_byte(addr + 3, b[3]);
+    }
+
+    /// Pack a config address the way a driver would -- see
+    /// `pcibridge`'s own unit tests for the identical helper against the
+    /// card directly, rather than through the real bus.
+    fn pcibridge_pack_cfg_addr(bus_no: u8, device: u8, function: u8, offset: u16) -> u32 {
+        (bus_no as u32) << 20 | (device as u32) << 15 | (function as u32) << 12 | offset as u32
+    }
+
+    fn pcibridge_stage_and_op(bus: &mut MachineBus, base: u32, addr: u32, width: u8, op: u8) {
+        pcibridge_write_u32(bus, base + pcibridge::reg::CFG_ADDR, addr);
+        bus.write_byte(base + pcibridge::reg::CFG_WIDTH + 3, width);
+        bus.write_byte(base + pcibridge::reg::CFG_OP + 3, op);
+    }
+
+    /// End-to-end through the real bus (not `pcibridge`'s own flat unit
+    /// tests): a machine with a real [`pci::VirtualPciBus`] behind
+    /// `pcibridge` scans bus 0 devices 0..8 exactly the way `pci.library`
+    /// enumeration will -- only the two populated slots answer with their
+    /// real identity, everything else all-ones -- and then sizes a real
+    /// BAR through the card's own registers.
+    #[test]
+    fn pci_enumeration_walks_through_the_real_bus() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut hostbridge_dev = pci::HostBridge::new();
+        let mut net_dev = pci::VirtioNetStub::new();
+        let mut slots = [
+            pci::VirtualSlot {
+                bdf: pci::Bdf {
+                    bus: 0,
+                    device: 0,
+                    function: 0,
+                },
+                device: &mut hostbridge_dev,
+            },
+            pci::VirtualSlot {
+                bdf: pci::Bdf {
+                    bus: 0,
+                    device: 1,
+                    function: 0,
+                },
+                device: &mut net_dev,
+            },
+        ];
+        let mut vpci = pci::VirtualPciBus::new(&mut slots);
+        let mut bus = new_bus(&mut ram, &rom).with_pcibridge(&mut vpci);
+
+        let base = 0x4000_0000u32;
+        configure_zorro_iii(&mut bus, base);
+        assert_eq!(bus.pcibridge_board_base(), Some(base));
+
+        for device in 0u8..8 {
+            pcibridge_stage_and_op(
+                &mut bus,
+                base,
+                pcibridge_pack_cfg_addr(0, device, 0, 0),
+                2,
+                0,
+            );
+            assert_eq!(
+                bus.read_byte(base + pcibridge::reg::CFG_STATUS + 3),
+                pcibridge::status::COMPLETED,
+                "device {device} scan must always complete"
+            );
+            bus.write_byte(base + pcibridge::reg::CFG_STATUS + 3, 0xFF);
+            let vendor = pcibridge_read_u32(&mut bus, base + pcibridge::reg::CFG_DATA);
+            match device {
+                0 => assert_eq!(vendor, pci::HostBridge::VENDOR_ID as u32, "device 0"),
+                1 => assert_eq!(vendor, pci::VirtioNetStub::VENDOR_ID as u32, "device 1"),
+                _ => assert_eq!(vendor, 0xFFFF, "device {device} must be absent"),
+            }
+        }
+
+        // Size BAR0 of 00:01.0 through the real bus.
+        pcibridge_write_u32(&mut bus, base + pcibridge::reg::CFG_DATA, 0xFFFF_FFFF);
+        pcibridge_stage_and_op(&mut bus, base, pcibridge_pack_cfg_addr(0, 1, 0, 0x10), 4, 1);
+        bus.write_byte(base + pcibridge::reg::CFG_STATUS + 3, 0xFF);
+
+        pcibridge_stage_and_op(&mut bus, base, pcibridge_pack_cfg_addr(0, 1, 0, 0x10), 4, 0);
+        assert_eq!(
+            pcibridge_read_u32(&mut bus, base + pcibridge::reg::CFG_DATA),
+            0xFFFF_C000
+        );
+    }
+
+    /// Attach `pcibridge` after the whole existing native chain and prove
+    /// nothing that was already there moves: every pre-existing board's
+    /// base is identical with and without `pcibridge`, and `pcibridge`
+    /// itself lands at its own, distinct address.
+    #[test]
+    fn pcibridge_coexists_with_the_full_native_chain_without_moving_anyone() {
+        // ---- machine A: the native chain alone -----------------------------
+        let bases_without_pcibridge = {
+            let mut ram = boxed_chip_ram();
+            let rom = [0u8; ROM_WINDOW_SIZE];
+            let mut disk = MirageDisk::new(64);
+            let mut vram = std::vec![0u8; 64 * 1024];
+            let modes = [rtgboard::ModeDescriptor {
+                width: 640,
+                height: 480,
+                format: rtgboard::format::RGBX_8888,
+            }];
+            let mut fast = std::vec![0u8; fastram::MIN_SIZE_BYTES as usize];
+            let mut packet_backend = StubPacketBackend;
+            let mut bus = new_bus(&mut ram, &rom)
+                .with_hostblk(0, &mut disk, false)
+                .with_input()
+                .with_rtgboard(&mut vram, &modes)
+                .with_fast_ram(&mut fast)
+                .with_pktport(&mut packet_backend);
+
+            configure_hostblk_z3(&mut bus, 0x4000_0000);
+            configure_zorro_iii(&mut bus, 0x5000_0000);
+            configure_zorro_iii(&mut bus, 0x6000_0000);
+            configure_zorro_iii(&mut bus, 0x7000_0000);
+            configure_zorro_ii(&mut bus, 0x20);
+
+            (
+                bus.hostblk_board_base(),
+                bus.input_board_base(),
+                bus.rtgboard_base(),
+                bus.autoconfig
+                    .placement(bus.fast_ram_board.expect("fast RAM registered"))
+                    .map(|p| p.base),
+                bus.pktport_board_base(),
+            )
+        };
+
+        // ---- machine B: the same chain, plus pcibridge last ---------------
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut disk = MirageDisk::new(64);
+        let mut vram = std::vec![0u8; 64 * 1024];
+        let modes = [rtgboard::ModeDescriptor {
+            width: 640,
+            height: 480,
+            format: rtgboard::format::RGBX_8888,
+        }];
+        let mut fast = std::vec![0u8; fastram::MIN_SIZE_BYTES as usize];
+        let mut packet_backend = StubPacketBackend;
+        let mut hostbridge_dev = pci::HostBridge::new();
+        let mut slots = [pci::VirtualSlot {
+            bdf: pci::Bdf {
+                bus: 0,
+                device: 0,
+                function: 0,
+            },
+            device: &mut hostbridge_dev,
+        }];
+        let mut vpci = pci::VirtualPciBus::new(&mut slots);
+        let mut bus = new_bus(&mut ram, &rom)
+            .with_hostblk(0, &mut disk, false)
+            .with_input()
+            .with_rtgboard(&mut vram, &modes)
+            .with_fast_ram(&mut fast)
+            .with_pktport(&mut packet_backend)
+            .with_pcibridge(&mut vpci);
+
+        configure_hostblk_z3(&mut bus, 0x4000_0000);
+        configure_zorro_iii(&mut bus, 0x5000_0000);
+        configure_zorro_iii(&mut bus, 0x6000_0000);
+        configure_zorro_iii(&mut bus, 0x7000_0000);
+        configure_zorro_ii(&mut bus, 0x20);
+        configure_zorro_iii(&mut bus, 0x9000_0000);
+
+        assert_eq!(bus.hostblk_board_base(), bases_without_pcibridge.0);
+        assert_eq!(bus.input_board_base(), bases_without_pcibridge.1);
+        assert_eq!(bus.rtgboard_base(), bases_without_pcibridge.2);
+        assert_eq!(
+            bus.autoconfig
+                .placement(bus.fast_ram_board.expect("fast RAM registered"))
+                .map(|p| p.base),
+            bases_without_pcibridge.3
+        );
+        assert_eq!(bus.pktport_board_base(), bases_without_pcibridge.4);
+
+        let pcibridge_base = bus
+            .pcibridge_board_base()
+            .expect("pcibridge configured last");
+        assert_eq!(pcibridge_base, 0x9000_0000);
+        for other in [
+            bases_without_pcibridge.0,
+            bases_without_pcibridge.1,
+            bases_without_pcibridge.2,
+            bases_without_pcibridge.3,
+            bases_without_pcibridge.4,
+        ] {
+            assert_ne!(
+                Some(pcibridge_base),
+                other,
+                "pcibridge must land at its own, distinct address"
+            );
+        }
+
+        // pcibridge answers while hostblk's own registers still answer at
+        // its (unmoved) base.
+        assert_eq!(
+            pcibridge_read_u32(&mut bus, pcibridge_base + pcibridge::reg::VERSION),
+            pcibridge::PROTOCOL_VERSION
+        );
+        let hostblk_base = bases_without_pcibridge.0.unwrap();
+        assert_eq!(
+            pcibridge_read_u32(&mut bus, hostblk_base + hostblk::reg::VERSION),
+            hostblk::PROTOCOL_VERSION
+        );
+    }
+
+    /// A machine that never calls `with_pcibridge` is completely
+    /// unaffected -- no chain entry, no routing branch, and its
+    /// would-be register addresses stay open bus.
+    #[test]
+    fn no_pcibridge_leaves_the_chain_empty_and_everything_else_unaffected() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom);
+
+        assert_eq!(bus.pcibridge_board, None);
+        assert!(bus.pcibridge().is_none());
+        assert_eq!(bus.autoconfig.board_at(0x4000_0000), None);
+
+        let base = 0x4000_0000u32;
+        assert_eq!(bus.read_byte(base + pcibridge::reg::VERSION), OPEN_BUS_BYTE);
+        assert_eq!(
+            bus.read_byte(base + pcibridge::reg::CFG_ADDR),
+            OPEN_BUS_BYTE
+        );
+        bus.write_byte(base + pcibridge::reg::CFG_OP + 3, 0);
+        assert_eq!(
+            bus.read_byte(base + pcibridge::reg::CFG_STATUS),
+            OPEN_BUS_BYTE
         );
     }
 }

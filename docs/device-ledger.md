@@ -176,6 +176,7 @@ only once `hostblk` no longer occupies one of them for the duration.
 | Graffity Z2/Z3 | **bring-up** | as Cirrus | as Cirrus |
 | `input` native input card | permanent | — | never; the machine's own keyboard/mouse path |
 | `rtgboard` native RTG display board | permanent | — | never; ADR 0002's generic-board tier. P96 `.card` driver landed, first light verified — see below |
+| `pcibridge` PCI/ECAM shim | permanent | — | never; ADR 0005 — the machine's real bus surface, growing more load-bearing over time like AUTOCONFIG itself |
 
 ### Permanent
 
@@ -383,6 +384,23 @@ captured in a screenshot, with `crates/machine-hosted/tests/real_rom.rs`
 pinning both as a regression test. See `docs/rtgboard-protocol.md` for
 the register contract and the driver-side facts worth knowing (its
 format/DisplayID coupling, in particular).
+
+**`pcibridge` PCI/ECAM shim** — `pcibridge.rs` over `pci.rs`. ADR 0005
+stage 1: the Zorro III card exposing a PCI configuration/BAR space to
+the guest, backed through the `PciBackend` trait — a host-side virtual
+topology on `machine-hosted` (which has no real PCI bus), real ECAM on
+the QEMU board crates when their turn comes (the mapping is documented
+on the trait; the wiring is deliberately not this increment's).
+Permanent under the ledger's own definitions because PCI *is* how this
+machine's real hardware attaches — QEMU today, KVM in Phase 4, VFIO or
+bare-metal PCIe in Phase 5 — so like AUTOCONFIG it grows more
+load-bearing as the machine becomes less emulated, not less. The
+virtual topology's virtio-net device is config-space-complete and
+function-less by design: enumeration must see a real-shaped device
+(`1af4:1041`, capability chain, genuine BAR sizing), and the rings are
+stage 3's. See `docs/pcibridge-protocol.md` for the register contract
+stage 2's `pci.library` will be written against, and §2 there for the
+backing decision in full.
 
 ### Capped
 
