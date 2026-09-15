@@ -110,6 +110,21 @@ time:
    routing. Its test is period-shaped: the API surface real drivers
    call, exercised by a guest-side probe tool, not only by our own
    driver.
+   *Done, 2026-09-15* — `LIBS:prometheus.library` v3
+   (`m68k/prometheus-library/`, API pinned to the Matay SDK 3.0 with
+   provenance and the licensing firewall recorded in
+   `docs/pci-library.md` §1), the `pcibridge` host half grown
+   INTx→INT2 and sized aperture accesses (protocol VERSION 2), and
+   PCIProbe proving the public API from real 68k code on real
+   Kickstart 3.2.2: the byte-order presentation asserted with values a
+   tidied implementation fails, BAR0 assigned below the Zorro III
+   window and cross-checked guest-vs-host, DMA identity, and an INTA
+   level observed through a real INT2 dispatch (the card's diagnostic
+   register standing in for device function logic until stage 3 —
+   `docs/pci-library.md` §6 says plainly what is and is not
+   exercised). One scope note: the probe runs against the flat
+   host-side virtual topology; bridge walking is deliberately absent
+   (`docs/pci-library.md` §2).
 3. **virtio-net + SANA-II driver last**, as the library's first real
    client — modern virtio (not legacy), MSI-X deferred in favour of
    INTx-style routing per §10.1's driver discipline.

@@ -399,8 +399,35 @@ virtual topology's virtio-net device is config-space-complete and
 function-less by design: enumeration must see a real-shaped device
 (`1af4:1041`, capability chain, genuine BAR sizing), and the rings are
 stage 3's. See `docs/pcibridge-protocol.md` for the register contract
-stage 2's `pci.library` will be written against, and §2 there for the
-backing decision in full.
+(now at protocol VERSION 2), and §2 there for the backing decision in
+full.
+
+**Stage 2 landed (2026-09-15), both halves.** Host side: the INTx→INT2
+routing (`INTX_STATUS`/`INTX_ENABLE`/`INTX_TEST`, level-triggered,
+shared, live rather than latched) and sized aperture accesses (a
+naturally-aligned word/long reaches the backend as one access of that
+width, byte lanes preserved — the prerequisite stage 3's virtio rings
+were waiting on). Guest side — recorded here with its card, the same
+way `input`'s driver ROM is: **`LIBS:prometheus.library` v3**
+(`m68k/prometheus-library/`), the Prometheus v2/v3 API implemented
+natively per proposal §10.1, API definition pinned to the Matay
+Prometheus SDK 3.0 with provenance and the licensing firewall recorded
+in `docs/pci-library.md` §1. The library finds its board through
+`FindConfigDev` (never a hardcoded address), refuses any protocol
+version but 2, enumerates through real config cycles, assigns 32-bit
+memory BARs below the Zorro III window, and presents the *actual*
+Prometheus byte-order contract (`Prm_ReadConfigWord(board, 0)` returns
+the DEVICE id — the SDK's own worked example, not a tidied
+reinterpretation). Proven end to end by `C:PCIProbe`
+(`m68k/pciprobe/`) on real Kickstart 3.2.2:
+`kickstart_3_2_2_a1200_pciprobe_proves_the_prometheus_library_api`
+pins the serial evidence — all byte-order assertions, BAR0 at
+`$20000000` agreeing between guest report and host introspection, DMA
+identity, and an INTA level observed through a real INT2 dispatch
+(`docs/pci-library.md` §6 records what the diagnostic-register harness
+does and does not exercise until stage 3 supplies a real device
+source). Delivery is post-generation HDF patching
+(`scripts/patch-pciprobe-hdf.sh`), not an amibake change.
 
 ### Capped
 

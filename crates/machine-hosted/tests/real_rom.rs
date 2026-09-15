@@ -67,6 +67,17 @@ fn rtgboard_hd_image() -> String {
     fixture("M68K_TEST_RTG_HDF", "m68k-machine-rtgboard.hdf")
 }
 
+/// The `prometheus.library`/PCIProbe patched HDF (ADR 0005 stage 2,
+/// `docs/pci-library.md` §6/§8) -- the same `amibake` base as
+/// `hd_image()`, patched by `scripts/build-prometheus-library.sh` +
+/// `scripts/build-pciprobe.sh` + `scripts/patch-pciprobe-hdf.sh`:
+/// installs `Libs/prometheus.library` and `C/PCIProbe`, and prepends
+/// `C:PCIProbe` to `S/Startup-Sequence` so a plain unattended boot
+/// produces the probe's serial evidence.
+fn pciprobe_hd_image() -> String {
+    fixture("M68K_TEST_PCIPROBE_HDF", "m68k-machine-pciprobe.hdf")
+}
+
 /// Skip the calling test unless every fixture it needs is present, so a
 /// clean clone with no licensed media still goes green.
 fn have_fixtures(paths: &[&str]) -> bool {
@@ -1560,6 +1571,135 @@ fn scripted_pointer_and_double_click_work_on_the_rtgboard_rtg_screen() {
     );
 
     let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&serial_log_path);
+}
+
+/// ADR 0005 stage 2's end-to-end evidence (`docs/pci-library.md` §6/§7):
+/// real Kickstart 3.2.2 boots the PCIProbe-patched HDF with `--pcibridge`
+/// attached, `S/Startup-Sequence`'s prepended `C:PCIProbe` runs the probe
+/// as real 68k code against `LIBS:prometheus.library`, and the serial log
+/// carries the whole chain -- library init (protocol version 2 confirmed,
+/// both topology functions enumerated, BAR0 assigned), the seven
+/// byte-order assertions a tidied or wrong-endian presentation would fail
+/// with different concrete values (`docs/pci-library.md` §3), the BAR/
+/// address-translation cross-checks, the aperture master-abort read, the
+/// DMA identity check, and an INTA assertion observed through a real INT2
+/// dispatch into a `Prm_AddIntServer`-installed server (the INTX_TEST
+/// harness poke standing in for stage 3's device function logic -- said
+/// plainly in `docs/pci-library.md` §6).
+///
+/// BAR consistency is asserted from both sides: the guest's own
+/// `PCIPROBE bar0:` line carries the PCI address the library assigned and
+/// wrote, `--inspect`'s host-side pcibridge section reads the same BAR
+/// back through the backend (what the device itself latched), and the two
+/// must agree -- plus sit inside the policy region below the Zorro III
+/// window (`$20000000..$20800000`, `docs/pci-library.md` §2).
+///
+/// Measured on this exact fixture (2026-09-15, first run): the probe
+/// completes well within 3000 frames, guest and host both report BAR0 at
+/// `$20000000`, and the INT2 server observes exactly count 1.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and the patched pciprobe HDF on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_pciprobe_proves_the_prometheus_library_api() {
+    let rom = kickstart_a1200();
+    let hd = pciprobe_hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+
+    let serial_log_path = std::env::temp_dir().join(format!(
+        "machine-hosted-kickstart-pciprobe-{}.serial.log",
+        std::process::id()
+    ));
+
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--pcibridge",
+        "--max-frames",
+        "3000",
+        "--max-instructions",
+        "2000000000",
+        "--serial-log",
+        serial_log_path.to_str().unwrap(),
+        "--inspect",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    let serial_log = std::fs::read_to_string(&serial_log_path)
+        .unwrap_or_else(|e| panic!("read serial log {serial_log_path:?}: {e}"));
+
+    // The library's own init narration, then the probe's checks. Every
+    // marker here is positive evidence; the list follows the serial
+    // order the probe emits (docs/pci-library.md §6).
+    for marker in [
+        "prometheus.library: LibInit: board at ",
+        "PCIB_VERSION 2 confirmed",
+        "prometheus.library: found 1AF4:1041 at 00:01.0",
+        "prometheus.library: 00:01.0 BAR0 -> PCI $20000000 size $004000",
+        "prometheus.library: LibInit complete",
+        "PCIPROBE openlibrary: PASS",
+        "PCIPROBE byteorder cfglong@0: expected $10411AF4 got $10411AF4 PASS",
+        "PCIPROBE byteorder cfgword@0 (device): expected $00001041 got $00001041 PASS",
+        "PCIPROBE byteorder cfgword@2 (vendor): expected $00001AF4 got $00001AF4 PASS",
+        "PCIPROBE byteorder cfgbyte@3: expected $000000F4 got $000000F4 PASS",
+        "PCIPROBE bar0 pci range: PASS",
+        "PCIPROBE aperture read (master-abort): expected $FFFFFFFF got $FFFFFFFF PASS",
+        "PCIPROBE dma physaddr identity:",
+        "PCIPROBE intx: observed INTA via INT2 (count 1)",
+        "PCIPROBE result: ALL PASS",
+    ] {
+        assert!(
+            serial_log.contains(marker),
+            "expected the serial narration to contain {marker:?} -- \
+             serial log:\n{serial_log}"
+        );
+    }
+    // The single-verdict discipline's other half: no individual check
+    // printed FAIL. (Every probe failure line carries the literal word
+    // FAIL; "ALL PASS" above alone would not catch a probe whose
+    // verdict logic broke.)
+    assert!(
+        !serial_log.contains(" FAIL"),
+        "expected no failing probe check anywhere in the serial log:\n{serial_log}"
+    );
+
+    // BAR consistency from both sides (docs/pci-library.md §6): the
+    // guest's own bar0 line vs. what --inspect read back from the
+    // device through the backend.
+    let guest_pci = serial_log
+        .lines()
+        .find_map(|line| {
+            let rest = line.split("PCIPROBE bar0: cpu $").nth(1)?;
+            rest.split("pci $").nth(1)?.split_whitespace().next()
+        })
+        .expect("the probe's 'PCIPROBE bar0:' line with a pci $ field");
+    let guest_pci = u32::from_str_radix(guest_pci, 16).expect("parse the guest's BAR0 PCI address");
+
+    let host_pci = stdout
+        .lines()
+        .find_map(|line| {
+            line.contains("virtio-net stub (00:01.0) BAR0 raw")
+                .then(|| line.split("PCI address 0x").nth(1))?
+                .and_then(|rest| rest.split_whitespace().next())
+        })
+        .expect("--inspect's pcibridge BAR0 cross-check line");
+    let host_pci = u32::from_str_radix(host_pci, 16).expect("parse the host's BAR0 PCI address");
+
+    assert_eq!(
+        guest_pci, host_pci,
+        "guest-reported and host-introspected BAR0 PCI addresses must agree"
+    );
+    assert!(
+        (0x2000_0000..0x2080_0000).contains(&guest_pci),
+        "BAR0 must sit inside the policy region below the Zorro III \
+         window (docs/pci-library.md §2), got {guest_pci:#010x}"
+    );
+
     let _ = std::fs::remove_file(&serial_log_path);
 }
 

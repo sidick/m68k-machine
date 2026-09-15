@@ -1,9 +1,9 @@
 # `pci.library` — the Prometheus-compatible bus library
 
-**Status:** ADR 0005 **stage 2**. Contract and provenance drafted first,
-2026-09-15, before any implementation code; the sections below gain
-"landed"/"proven" notes as the increments do. The deliverable the ADR
-calls `pci.library` ships on disk as **`LIBS:prometheus.library`,
+**Status:** ADR 0005 **stage 2**, **landed and proven 2026-09-15** (§7).
+Contract and provenance were drafted first, before any implementation
+code, and the implementation was then written to them. The deliverable
+the ADR calls `pci.library` ships on disk as **`LIBS:prometheus.library`,
 version 3** — that is the name openpci.library's Prometheus wrapper
 (and every period driver) opens, so an invented filename would defeat
 the compatibility the library exists for. "pci.library" remains the
@@ -265,9 +265,44 @@ device latched; the real-ROM test asserts they agree.
 
 ## 7. Verification
 
-*(Filled in as the increments land, test names as evidence — the
-platform norm is silent failure, so every claim below must be positive
-evidence.)*
+All landed 2026-09-15; test names as evidence — the platform norm is
+silent failure, so every claim below is positive evidence, not absence
+of complaint.
+
+- **Host half** (`docs/pcibridge-protocol.md` §9 carries the full
+  list): 12 new unit/bus tests across `pci.rs`/`pcibridge.rs`/`lib.rs`
+  prove INTx pin routing, the three registers' masking and level-live
+  (never latched) semantics, `irq_pending` gating, the INT2 chain
+  end-to-end through the guest-visible register file
+  (`pcibridge_intx_test_is_observable_through_the_register_file_and_raises_int2`
+  — including the chipset `INTREQ` latch being a separate,
+  acknowledge-required layer), and sized aperture delivery measured as
+  exactly one backend access of the natural width via an instrumented
+  test device. 430 machine-core + 89 machine-hosted tests green, fmt
+  and clippy clean.
+- **Guest halves**: `scripts/build-prometheus-library.sh` and
+  `scripts/build-pciprobe.sh` build both binaries warning-free and
+  positively verify hunk magic, the ROMTag word (library), and the
+  marker strings. `scripts/patch-pciprobe-hdf.sh` installs
+  `Libs/prometheus.library` + `C/PCIProbe` and prepends `C:PCIProbe`
+  to the startup-sequence, reading every changed path back
+  byte-compared.
+- **End to end, real ROM**
+  (`kickstart_3_2_2_a1200_pciprobe_proves_the_prometheus_library_api`,
+  `crates/machine-hosted/tests/real_rom.rs`): real Kickstart 3.2.2
+  boots the patched HDF with `--pcibridge`; the serial log carries the
+  library's init chain (`PCIB_VERSION 2 confirmed`, both topology
+  functions found, `00:01.0 BAR0 -> PCI $20000000 size $004000`), all
+  seven byte-order assertions passing with the §3 concrete values, the
+  BAR range/translation cross-checks, the aperture master-abort
+  all-ones read, DMA identity, `observed INTA via INT2 (count 1)`, and
+  `PCIPROBE result: ALL PASS` with no ` FAIL` line anywhere. The test
+  parses the guest's `PCIPROBE bar0:` PCI address and asserts it equal
+  to `--inspect`'s host-side read of what the device latched — both
+  measured `$20000000` — and inside the policy region. The full
+  real-ROM baseline suite (14 tests: boot, introspection, ROMWack over
+  script and TCP, boot screen, HD-to-Workbench, RTG desktop, rtgboard
+  first light, input scripting, AROS pair) re-ran green alongside it.
 
 ## 8. What stage 3 needs, and is now bound by
 
