@@ -22,7 +22,9 @@
  *   4. The byte-order assertions (docs/pci-library.md section 3) on it.
  *   5. BAR0 checks, including the raw-config-space cross-check and the
  *      Prm_GetPhysicalAddress/Prm_GetVirtualAddress round trip.
- *   6. The aperture read (expects the master-abort all-ones value).
+ *   6. The aperture read (expects the master-abort all-ones value just
+ *      past this BAR's own claimed range), then a live-device check:
+ *      the MAC read back from DEVICE_CFG through the aperture.
  *   7. DMA buffer alloc/physaddr-identity/free.
  *   8. INTx end to end: Prm_AddIntServer, the one deliberately
  *      out-of-band harness step (FindConfigDev + a raw INTX_TEST poke),
@@ -344,19 +346,64 @@ int main(void)
         check((CONST_STRPTR)"bar0 virtaddr crosscheck",
               memaddr0, (ULONG)virtaddr);
 
-        /* ---- Step 6: the aperture read. The stub has no function
-         * behind its BAR, so a real access through the banked window
-         * must answer the master-abort all-ones value -- getting that
-         * (rather than, say, always-zero or the last CPU bus value)
-         * is the positive evidence the aperture is genuinely plumbed
-         * through to PCI memory space, not just returning some other
-         * constant by accident. */
+        /* ---- Step 6: the aperture read. Stage 3 landed the virtio-net
+         * stub's own function logic (docs/virtionet.md), so BAR0 itself
+         * now has live registers behind it -- reading memaddr0 no
+         * longer proves anything about the banked window's own
+         * master-abort behaviour, only that this one device answers.
+         * The master-abort check instead targets the first byte past
+         * this BAR's own claimed range: memaddr0 + memsize0, DERIVED
+         * from the values this probe already read back (never a
+         * hardcoded constant, docs/device-ledger.md's address rule).
+         * BAR0 sits at the policy region's own base (the "bar0 pci
+         * range" check above), so this address is still comfortably
+         * inside the 8 MB banked aperture (docs/pci-library.md section
+         * 2) and unclaimed by any board -- a real access through it
+         * must still answer all-ones. */
         {
-            volatile ULONG *aperture = (volatile ULONG *)memaddr0;
+            ULONG unclaimed_addr = memaddr0 + memsize0;
+            volatile ULONG *aperture = (volatile ULONG *)unclaimed_addr;
             ULONG got = *aperture;
 
             check((CONST_STRPTR)"aperture read (master-abort)",
                   0xFFFFFFFFUL, got);
+        }
+
+        /* ---- Step 6b: a live device behind BAR0. Now that stage 3's
+         * function logic exists, this probe can positively assert it is
+         * talking to the actual virtio-net device it filtered for above
+         * -- not merely a board matching the right vendor/device IDs in
+         * config space -- by reading the MAC out of DEVICE_CFG (BAR0 +
+         * $3000, docs/virtionet.md's BAR0 map) through the aperture
+         * itself and comparing it against the device's own identity
+         * (a constant of the same kind as NET_VENDOR/NET_DEVICE above --
+         * fine to hardcode, it names what device this is, not where it
+         * lives). */
+        {
+            volatile UBYTE *devcfg = (volatile UBYTE *)(memaddr0 + 0x3000UL);
+            static const UBYTE expect_mac[6] = { 0x02, 0x6D, 0x36, 0x4B, 0x00, 0x01 };
+            UBYTE got_mac[6];
+            BOOL pass = TRUE;
+            int i;
+
+            for (i = 0; i < 6; i++) {
+                got_mac[i] = devcfg[i];
+                if (got_mac[i] != expect_mac[i])
+                    pass = FALSE;
+            }
+            if (!pass)
+                g_all_pass = 0;
+
+            KPrintF((CONST_STRPTR)"PCIPROBE bar0 device mac: expected "
+                    "%02lx:%02lx:%02lx:%02lx:%02lx:%02lx got "
+                    "%02lx:%02lx:%02lx:%02lx:%02lx:%02lx %s\n",
+                    (ULONG)expect_mac[0], (ULONG)expect_mac[1],
+                    (ULONG)expect_mac[2], (ULONG)expect_mac[3],
+                    (ULONG)expect_mac[4], (ULONG)expect_mac[5],
+                    (ULONG)got_mac[0], (ULONG)got_mac[1],
+                    (ULONG)got_mac[2], (ULONG)got_mac[3],
+                    (ULONG)got_mac[4], (ULONG)got_mac[5],
+                    pass ? (CONST_STRPTR)"PASS" : (CONST_STRPTR)"FAIL");
         }
     }
 
