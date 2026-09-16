@@ -48,7 +48,7 @@ png = "0.18.1"
 # left on: both crates gate their std::io conveniences behind it and this
 # crate is std-only regardless.
 amiga-rdb = "0.4"
-amiga-ffs = "0.3"
+amiga-ffs = "0.4"
 
 # ROM normalization/identification for the hosted runner (`rom_image.rs`):
 # byte-order detection/correction, Cloanto/Amiga Forever decode, and
