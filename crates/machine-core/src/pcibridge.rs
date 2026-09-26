@@ -497,7 +497,7 @@ impl<'a> PciBridge<'a> {
     /// Whether this card is currently holding `INT2` asserted:
     /// `(INTX_STATUS & INTX_ENABLE) != 0`, level-triggered (module docs)
     /// -- `MachineBus` polls this after every register write that could
-    /// change the answer, and once per host tick besides (backend state
+    /// change the answer, and once per raster line besides (backend state
     /// can change with no register write at all).
     pub fn irq_pending(&mut self) -> bool {
         (self.intx_status() & self.intx_enable) != 0
@@ -508,10 +508,8 @@ impl<'a> PciBridge<'a> {
     /// (module docs on [`PciBackend::tick`]). `pcibridge` itself has no
     /// engine of its own (config cycles stay synchronous, module docs),
     /// so this is pure delegation; [`crate::MachineBus::tick`] drives it
-    /// once per call, not batched to once per raster line the way
-    /// MIRAGE's engine is -- measured, not assumed
-    /// (`MachineBus::tick`'s own doc comment): a real guest's virtio-net
-    /// loopback poll window does not tolerate the added latency.
+    /// once per raster line crossed, the same grain as MIRAGE's and
+    /// `hostblk`'s engines (`docs/bus-fast-path-plan.md` step 4.1).
     pub fn tick(&mut self, mem: &mut dyn crate::GuestMemory) {
         self.backend.tick(mem);
     }

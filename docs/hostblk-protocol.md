@@ -184,12 +184,11 @@ synchronously at all. `DOORBELL`'s write handler only pushes a raw
 pointer onto an in-host submission ring — it does not even read the
 descriptor yet. All real work (reading the descriptor, validating it,
 moving data, calling the `BlockDevice`) happens in `Hostblk::tick`,
-called once per `MachineBus::tick`, which executes **at most one**
-submission per call. With `N` requests queued, the `N`th completes on
-the `N`th tick at the earliest. Unlike MIRAGE's engine, this one is
-**not** batched to once per raster line -- measured, not assumed
-(`MachineBus::tick`'s own doc comment): gating it that way reliably
-wedges a real Kickstart 3.2.2 boot before Startup-Sequence ever runs.
+which `MachineBus::tick` calls once per raster line crossed (the same
+grain as MIRAGE's engine; ~100 instructions at this machine's
+timebase), and which executes **at most one** submission per call.
+With `N` requests queued, the `N`th completes on the `N`th line at the
+earliest.
 
 **Driver feedback: a request must be marked in flight before the
 doorbell.** exec's `WaitIO`/`CheckIO`/`DoIO` treat `ln_Type ==

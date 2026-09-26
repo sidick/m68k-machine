@@ -870,13 +870,10 @@ impl<'a> MachineBus<'a> {
     /// CIAs. Call this from the CPU's `sync` hook so device time and
     /// guest time stay in step.
     ///
-    /// MIRAGE's deferred-completion engine (and its `irq_pending()`
-    /// poll) runs once per raster line crossed, not once per call -- see
-    /// the comment at its call site below. `hostblk`/`pktport`/
-    /// `pcibridge` still advance on every call (see the same comment for
-    /// why: line-grained batching measurably breaks real guest boot for
-    /// these three). Chipset and both CIAs advance on every call
-    /// regardless.
+    /// The MIRAGE, `hostblk`, `pktport` and `pcibridge` engines (and
+    /// their `irq_pending()` polls) run once per raster line crossed,
+    /// not once per call -- see the comment at their call site below.
+    /// Chipset and both CIAs advance on every call regardless.
     pub fn tick(&mut self, cpu_clocks: u32) {
         let beam = self.chipset.tick(cpu_clocks, CPU_CLOCKS_PER_COLOUR_CLOCK);
 
@@ -915,43 +912,53 @@ impl<'a> MachineBus<'a> {
             }
         }
 
-        // MIRAGE's deferred-completion state machine advances once per
-        // raster line *crossed*, not once per call: it is already a
-        // "deferred completion, one step per call" state machine (module
-        // docs), and one line's worth of latency (~908 CPU clocks, ~100
-        // instructions at this machine's timebase) is invisible to a
-        // guest driving it -- exactly the grain the STOP-path resync in
-        // `machine-hosted`'s `run.rs`/the board `main.rs` hook loops
-        // already ticks in (`STOP_TICK_SLICE`, one line per slice), so
-        // that resync still services it every slice. A normal
-        // per-instruction tick spans far less than one line, so gating
-        // on `beam.lines_started > 0` costs this engine nothing on most
-        // calls and still runs it at most once per call the rare time a
-        // call does cross a line (this is not scaled by how many lines
-        // were crossed, the same "at most one step" contract as before).
+        // The four deferred-completion engines -- MIRAGE, `hostblk`,
+        // `pktport`, and `pcibridge`'s virtio-net rings -- and their
+        // `irq_pending()` polls advance once per raster line *crossed*,
+        // not once per call (`docs/bus-fast-path-plan.md` step 4.1).
+        // Each is already a "deferred completion, one step per call"
+        // state machine (module docs), and one line's worth of latency
+        // (~908 CPU clocks, ~100 instructions at this machine's
+        // timebase) is invisible to a correct guest driver. It is also
+        // exactly the grain the STOP-path resync in `machine-hosted`'s
+        // `run.rs`/the board `main.rs` hook loops already ticks in
+        // (`STOP_TICK_SLICE`, one line per slice), so that resync still
+        // services every engine every slice. A normal per-instruction
+        // tick spans far less than one line, so gating on
+        // `beam.lines_started > 0` skips all four on most calls and
+        // still runs each at most once the rare time a call does cross a
+        // line (not scaled by how many lines were crossed: the same "at
+        // most one step" contract as before).
         //
-        // `hostblk`/`pktport`/`pcibridge` do **not** get the same
-        // treatment, despite sharing the identical "deferred completion,
-        // one step per call" shape (module docs) -- measured, not
-        // assumed: gating them the same way reliably wedges a real
-        // Kickstart 3.2.2 boot (`cargo test -p machine-hosted --test
-        // real_rom -- --ignored kickstart_3_2_2_a1200_virtionet_first_
-        // packet_round_trip`), which never reaches Startup-Sequence when
-        // `hostblk`'s engine is line-gated, and never observes the
-        // virtio-net loopback reply within its poll window when
-        // `pcibridge`'s is. Real ROM/DiagArea code busy-polls a
-        // completion register in a tight loop with no signal-based
-        // yield (`m68k/hostblk-rom/hostblk-diagrom.s`'s `read_block`,
-        // and exec 47.13's own `DoIO`, per that file's `dev_beginio`
-        // comment) -- unbounded in principle, but evidently intolerant
-        // in practice of one line's worth of added latency somewhere in
-        // that chain. `pktport` shares `hostblk`'s doorbell/completion
-        // shape closely enough (module docs, "follows hostblk.rs's shape
-        // almost exactly") that it is kept per-call too, on the same
-        // evidence-over-assumption standard (`CLAUDE.md`, "Silent
-        // failure is this platform's norm"), rather than risking an
-        // identical wedge the moment something exercises it under a real
-        // guest driver.
+        // The first attempt at this wedged a real Kickstart 3.2.2 boot
+        // after four FFS reads, and was reverted. The cause was a guest
+        // driver bug that per-instruction ticking had been hiding:
+        // `hostblk.device`'s `BeginIO` never set the request's `ln_Type`
+        // to `NT_MESSAGE`, so ROM FFS's reused IORequest still read as
+        // `NT_REPLYMSG` from its previous completion, and exec's DoIO
+        // returned without waiting whenever the reply had not already
+        // landed. See `m68k/hostblk-rom/hostblk-diagrom.s`'s
+        // `dev_beginio` header for the trace. The virtio-net real-ROM
+        // failure seen at the same time was the net harness counting its
+        // reply cooldown in `poll_receive` calls, now counted in guest
+        // frames (`machine-hosted`'s `netharness.rs`).
+        //
+        // Each engine needs a `&mut dyn GuestMemory` view of guest RAM
+        // (it asks which addresses are RAM rather than assuming a range,
+        // so it can reach fast RAM as well as chip RAM) -- `&mut
+        // self.ram` and `&mut self.hostblk` (etc.) are different fields,
+        // so the compiler accepts both borrows at once with no
+        // `Option::take()`/put-back dance (`GuestRam`'s own doc comment
+        // on why that dance existed before this field split).
+        //
+        // `pcibridge`'s own register file has no engine to advance
+        // (config cycles stay synchronous, module docs), but ADR 0005
+        // stage 3's virtio-net function behind it does. Ticking it here
+        // is also what keeps its `INTx` poll honest: unlike every
+        // register-file write path, a used buffer added by this tick can
+        // raise the card's `INTx` line with no register write involved
+        // at all, the same reason Graffity's card is polled above rather
+        // than only checked after a write.
         if beam.lines_started > 0 {
             if let Some(m) = &mut self.mirage {
                 m.tick();
@@ -959,54 +966,23 @@ impl<'a> MachineBus<'a> {
                     self.chipset.raise_int(chipset::intbit::PORTS);
                 }
             }
-        }
-
-        // `hostblk`'s engine: one step per call, not scaled to
-        // `cpu_clocks` -- see `hostblk`'s module docs on why "at most
-        // one request per tick" is the right grain here, and why this
-        // may run entirely independently of MIRAGE (both coexist).
-        //
-        // Needs a `&mut dyn GuestMemory` view of guest RAM (it asks
-        // which addresses are RAM rather than assuming a range, so it
-        // can reach fast RAM as well as chip RAM) -- `&mut self.ram` and
-        // `&mut self.hostblk` are two different fields, so the compiler
-        // accepts both borrows at once with no `Option::take()`/put-back
-        // dance (`GuestRam`'s own doc comment on why that dance existed
-        // before this field split).
-        if let Some(h) = &mut self.hostblk {
-            h.tick(&mut self.ram);
-            if h.irq_pending() {
-                self.chipset.raise_int(chipset::intbit::PORTS);
+            if let Some(h) = &mut self.hostblk {
+                h.tick(&mut self.ram);
+                if h.irq_pending() {
+                    self.chipset.raise_int(chipset::intbit::PORTS);
+                }
             }
-        }
-
-        // `pktport`'s engine advances the same way, one request per
-        // call: see `pktport`'s module docs, "One outstanding request"
-        // -- with capacity 1 there is never more than a single request
-        // to service, but the shape (a `&mut dyn GuestMemory` view of
-        // `self.ram`, borrowed disjointly from `self.pktport`) is
-        // identical to `hostblk`'s, for the identical reason.
-        if let Some(p) = &mut self.pktport {
-            p.tick(&mut self.ram);
-            if p.irq_pending() {
-                self.chipset.raise_int(chipset::intbit::PORTS);
+            if let Some(p) = &mut self.pktport {
+                p.tick(&mut self.ram);
+                if p.irq_pending() {
+                    self.chipset.raise_int(chipset::intbit::PORTS);
+                }
             }
-        }
-
-        // `pcibridge`'s own register file has no engine to advance
-        // (config cycles stay synchronous, module docs), but ADR 0005
-        // stage 3's virtio-net function behind it does: its virtqueues
-        // need the same `&mut dyn GuestMemory` view of `self.ram`
-        // `hostblk`/`pktport` take above. Ticking it here is also what
-        // keeps the `INTx` poll below honest: unlike every register-file
-        // write path, a used buffer added by this tick can raise the
-        // card's `INTx` line with no register write involved at all, the
-        // same reason Graffity's card is polled here rather than only
-        // checked after a write.
-        if let Some(dev) = &mut self.pcibridge {
-            dev.tick(&mut self.ram);
-            if dev.irq_pending() {
-                self.chipset.raise_int(chipset::intbit::PORTS);
+            if let Some(dev) = &mut self.pcibridge {
+                dev.tick(&mut self.ram);
+                if dev.irq_pending() {
+                    self.chipset.raise_int(chipset::intbit::PORTS);
+                }
             }
         }
 
@@ -2292,8 +2268,10 @@ mod tests {
         assert_eq!(check[4], 1);
     }
 
-    /// The step-4.1 contract itself: MIRAGE's (and by the same code path,
-    /// `hostblk`/`pktport`/`pcibridge`'s) engine must not advance on a
+    /// The step-4.1 contract itself: MIRAGE's (and by the same gated
+    /// block, `hostblk`/`pktport`/`pcibridge`'s -- `hostblk`'s is also
+    /// pinned directly by `configured_hostblk_routes_its_window_and_
+    /// completes_a_transfer_via_int2`) engine must not advance on a
     /// tick that stays within one raster line, and must advance exactly
     /// once a tick crosses a line boundary -- `MachineBus::tick` gates
     /// all four on `beam.lines_started > 0`, not on being called at all.
@@ -2515,6 +2493,19 @@ mod tests {
         assert_eq!(
             bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
             0
+        );
+
+        // Ticks that stay inside the current raster line must not run
+        // the engine: `MachineBus::tick` gates it on a line boundary
+        // being crossed (bus-fast-path-plan step 4.1), not on being
+        // called at all.
+        for _ in 0..50 {
+            bus.tick(ONE_LINE_CLOCKS / 64);
+        }
+        assert_eq!(
+            bus.read_long(base + hostblk::reg::COMPLETION_PTR),
+            0,
+            "no line boundary crossed yet: the engine must not have run"
         );
 
         bus.tick(ONE_LINE_CLOCKS); // MachineBus::tick's hostblk arm executes the request

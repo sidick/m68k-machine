@@ -41,8 +41,8 @@ its BAR0 registers live rather than answering all-ones.
 **Notify is a no-op, honestly.** A real virtio device usually treats a
 notify write as "go look at the ring now"; this one does not need to,
 because `VirtioNetStub::tick` polls both rings (`process_tx` then
-`process_rx`) once per `MachineBus::tick`, called every host tick
-regardless of whether the guest ever notifies at all. A driver that
+`process_rx`) every time `MachineBus::tick` crosses a raster line
+(`docs/bus-fast-path-plan.md` step 4.1), regardless of whether the guest ever notifies at all. A driver that
 writes `NOTIFY` gets exactly what the spec allows it to get — no
 acknowledgement, no side effect — and the rings still move, because
 polling already covers it. This is recorded here rather than left for a
@@ -139,7 +139,7 @@ there is no real host network path to choose *instead* of it yet. It:
   `0x88b5`, payload `"M68KVNET-RX-REPLY-0001"`.
 
 **Why bounded, spaced attempts, not one delivery.**
-`VirtioNetStub::tick` polls tx then rx every host tick, so the very tick
+`VirtioNetStub::tick` polls tx then rx once per raster line, so the very tick
 that notices a transmitted frame can already have an rx descriptor ready
 to deliver into — well before the guest task resumes from its blocking
 `DoIO` on that transmit, let alone posts the `CMD_READ` that would
