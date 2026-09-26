@@ -275,6 +275,19 @@ pub struct MachineBus<'a> {
     /// as [`Self::mirage_board`]/[`Self::hostblk_board`].
     pcibridge_board: Option<usize>,
 
+    /// Fast RAM's placed `(base, len)` window, cached from
+    /// `autoconfig.placement(fast_ram_board)` by [`Self::refresh_windows`]
+    /// -- `None` until AUTOCONFIG has actually configured the board
+    /// ([`Self::with_fast_ram`] alone only adds it to the chain, it does
+    /// not place it). [`Self::fast_region`]/[`Self::fast_region_mut`]
+    /// check this instead of asking [`AutoConfig`] to scan, which is the
+    /// whole point: derived only from `autoconfig.placement`, never a
+    /// constant (`docs/device-ledger.md`, standing rule 2).
+    fast_window: Option<(u32, u32)>,
+    /// `pcibridge`'s placed window, the same shape and the same reason,
+    /// checked by [`Self::pcibridge_target`].
+    pcibridge_window: Option<(u32, u32)>,
+
     /// While set, the ROM is mirrored over the bottom of the address
     /// space so the CPU's reset vector fetch from `$000000`/`$000004`
     /// lands in ROM. Real hardware does this with Gary, driven by CIA-A
@@ -294,6 +307,13 @@ pub const CIA_END: u32 = 0x00C0_0000;
 /// Custom chip register window, `$DFF000`-`$DFFFFF`.
 pub const CUSTOM_BASE: u32 = 0x00DF_F000;
 pub const CUSTOM_END: u32 = 0x00E0_0000;
+
+/// Pins the fast path's chip-RAM branch ([`MachineBus::fast_region`]/
+/// [`MachineBus::fast_region_mut`]): both answer for a plain
+/// `CHIP_RAM_BASE..CHIP_RAM_END` match with no further exclusion, which
+/// is only correct because neither the CIA window nor the custom
+/// register window can ever start inside chip RAM's fixed range.
+const _: () = assert!(CIA_BASE >= CHIP_RAM_END && CUSTOM_BASE >= CHIP_RAM_END);
 
 /// CIA-A PRA bit 6: joystick/mouse port 0 fire button (pin 6, FIR0),
 /// which is where the left mouse button actually lands — not the
@@ -358,8 +378,55 @@ impl<'a> MachineBus<'a> {
             rtg_board: None,
             pcibridge: None,
             pcibridge_board: None,
+            fast_window: None,
+            pcibridge_window: None,
             overlay: true,
         }
+    }
+
+    /// Recompute [`Self::fast_window`] and [`Self::pcibridge_window`]
+    /// from `self.autoconfig`'s current placements. There are exactly two
+    /// places a placement can change: the AUTOCONFIG arm of
+    /// [`Self::write_byte`] (`AutoConfig::configure`, reached only from
+    /// there) and the [`Self::with_fast_ram`]/[`Self::with_pcibridge`]
+    /// builders (which register the board but cannot place it --
+    /// placement only ever happens later, through a guest write to the
+    /// AUTOCONFIG window). Calling this at the end of all three, rather
+    /// than threading a generation counter through `AutoConfig`, keeps
+    /// the cache exactly as fresh as the placement it mirrors.
+    fn refresh_windows(&mut self) {
+        self.fast_window = self
+            .fast_ram_board
+            .and_then(|idx| self.autoconfig.placement(idx))
+            .map(|p| (p.base, p.size_bytes));
+        self.pcibridge_window = self
+            .pcibridge_board
+            .and_then(|idx| self.autoconfig.placement(idx))
+            .map(|p| (p.base, p.size_bytes));
+
+        debug_assert!(
+            !self
+                .fast_window
+                .is_some_and(|(base, len)| Self::overlaps_autoconfig_window(base, len)),
+            "fast RAM's placed window must never overlap AUTOCONFIG's own"
+        );
+        debug_assert!(
+            !self
+                .pcibridge_window
+                .is_some_and(|(base, len)| Self::overlaps_autoconfig_window(base, len)),
+            "pcibridge's placed window must never overlap AUTOCONFIG's own"
+        );
+    }
+
+    /// Whether `[base, base + len)` overlaps the AUTOCONFIG window itself
+    /// -- checked by [`Self::refresh_windows`] because a board placed
+    /// there would make the fast path answer for addresses that must
+    /// keep going through [`AutoConfig::read`]/`write` instead (a real
+    /// board can never land there either: AUTOCONFIG retires each board
+    /// from the window as it is configured).
+    fn overlaps_autoconfig_window(base: u32, len: u32) -> bool {
+        let end = base.saturating_add(len);
+        base < autoconfig::AUTOCONFIG_END && end > autoconfig::AUTOCONFIG_BASE
     }
 
     /// Attach a disk to MIRAGE unit `unit` (0-7, `mirage` module docs).
@@ -455,6 +522,11 @@ impl<'a> MachineBus<'a> {
             .autoconfig
             .add_board(fastram::autoconfig_board_spec(mem.len() as u32));
         self.fast_ram = Some(mem);
+        // Not yet placed (that happens later, through a guest AUTOCONFIG
+        // write) so this is a no-op today, but keeps `fast_window` in
+        // sync with `fast_ram_board` at every mutation site rather than
+        // only some of them -- see `Self::refresh_windows`.
+        self.refresh_windows();
         self
     }
 
@@ -513,6 +585,9 @@ impl<'a> MachineBus<'a> {
     pub fn with_pcibridge(mut self, backend: &'a mut dyn pci::PciBackend) -> Self {
         self.pcibridge_board = self.autoconfig.add_board(PciBridge::board_spec());
         self.pcibridge = Some(PciBridge::new(backend));
+        // See `with_fast_ram`'s matching call: a no-op until AUTOCONFIG
+        // places the board, but keeps every mutation site consistent.
+        self.refresh_windows();
         self
     }
 
@@ -853,8 +928,70 @@ impl<'a> MachineBus<'a> {
         self.chipset.pending_level()
     }
 
+    /// Backing storage and within-region offset for a *read* at
+    /// `address`, if it falls inside a region the fast path can answer
+    /// directly without walking the rest of the chain: fast RAM (via
+    /// [`Self::fast_window`], bounded by the real buffer a board layer
+    /// supplied -- which may be shorter than the declared AUTOCONFIG
+    /// window, [`Self::with_fast_ram`]'s doc comment), chip RAM (except
+    /// while the ROM overlay is redirecting reads there), or ROM when it
+    /// exactly fills its window (an undersized ROM needs
+    /// [`rom::read_mirrored`]'s wraparound, which this path does not
+    /// implement, so it declines and lets the existing chain below
+    /// handle it).
+    ///
+    /// Returns the *whole* backing slice and an offset into it,
+    /// deliberately not pre-sliced to the access width: callers index
+    /// with `get(off..off + N)`, so a span that runs past the end of the
+    /// real array (fast RAM's window can be larger than its actual
+    /// buffer) simply misses and falls through to the byte-granular
+    /// chain unchanged, rather than this function having to reason about
+    /// widths itself.
+    fn fast_region(&self, address: u32) -> Option<(&[u8], usize)> {
+        if (CHIP_RAM_BASE..CHIP_RAM_END).contains(&address)
+            && !(self.overlay && address < OVERLAY_END)
+        {
+            return Some((&self.chip_ram[..], (address - CHIP_RAM_BASE) as usize));
+        }
+        if let Some((base, len)) = self.fast_window {
+            if address >= base && address - base < len {
+                let mem = self.fast_ram.as_deref()?;
+                return Some((mem, (address - base) as usize));
+            }
+        }
+        if self.rom.len() == ROM_WINDOW_SIZE && (ROM_BASE..ROM_END).contains(&address) {
+            return Some((self.rom, (address - ROM_BASE) as usize));
+        }
+        None
+    }
+
+    /// The mutable equivalent of [`Self::fast_region`], for *writes*:
+    /// fast RAM (same shape) and chip RAM, with no overlay exclusion --
+    /// a write under the overlay still lands in chip RAM today (the
+    /// overlay only ever redirects reads, [`Self::write_byte`]'s own
+    /// comment on why), so the fast path must not decline it either. ROM
+    /// is never covered here; it has nothing to write to.
+    fn fast_region_mut(&mut self, address: u32) -> Option<(&mut [u8], usize)> {
+        if (CHIP_RAM_BASE..CHIP_RAM_END).contains(&address) {
+            return Some((&mut self.chip_ram[..], (address - CHIP_RAM_BASE) as usize));
+        }
+        if let Some((base, len)) = self.fast_window {
+            if address >= base && address - base < len {
+                let mem = self.fast_ram.as_deref_mut()?;
+                return Some((mem, (address - base) as usize));
+            }
+        }
+        None
+    }
+
     /// Read one byte. Open-bus addresses return [`OPEN_BUS_BYTE`].
     pub fn read_byte(&mut self, address: u32) -> u8 {
+        if let Some((region, off)) = self.fast_region(address) {
+            if let Some(&byte) = region.get(off) {
+                return byte;
+            }
+        }
+
         // Overlay first: while OVL is asserted the ROM answers for low
         // memory ahead of chip RAM.
         if self.overlay && address < OVERLAY_END {
@@ -883,153 +1020,161 @@ impl<'a> MachineBus<'a> {
             rom::read_mirrored(self.ext_rom, rom::EXT_ROM_BASE, address)
         } else if (ROM_BASE..ROM_END).contains(&address) && !self.rom.is_empty() {
             rom::read_mirrored(self.rom, ROM_BASE, address)
-        } else if let Some((board, offset)) = self.graphics_target(address) {
-            match &mut self.graphics {
-                Some(card) => card.read(board, offset),
-                None => OPEN_BUS_BYTE,
-            }
-        } else if let Some(offset) = self.mirage_target(address) {
-            match &mut self.mirage {
-                Some(m) => {
-                    let value = m.read(offset);
-                    // Mirror the write path's interrupt check on the
-                    // read path too: this machine's now-retired Gayle IDE
-                    // interface carried the hard-won reminder that a
-                    // device whose interrupt can change state on a read
-                    // (there, a per-sector refill; here, none currently
-                    // does -- `mirage`'s module docs explain why the
-                    // fetch moved to `tick()` instead) must not only ever
-                    // check after a write, on pain of a silently missed
-                    // interrupt.
-                    if m.irq_pending() {
-                        self.chipset.raise_int(chipset::intbit::PORTS);
+        } else if let Some(idx) = self.autoconfig.board_at(address) {
+            // One scan of the chain for every device below, rather than
+            // each of the seven arms this used to be (up to seven scans
+            // per access, `docs/bus-fast-path-plan.md` §0) calling its
+            // own `*_target` helper. `board_at` narrows to at most one
+            // candidate index -- boards never overlap -- so which arm
+            // matches it in is a lookup, not a race; only Graffity needs
+            // more than a plain field comparison, since it can own more
+            // than one chain index (`Self::graphics_boards`'s own doc
+            // comment).
+            //
+            // `board_at` only ever returns an index it has actually
+            // placed, so `placement` is always `Some` here; the `else`
+            // still fails closed to open bus rather than assuming that
+            // and indexing unchecked, per the hostile-input rule every
+            // guest address is read under.
+            let Some(base) = self.autoconfig.placement(idx).map(|p| p.base) else {
+                return OPEN_BUS_BYTE;
+            };
+            let offset = address - base;
+            if Some(idx) == self.mirage_board {
+                match &mut self.mirage {
+                    Some(m) => {
+                        let value = m.read(offset);
+                        // Mirror the write path's interrupt check on the
+                        // read path too: this machine's now-retired Gayle IDE
+                        // interface carried the hard-won reminder that a
+                        // device whose interrupt can change state on a read
+                        // (there, a per-sector refill; here, none currently
+                        // does -- `mirage`'s module docs explain why the
+                        // fetch moved to `tick()` instead) must not only ever
+                        // check after a write, on pain of a silently missed
+                        // interrupt.
+                        if m.irq_pending() {
+                            self.chipset.raise_int(chipset::intbit::PORTS);
+                        }
+                        value
                     }
-                    value
+                    None => OPEN_BUS_BYTE,
                 }
-                None => OPEN_BUS_BYTE,
-            }
-        } else if let Some(offset) = self.fast_ram_target(address) {
-            match &self.fast_ram {
-                Some(mem) => mem.get(offset as usize).copied().unwrap_or(OPEN_BUS_BYTE),
-                None => OPEN_BUS_BYTE,
-            }
-        } else if let Some(offset) = self.hostblk_target(address) {
-            match &self.hostblk {
-                Some(h) => h.read(offset),
-                // `hostblk::Hostblk::read` never asserts an interrupt as
-                // a side effect of reading -- unlike MIRAGE, no
-                // register read here changes engine state (module docs:
-                // discovery registers are pure queries, and the
-                // completion queue only ever drains via
-                // `COMPLETION_ADVANCE`, a write) -- so there is no
-                // read-path interrupt check to mirror here. Still routed
-                // through the same `Option` shape as MIRAGE for
-                // consistency, not because this arm needs it.
-                None => OPEN_BUS_BYTE,
-            }
-        } else if let Some(offset) = self.input_target(address) {
-            match &self.input {
-                Some(dev) => {
-                    let value = dev.read(offset);
-                    // No register read here currently mutates state
-                    // (module docs: `EVENT_TYPE`/`EVENT_CODE`/etc. are
-                    // pure head-of-queue queries, and the queue only
-                    // ever drains via `EVENT_ADVANCE`, a write) -- but
-                    // checked anyway, mirroring `hostblk`'s own read
-                    // arm, which makes the identical choice for the
-                    // identical reason: a device whose interrupt could
-                    // ever change state on a read (the now-retired
-                    // Gayle IDE interface's per-sector refill) that
-                    // *doesn't* check here is how an interrupt goes
-                    // silently missing and a multi-request pipeline
-                    // stalls until an unrelated interrupt rescues it.
-                    if dev.irq_pending() {
-                        self.chipset.raise_int(chipset::intbit::PORTS);
+            } else if Some(idx) == self.fast_ram_board {
+                match &self.fast_ram {
+                    Some(mem) => mem.get(offset as usize).copied().unwrap_or(OPEN_BUS_BYTE),
+                    None => OPEN_BUS_BYTE,
+                }
+            } else if Some(idx) == self.hostblk_board {
+                match &self.hostblk {
+                    Some(h) => h.read(offset),
+                    // `hostblk::Hostblk::read` never asserts an interrupt as
+                    // a side effect of reading -- unlike MIRAGE, no
+                    // register read here changes engine state (module docs:
+                    // discovery registers are pure queries, and the
+                    // completion queue only ever drains via
+                    // `COMPLETION_ADVANCE`, a write) -- so there is no
+                    // read-path interrupt check to mirror here. Still routed
+                    // through the same `Option` shape as MIRAGE for
+                    // consistency, not because this arm needs it.
+                    None => OPEN_BUS_BYTE,
+                }
+            } else if Some(idx) == self.input_board {
+                match &self.input {
+                    Some(dev) => {
+                        let value = dev.read(offset);
+                        // No register read here currently mutates state
+                        // (module docs: `EVENT_TYPE`/`EVENT_CODE`/etc. are
+                        // pure head-of-queue queries, and the queue only
+                        // ever drains via `EVENT_ADVANCE`, a write) -- but
+                        // checked anyway, mirroring `hostblk`'s own read
+                        // arm, which makes the identical choice for the
+                        // identical reason: a device whose interrupt could
+                        // ever change state on a read (the now-retired
+                        // Gayle IDE interface's per-sector refill) that
+                        // *doesn't* check here is how an interrupt goes
+                        // silently missing and a multi-request pipeline
+                        // stalls until an unrelated interrupt rescues it.
+                        if dev.irq_pending() {
+                            self.chipset.raise_int(chipset::intbit::PORTS);
+                        }
+                        value
                     }
-                    value
+                    None => OPEN_BUS_BYTE,
                 }
-                None => OPEN_BUS_BYTE,
-            }
-        } else if let Some(offset) = self.pktport_target(address) {
-            match &self.pktport {
-                // `pktport::Pktport::read` never asserts an interrupt as a
-                // side effect of reading -- every register it exposes is
-                // a pure query (`VERSION`/`CAPACITY`/`VOL_COUNT`, and
-                // `INT_STATUS` itself only changes via `tick` or a write),
-                // so there is no read-path interrupt check to mirror
-                // here, the same reasoning `hostblk`'s own read arm gives.
-                Some(dev) => dev.read(offset),
-                None => OPEN_BUS_BYTE,
-            }
-        } else if let Some(offset) = self.rtg_target(address) {
-            match &self.rtg {
-                // No interrupt to check here -- `rtgboard`'s module docs,
-                // "no asynchronous boundary to defer across": mode
-                // programming is synchronous and this board never
-                // asserts INT2 at all.
-                Some(dev) => dev.read(offset),
-                None => OPEN_BUS_BYTE,
-            }
-        } else if let Some(offset) = self.pcibridge_target(address) {
-            match &mut self.pcibridge {
-                // No interrupt check needed here even though this card
-                // can now raise INT2 (stage 2's INTx registers): every
-                // register this arm can read is a pure query --
-                // `INTX_STATUS` recomputes itself live rather than being
-                // mutated by a read, and nothing else in the register
-                // file changes `irq_pending()`'s answer on a read path --
-                // the same reasoning `hostblk`'s/`pktport`'s own read
-                // arms give for the identical choice.
-                Some(dev) => dev.read(offset),
-                None => OPEN_BUS_BYTE,
+            } else if Some(idx) == self.pktport_board {
+                match &self.pktport {
+                    // `pktport::Pktport::read` never asserts an interrupt as a
+                    // side effect of reading -- every register it exposes is
+                    // a pure query (`VERSION`/`CAPACITY`/`VOL_COUNT`, and
+                    // `INT_STATUS` itself only changes via `tick` or a write),
+                    // so there is no read-path interrupt check to mirror
+                    // here, the same reasoning `hostblk`'s own read arm gives.
+                    Some(dev) => dev.read(offset),
+                    None => OPEN_BUS_BYTE,
+                }
+            } else if Some(idx) == self.rtg_board {
+                match &self.rtg {
+                    // No interrupt to check here -- `rtgboard`'s module docs,
+                    // "no asynchronous boundary to defer across": mode
+                    // programming is synchronous and this board never
+                    // asserts INT2 at all.
+                    Some(dev) => dev.read(offset),
+                    None => OPEN_BUS_BYTE,
+                }
+            } else if Some(idx) == self.pcibridge_board {
+                match &mut self.pcibridge {
+                    // No interrupt check needed here even though this card
+                    // can now raise INT2 (stage 2's INTx registers): every
+                    // register this arm can read is a pure query --
+                    // `INTX_STATUS` recomputes itself live rather than being
+                    // mutated by a read, and nothing else in the register
+                    // file changes `irq_pending()`'s answer on a read path --
+                    // the same reasoning `hostblk`'s/`pktport`'s own read
+                    // arms give for the identical choice.
+                    Some(dev) => dev.read(offset),
+                    None => OPEN_BUS_BYTE,
+                }
+            } else if let Some(board) = self
+                .graphics_boards
+                .iter()
+                .position(|&chain_idx| chain_idx == Some(idx))
+            {
+                match &mut self.graphics {
+                    Some(card) => card.read(board, offset),
+                    None => OPEN_BUS_BYTE,
+                }
+            } else {
+                OPEN_BUS_BYTE
             }
         } else {
             OPEN_BUS_BYTE
         }
     }
 
-    /// Whether `address` falls inside the input card's configured
-    /// AUTOCONFIG window, and if so, the board-relative offset -- the
-    /// input to [`input::NativeInput::read`]/[`input::NativeInput::write`].
-    /// `None` whenever no card is attached ([`Self::input_board`] is
-    /// `None` until [`Self::with_input`] runs) or the address belongs to
-    /// some other board. See [`Self::hostblk_target`], the same shape.
-    fn input_target(&self, address: u32) -> Option<u32> {
-        let idx = self.input_board?;
-        if self.autoconfig.board_at(address) != Some(idx) {
-            return None;
-        }
-        let base = self.autoconfig.placement(idx)?.base;
-        Some(address - base)
-    }
-
-    /// Whether `address` falls inside the RTG board's configured
-    /// AUTOCONFIG window, and if so, the board-relative offset -- the
-    /// input to [`rtgboard::RtgBoard::read`]/[`rtgboard::RtgBoard::write`].
-    /// `None` whenever no board is attached ([`Self::rtg_board`] is
-    /// `None` until [`Self::with_rtgboard`] runs) or the address belongs
-    /// to some other board. See [`Self::hostblk_target`], the same shape.
-    fn rtg_target(&self, address: u32) -> Option<u32> {
-        let idx = self.rtg_board?;
-        if self.autoconfig.board_at(address) != Some(idx) {
-            return None;
-        }
-        let base = self.autoconfig.placement(idx)?.base;
-        Some(address - base)
-    }
-
     /// Whether `address` falls inside `pcibridge`'s configured AUTOCONFIG
     /// window, and if so, the board-relative offset -- the input to
-    /// [`pcibridge::PciBridge::read`]/[`pcibridge::PciBridge::write`].
-    /// `None` whenever no card is attached ([`Self::pcibridge_board`] is
-    /// `None` until [`Self::with_pcibridge`] runs) or the address belongs
-    /// to some other board. See [`Self::hostblk_target`], the same shape.
+    /// [`pcibridge::PciBridge::read`]/[`pcibridge::PciBridge::write`], and
+    /// what [`Self::pcibridge_aperture_sized`] narrows further into an
+    /// aperture offset. `None` whenever no card is attached
+    /// ([`Self::pcibridge_window`] is `None` until [`Self::with_pcibridge`]
+    /// has run *and* AUTOCONFIG has placed the board) or the address
+    /// belongs to some other board.
+    ///
+    /// Subtract-and-compare against the cached window rather than a
+    /// `board_at` scan -- this is the one `*_target` helper called from
+    /// outside `read_byte`/`write_byte`'s own single-scan device match
+    /// ([`Self::pcibridge_aperture_sized`], reached from `read_word`/
+    /// `read_long`/`write_word`/`write_long` before those fall back to
+    /// byte decomposition), so it still needs to answer in isolation
+    /// without a `board_at` result already in hand -- `docs/
+    /// bus-fast-path-plan.md` §3.3, the single largest bus item in the
+    /// full-device profile before this change.
     fn pcibridge_target(&self, address: u32) -> Option<u32> {
-        let idx = self.pcibridge_board?;
-        if self.autoconfig.board_at(address) != Some(idx) {
+        let (base, len) = self.pcibridge_window?;
+        if address < base || address - base >= len {
             return None;
         }
-        let base = self.autoconfig.placement(idx)?.base;
         Some(address - base)
     }
 
@@ -1051,86 +1196,6 @@ impl<'a> MachineBus<'a> {
         let offset = self.pcibridge_target(address)?;
         (offset >= pcibridge::APERTURE_BASE_OFFSET)
             .then(|| offset - pcibridge::APERTURE_BASE_OFFSET)
-    }
-
-    /// Whether `address` falls inside `hostblk`'s configured AUTOCONFIG
-    /// window, and if so, the board-relative offset -- the input to
-    /// [`hostblk::Hostblk::read`]/[`hostblk::Hostblk::write`]. `None`
-    /// whenever no card is attached ([`Self::hostblk_board`] is `None`
-    /// until [`Self::with_hostblk`] runs) or the address belongs to some
-    /// other board. See [`Self::mirage_target`], the same shape.
-    fn hostblk_target(&self, address: u32) -> Option<u32> {
-        let idx = self.hostblk_board?;
-        if self.autoconfig.board_at(address) != Some(idx) {
-            return None;
-        }
-        let base = self.autoconfig.placement(idx)?.base;
-        Some(address - base)
-    }
-
-    /// Whether `address` falls inside `pktport`'s configured AUTOCONFIG
-    /// window, and if so, the board-relative offset -- the input to
-    /// [`pktport::Pktport::read`]/[`pktport::Pktport::write`]. `None`
-    /// whenever no card is attached ([`Self::pktport_board`] is `None`
-    /// until [`Self::with_pktport`] runs) or the address belongs to some
-    /// other board. See [`Self::hostblk_target`], the same shape.
-    fn pktport_target(&self, address: u32) -> Option<u32> {
-        let idx = self.pktport_board?;
-        if self.autoconfig.board_at(address) != Some(idx) {
-            return None;
-        }
-        let base = self.autoconfig.placement(idx)?.base;
-        Some(address - base)
-    }
-
-    /// Whether `address` falls inside fast RAM's configured AUTOCONFIG
-    /// window, and if so, the board-relative offset. `None` whenever no
-    /// board is attached ([`Self::fast_ram_board`] is `None` until
-    /// [`Self::with_fast_ram`] runs) or the address belongs to some other
-    /// board. See [`Self::mirage_target`], the same shape.
-    fn fast_ram_target(&self, address: u32) -> Option<u32> {
-        let idx = self.fast_ram_board?;
-        if self.autoconfig.board_at(address) != Some(idx) {
-            return None;
-        }
-        let base = self.autoconfig.placement(idx)?.base;
-        Some(address - base)
-    }
-
-    /// Whether `address` falls inside MIRAGE's configured AUTOCONFIG
-    /// window, and if so, the board-relative offset -- the input to
-    /// [`mirage::Mirage::read`]/[`mirage::Mirage::write`]. `None`
-    /// whenever no card is attached ([`Self::mirage_board`] is `None`
-    /// until [`Self::with_mirage`] runs) or the address belongs to some
-    /// other board. See [`Self::graphics_target`], the same shape for
-    /// Graffity.
-    fn mirage_target(&self, address: u32) -> Option<u32> {
-        let idx = self.mirage_board?;
-        if self.autoconfig.board_at(address) != Some(idx) {
-            return None;
-        }
-        let base = self.autoconfig.placement(idx)?.base;
-        Some(address - base)
-    }
-
-    /// Whether `address` falls inside one of the attached Graffity
-    /// card's configured AUTOCONFIG windows, and if so, which of the
-    /// card's own board indices and the offset within it -- the input
-    /// to [`Graffity::read`]/[`Graffity::write`]. `None` whenever no
-    /// card is attached (`graphics_boards` is never anything but all
-    /// `None` without one) or the address belongs to some other board
-    /// entirely. This function is the whole of what `MachineBus` knows
-    /// about Graffity's address layout: it carries no notion of VRAM,
-    /// registers, or any other aperture, only which chain index maps to
-    /// which board index (`Self::graphics_boards`'s own doc comment).
-    fn graphics_target(&self, address: u32) -> Option<(usize, u32)> {
-        let idx = self.autoconfig.board_at(address)?;
-        let base = self.autoconfig.placement(idx)?.base;
-        let board = self
-            .graphics_boards
-            .iter()
-            .position(|&chain_idx| chain_idx == Some(idx))?;
-        Some((board, address - base))
     }
 
     /// Decode a CIA access. CIA-A occupies odd addresses, CIA-B even
@@ -1221,6 +1286,19 @@ impl<'a> MachineBus<'a> {
         {
             return self.read_custom_word(address);
         }
+        // The fast path, before `pcibridge_aperture_sized` (moved after
+        // it, `docs/bus-fast-path-plan.md` §3.3 -- that check used to run
+        // first here and was, unconditionally, a full `board_at` scan on
+        // every word access, the single largest bus item in the full
+        // config's profile). `fast_region` only ever answers for fast
+        // RAM/chip RAM/ROM, none of which can overlap `pcibridge`'s
+        // aperture, so trying it first changes nothing about which path
+        // a given address ultimately takes.
+        if let Some((region, off)) = self.fast_region(address) {
+            if let Some(bytes) = region.get(off..off + 2) {
+                return u16::from_be_bytes([bytes[0], bytes[1]]);
+            }
+        }
         // `pcibridge`'s BAR aperture, before the byte-decomposition
         // fallback: a naturally-aligned word access becomes ONE width-2
         // backend access rather than two width-1s, the same reason the
@@ -1241,6 +1319,13 @@ impl<'a> MachineBus<'a> {
 
     /// Read one big-endian 32-bit longword, composed from four byte reads.
     pub fn read_long(&mut self, address: u32) -> u32 {
+        // Fast path first -- see `read_word`'s matching comment on why
+        // trying it ahead of `pcibridge_aperture_sized` is safe.
+        if let Some((region, off)) = self.fast_region(address) {
+            if let Some(bytes) = region.get(off..off + 4) {
+                return u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            }
+        }
         // Same sized-aperture path as `read_word`, one width-4 backend
         // access instead of four width-1s.
         if let Some(k) = self.pcibridge_aperture_sized(address, pci::AccessWidth::W32) {
@@ -1257,6 +1342,13 @@ impl<'a> MachineBus<'a> {
     /// open bus are silently discarded (real ROM cannot be written, and a
     /// real open-bus write simply has nothing latch it).
     pub fn write_byte(&mut self, address: u32, value: u8) {
+        if let Some((region, off)) = self.fast_region_mut(address) {
+            if let Some(slot) = region.get_mut(off) {
+                *slot = value;
+                return;
+            }
+        }
+
         // A write under the overlay still reaches chip RAM: the overlay
         // only redirects reads, since there is nothing behind ROM to
         // write to and the OS relies on being able to build its vector
@@ -1265,6 +1357,13 @@ impl<'a> MachineBus<'a> {
             self.chip_ram[(address - CHIP_RAM_BASE) as usize] = value;
         } else if AutoConfig::responds_to(address) {
             self.autoconfig.write(address, value);
+            // The one AUTOCONFIG mutation site `docs/bus-fast-path-plan.md`
+            // §3.1 doesn't cover via a builder: a base-address write here
+            // is exactly what `AutoConfig::configure` (and `SHUTUP`'s
+            // retirement) can change a placement from, so the cached
+            // windows must be recomputed every time, not just when this
+            // arm happens to be the one that actually placed something.
+            self.refresh_windows();
         } else if (CIA_BASE..CIA_END).contains(&address) {
             self.write_cia(address, value);
         } else if (CUSTOM_BASE..CUSTOM_END).contains(&address) {
@@ -1278,81 +1377,94 @@ impl<'a> MachineBus<'a> {
                 (current & 0xFF00) | value as u16
             };
             self.write_custom_word(aligned, merged);
-        } else if let Some((board, offset)) = self.graphics_target(address) {
-            if let Some(card) = &mut self.graphics {
-                card.write(board, offset, value);
-            }
-        } else if let Some(offset) = self.mirage_target(address) {
-            if let Some(m) = &mut self.mirage {
-                m.write(offset, value);
-                if m.irq_pending() {
-                    self.chipset.raise_int(chipset::intbit::PORTS);
+        } else if let Some(idx) = self.autoconfig.board_at(address) {
+            // See `read_byte`'s matching arm for why this is one scan
+            // and one match rather than the seven-helper ladder this
+            // used to be.
+            let Some(base) = self.autoconfig.placement(idx).map(|p| p.base) else {
+                return;
+            };
+            let offset = address - base;
+            if Some(idx) == self.mirage_board {
+                if let Some(m) = &mut self.mirage {
+                    m.write(offset, value);
+                    if m.irq_pending() {
+                        self.chipset.raise_int(chipset::intbit::PORTS);
+                    }
                 }
-            }
-        } else if let Some(offset) = self.fast_ram_target(address) {
-            if let Some(mem) = &mut self.fast_ram {
-                if let Some(slot) = mem.get_mut(offset as usize) {
-                    *slot = value;
+            } else if Some(idx) == self.fast_ram_board {
+                if let Some(mem) = &mut self.fast_ram {
+                    if let Some(slot) = mem.get_mut(offset as usize) {
+                        *slot = value;
+                    }
                 }
-            }
-        } else if let Some(offset) = self.hostblk_target(address) {
-            if let Some(h) = &mut self.hostblk {
-                h.write(offset, value);
-                // A `DOORBELL` write can never itself raise INT2 --
-                // `hostblk`'s module docs' "Deferred completion" section
-                // is the whole point of this check being a no-op today.
-                // Kept for the same reason MIRAGE checks after
-                // every write rather than only where it currently
-                // matters: a future register (e.g. an immediate-reject
-                // path) raising synchronously must not require
-                // remembering to add this check back in.
-                if h.irq_pending() {
-                    self.chipset.raise_int(chipset::intbit::PORTS);
+            } else if Some(idx) == self.hostblk_board {
+                if let Some(h) = &mut self.hostblk {
+                    h.write(offset, value);
+                    // A `DOORBELL` write can never itself raise INT2 --
+                    // `hostblk`'s module docs' "Deferred completion" section
+                    // is the whole point of this check being a no-op today.
+                    // Kept for the same reason MIRAGE checks after
+                    // every write rather than only where it currently
+                    // matters: a future register (e.g. an immediate-reject
+                    // path) raising synchronously must not require
+                    // remembering to add this check back in.
+                    if h.irq_pending() {
+                        self.chipset.raise_int(chipset::intbit::PORTS);
+                    }
                 }
-            }
-        } else if let Some(offset) = self.input_target(address) {
-            if let Some(dev) = &mut self.input {
-                dev.write(offset, value);
-                // `EVENT_ADVANCE`/`INT_STATUS`/`INT_ENABLE` are exactly
-                // the registers that can change `irq_pending()`'s
-                // answer, so this check is load-bearing here (unlike
-                // `hostblk`'s doorbell arm above, kept only for future-
-                // proofing) -- see `input` module docs, "Interrupt
-                // model".
-                if dev.irq_pending() {
-                    self.chipset.raise_int(chipset::intbit::PORTS);
+            } else if Some(idx) == self.input_board {
+                if let Some(dev) = &mut self.input {
+                    dev.write(offset, value);
+                    // `EVENT_ADVANCE`/`INT_STATUS`/`INT_ENABLE` are exactly
+                    // the registers that can change `irq_pending()`'s
+                    // answer, so this check is load-bearing here (unlike
+                    // `hostblk`'s doorbell arm above, kept only for future-
+                    // proofing) -- see `input` module docs, "Interrupt
+                    // model".
+                    if dev.irq_pending() {
+                        self.chipset.raise_int(chipset::intbit::PORTS);
+                    }
                 }
-            }
-        } else if let Some(offset) = self.pktport_target(address) {
-            if let Some(dev) = &mut self.pktport {
-                dev.write(offset, value);
-                // `DOORBELL`/`INT_STATUS`/`INT_ENABLE` are exactly the
-                // registers that can change `irq_pending()`'s answer
-                // (`DOORBELL` never synchronously today -- `pktport`'s
-                // module docs, "Deferred completion" -- but kept
-                // unconditional for the same future-proofing reason
-                // `hostblk`'s own doorbell arm gives).
-                if dev.irq_pending() {
-                    self.chipset.raise_int(chipset::intbit::PORTS);
+            } else if Some(idx) == self.pktport_board {
+                if let Some(dev) = &mut self.pktport {
+                    dev.write(offset, value);
+                    // `DOORBELL`/`INT_STATUS`/`INT_ENABLE` are exactly the
+                    // registers that can change `irq_pending()`'s answer
+                    // (`DOORBELL` never synchronously today -- `pktport`'s
+                    // module docs, "Deferred completion" -- but kept
+                    // unconditional for the same future-proofing reason
+                    // `hostblk`'s own doorbell arm gives).
+                    if dev.irq_pending() {
+                        self.chipset.raise_int(chipset::intbit::PORTS);
+                    }
                 }
-            }
-        } else if let Some(offset) = self.rtg_target(address) {
-            if let Some(dev) = &mut self.rtg {
-                dev.write(offset, value);
-                // No interrupt check here -- see `read_byte`'s matching
-                // arm above.
-            }
-        } else if let Some(offset) = self.pcibridge_target(address) {
-            if let Some(dev) = &mut self.pcibridge {
-                dev.write(offset, value);
-                // `INTX_ENABLE`/`INTX_TEST` (and, indirectly, whatever a
-                // config-cycle write did to a device the backend routes
-                // `intx_levels()` through) are exactly the registers that
-                // can change `irq_pending()`'s answer, so this check is
-                // load-bearing here -- the `input` arm above is the
-                // model (`input` module docs, "Interrupt model").
-                if dev.irq_pending() {
-                    self.chipset.raise_int(chipset::intbit::PORTS);
+            } else if Some(idx) == self.rtg_board {
+                if let Some(dev) = &mut self.rtg {
+                    dev.write(offset, value);
+                    // No interrupt check here -- see `read_byte`'s matching
+                    // arm above.
+                }
+            } else if Some(idx) == self.pcibridge_board {
+                if let Some(dev) = &mut self.pcibridge {
+                    dev.write(offset, value);
+                    // `INTX_ENABLE`/`INTX_TEST` (and, indirectly, whatever a
+                    // config-cycle write did to a device the backend routes
+                    // `intx_levels()` through) are exactly the registers that
+                    // can change `irq_pending()`'s answer, so this check is
+                    // load-bearing here -- the `input` arm above is the
+                    // model (`input` module docs, "Interrupt model").
+                    if dev.irq_pending() {
+                        self.chipset.raise_int(chipset::intbit::PORTS);
+                    }
+                }
+            } else if let Some(board) = self
+                .graphics_boards
+                .iter()
+                .position(|&chain_idx| chain_idx == Some(idx))
+            {
+                if let Some(card) = &mut self.graphics {
+                    card.write(board, offset, value);
                 }
             }
         }
@@ -1368,6 +1480,13 @@ impl<'a> MachineBus<'a> {
         if (CUSTOM_BASE..CUSTOM_END).contains(&address) {
             self.write_custom_word(address, value);
             return;
+        }
+        // Fast path first -- see `read_word`'s matching comment.
+        if let Some((region, off)) = self.fast_region_mut(address) {
+            if let Some(slot) = region.get_mut(off..off + 2) {
+                slot.copy_from_slice(&value.to_be_bytes());
+                return;
+            }
         }
         // `pcibridge`'s BAR aperture, before the byte-decomposition
         // fallback -- see `read_word`'s matching arm for why.
@@ -1396,6 +1515,13 @@ impl<'a> MachineBus<'a> {
     /// Write one big-endian 32-bit longword, decomposed into two word
     /// writes.
     pub fn write_long(&mut self, address: u32, value: u32) {
+        // Fast path first -- see `read_word`'s matching comment.
+        if let Some((region, off)) = self.fast_region_mut(address) {
+            if let Some(slot) = region.get_mut(off..off + 4) {
+                slot.copy_from_slice(&value.to_be_bytes());
+                return;
+            }
+        }
         // Same sized-aperture path as `write_word`, one width-4 backend
         // access instead of decomposing further.
         if let Some(k) = self.pcibridge_aperture_sized(address, pci::AccessWidth::W32) {
@@ -3257,5 +3383,269 @@ mod tests {
             bus.read_byte(base + pcibridge::reg::CFG_STATUS),
             OPEN_BUS_BYTE
         );
+    }
+
+    // ---- step 3 (`docs/bus-fast-path-plan.md`): the fast path ------------
+
+    /// A word straddling the end of chip RAM (`fast_region`'s slice ends
+    /// exactly at `CHIP_RAM_END`, so `get(off..off + 2)` misses and the
+    /// access must fall through to the byte-composed path unchanged) must
+    /// read identically to composing it from two `read_byte` calls, and
+    /// the byte one past chip RAM's end must be open bus -- nothing is
+    /// mapped there by default.
+    #[test]
+    fn word_straddling_chip_rams_end_matches_the_byte_composed_result() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom);
+
+        bus.write_byte(CHIP_RAM_END - 1, 0xAB);
+        assert_eq!(
+            bus.read_byte(CHIP_RAM_END),
+            OPEN_BUS_BYTE,
+            "one past chip RAM's end, nothing attached there"
+        );
+        let expected =
+            ((bus.read_byte(CHIP_RAM_END - 1) as u16) << 8) | (bus.read_byte(CHIP_RAM_END) as u16);
+        assert_eq!(bus.read_word(CHIP_RAM_END - 1), expected);
+        assert_eq!(bus.read_word(CHIP_RAM_END - 1), 0xABFF);
+    }
+
+    /// The same straddle shape at the end of fast RAM's *real* backing
+    /// buffer, which -- unlike chip RAM's fixed array -- is routinely
+    /// shorter than the 16 MB window AUTOCONFIG declares for it
+    /// (`with_fast_ram`'s doc comment). A long write/read spanning that
+    /// boundary must fall through to the byte path exactly like chip
+    /// RAM's case above, discarding/open-bussing the bytes past the real
+    /// buffer rather than panicking or silently wrapping.
+    #[test]
+    fn long_straddling_fast_rams_real_buffer_end_matches_the_byte_composed_result() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        // A real buffer far shorter than the 16 MB window every fast-RAM
+        // board declares (`fastram::MIN_SIZE_BYTES`) -- the gap between
+        // the two is the whole point of this test.
+        let mut fast = std::vec![0u8; 8];
+        let mut bus = new_bus(&mut ram, &rom).with_fast_ram(&mut fast);
+        let base = 0x4000_0000u32;
+        configure_hostblk_z3(&mut bus, base);
+
+        bus.write_long(base + 6, 0xAABB_CCDD);
+        assert_eq!(
+            bus.read_byte(base + 8),
+            OPEN_BUS_BYTE,
+            "past the real 8-byte buffer, still inside the declared window"
+        );
+        let expected = ((bus.read_byte(base + 6) as u32) << 24)
+            | ((bus.read_byte(base + 7) as u32) << 16)
+            | ((bus.read_byte(base + 8) as u32) << 8)
+            | (bus.read_byte(base + 9) as u32);
+        assert_eq!(bus.read_long(base + 6), expected);
+    }
+
+    /// AUTOCONFIG placing fast RAM is the only thing that ever populates
+    /// [`MachineBus::fast_window`] (`Self::refresh_windows`'s doc
+    /// comment) -- there is no address to hardcode here, which is
+    /// `device-ledger.md`'s "rule for addresses" applied to this cache
+    /// specifically. Before that write lands, the fast path must not
+    /// answer for the address fast RAM will eventually occupy, even
+    /// though nothing has changed about the underlying buffer.
+    #[test]
+    fn placement_populates_fast_window_and_gates_the_fast_path() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut fast = std::vec![0xAAu8; fastram::MIN_SIZE_BYTES as usize];
+        let mut bus = new_bus(&mut ram, &rom).with_fast_ram(&mut fast);
+
+        assert_eq!(bus.fast_window, None, "not yet placed");
+        let base = 0x4000_0000u32;
+        assert_eq!(
+            bus.fast_region(base),
+            None,
+            "fast RAM's eventual base must not be hardcoded into the fast path early"
+        );
+        assert_eq!(bus.read_byte(base), OPEN_BUS_BYTE);
+
+        configure_hostblk_z3(&mut bus, base);
+
+        assert_eq!(bus.fast_window, Some((base, fastram::MIN_SIZE_BYTES)));
+        assert!(
+            bus.fast_region(base).is_some(),
+            "the fast path now answers for the placed window"
+        );
+        assert_eq!(bus.read_byte(base), 0xAA);
+    }
+
+    /// [`MachineBus::fast_region`] only ever answers for ROM when it
+    /// exactly fills its 512 KB window -- an undersized image still needs
+    /// [`rom::read_mirrored`]'s wraparound, which the fast path does not
+    /// implement, so it must decline and let the existing chain mirror it
+    /// (exactly as [`tests::undersized_rom_mirrors_across_the_window`]
+    /// already proves end to end; this pins the fast path's own refusal
+    /// specifically, so a future change can't silently start answering
+    /// wrong for this case instead of falling through).
+    #[test]
+    fn undersized_rom_is_declined_by_the_fast_path_and_still_mirrors() {
+        let mut ram = boxed_chip_ram();
+        let quarter = ROM_WINDOW_SIZE / 4;
+        let mut small_rom = alloc_vec_zeroed(quarter);
+        small_rom[0] = 0x42;
+        let bus = new_bus(&mut ram, &small_rom);
+
+        assert_eq!(bus.fast_region(ROM_BASE), None);
+        assert_eq!(bus.fast_region(ROM_BASE + quarter as u32), None);
+        assert_eq!(bus.fast_region(ROM_END - 1), None);
+    }
+
+    /// A word/long-composed-from-bytes reference, deliberately built on
+    /// [`MachineBus::read_byte`] rather than reproducing the pre-fast-path
+    /// byte chain from scratch. `read_byte` itself now has a fast path
+    /// too (`docs/bus-fast-path-plan.md` §3.2's own note on this), so this
+    /// is not an independent oracle the way the straddle tests above are
+    /// -- it is a fixed reference the width-native paths must agree with,
+    /// and the 445 pre-existing unit tests (unchanged by this whole
+    /// change, `cargo test -p machine-core`) are what establishes that
+    /// `read_byte` itself still answers exactly as the original chain
+    /// did.
+    fn read_word_ref(bus: &mut MachineBus, addr: u32) -> u16 {
+        let hi = bus.read_byte(addr) as u16;
+        let lo = bus.read_byte(addr.wrapping_add(1)) as u16;
+        (hi << 8) | lo
+    }
+
+    fn read_long_ref(bus: &mut MachineBus, addr: u32) -> u32 {
+        let hi = read_word_ref(bus, addr) as u32;
+        let lo = read_word_ref(bus, addr.wrapping_add(2)) as u32;
+        (hi << 16) | lo
+    }
+
+    /// Every device this bus can host, attached and configured at once
+    /// (exactly [`autoconfig::MAX_BOARDS`] boards -- `with_graphics_zorro_iii`
+    /// rather than the two-board Zorro II Graffity variant, to leave room
+    /// for `pcibridge` alongside it), walking the whole 32-bit address map
+    /// in 4 KB steps plus every fixed region boundary this bus decodes
+    /// against. `read_word`/`read_long` must agree with [`read_word_ref`]/
+    /// [`read_long_ref`] everywhere -- the fast path in front of the
+    /// chain must never change what a single access observes, only how
+    /// it gets there.
+    #[test]
+    fn width_native_reads_agree_with_the_byte_composed_reference_across_the_whole_map() {
+        let mut ram = boxed_chip_ram();
+        let mut rom = [0u8; ROM_WINDOW_SIZE];
+        rom[0] = 0x11;
+        let mut mirage_disk = MirageDisk::new(64);
+        let mut hostblk_disk = MirageDisk::new(64);
+        let mut graffity_vram = std::vec![0u8; 64 * 1024];
+        let mut rtg_vram = std::vec![0u8; 64 * 1024];
+        let modes = [rtgboard::ModeDescriptor {
+            width: 640,
+            height: 480,
+            format: rtgboard::format::RGBX_8888,
+        }];
+        let mut fast = std::vec![0u8; fastram::MIN_SIZE_BYTES as usize];
+        let mut packet_backend = StubPacketBackend;
+        let mut hostbridge_dev = pci::HostBridge::new();
+        let mut slots = [pci::VirtualSlot {
+            bdf: pci::Bdf {
+                bus: 0,
+                device: 0,
+                function: 0,
+            },
+            device: &mut hostbridge_dev,
+        }];
+        let mut vpci = pci::VirtualPciBus::new(&mut slots);
+
+        let mut bus = new_bus(&mut ram, &rom)
+            .with_mirage(0, &mut mirage_disk)
+            .with_hostblk(0, &mut hostblk_disk, false)
+            .with_graphics_zorro_iii(&mut graffity_vram)
+            .with_input()
+            .with_rtgboard(&mut rtg_vram, &modes)
+            .with_fast_ram(&mut fast)
+            .with_pktport(&mut packet_backend)
+            .with_pcibridge(&mut vpci);
+
+        // Configure every board in exactly the order it was registered
+        // above -- AUTOCONFIG only ever lets the *current* board answer
+        // (autoconfig module docs).
+        configure_zorro_ii(&mut bus, 0x20); // mirage -> $200000
+        configure_zorro_iii(&mut bus, 0x4000_0000); // hostblk
+        configure_zorro_iii(&mut bus, 0x5000_0000); // graffity (Zorro III)
+        configure_zorro_iii(&mut bus, 0x6000_0000); // input
+        configure_zorro_iii(&mut bus, 0x7000_0000); // rtgboard
+        configure_zorro_iii(&mut bus, 0x8000_0000); // fast_ram
+        configure_zorro_ii(&mut bus, 0x50); // pktport -> $500000
+        configure_zorro_iii(&mut bus, 0x9000_0000); // pcibridge
+
+        let mut addresses: std::vec::Vec<u32> = std::vec::Vec::new();
+        let mut addr: u64 = 0;
+        while addr <= u32::MAX as u64 {
+            addresses.push(addr as u32);
+            addr += 0x1000; // 4 KB steps, per `docs/bus-fast-path-plan.md`'s
+                            // differential-test spec
+        }
+        for edge in [
+            0u32,
+            OVERLAY_END,
+            CHIP_RAM_BASE,
+            CHIP_RAM_END,
+            0x0020_0000,
+            0x0021_0000, // mirage's window
+            0x0050_0000,
+            0x0051_0000, // pktport's window
+            CIA_BASE,
+            CIA_END,
+            CUSTOM_BASE,
+            CUSTOM_END,
+            autoconfig::AUTOCONFIG_BASE,
+            autoconfig::AUTOCONFIG_END,
+            rom::EXT_ROM_BASE,
+            rom::EXT_ROM_BASE + rom::EXT_ROM_WINDOW_SIZE as u32,
+            ROM_BASE,
+            ROM_END,
+            0x4000_0000,
+            0x5000_0000,
+            0x6000_0000,
+            0x7000_0000,
+            0x8000_0000,
+            0x9000_0000,
+        ] {
+            addresses.push(edge);
+            if edge > 0 {
+                addresses.push(edge - 1);
+            }
+            if edge < u32::MAX {
+                addresses.push(edge + 1);
+            }
+        }
+
+        for &addr in &addresses {
+            // Word/long comparisons only at even addresses: the custom
+            // chip registers decode in 2-byte-aligned pairs
+            // (`read_custom_word`'s own `& 0x1FE`), so a genuinely odd
+            // address there makes the word-composed path (`read_long`'s
+            // two `read_word` calls) and the pure byte-composed
+            // reference disagree about *which* register pairing answers
+            // -- a real 68k never issues a misaligned word/long access
+            // in the first place (address error), so this is a decoding
+            // property of that one region, not a fast-path regression.
+            // The dedicated straddle tests above already cover the
+            // odd-address case where it matters (chip RAM's and fast
+            // RAM's own boundaries, neither of which has this
+            // ambiguity).
+            if !addr.is_multiple_of(2) {
+                continue;
+            }
+            assert_eq!(
+                bus.read_word(addr),
+                read_word_ref(&mut bus, addr),
+                "word at {addr:#010x}"
+            );
+            assert_eq!(
+                bus.read_long(addr),
+                read_long_ref(&mut bus, addr),
+                "long at {addr:#010x}"
+            );
+        }
     }
 }
