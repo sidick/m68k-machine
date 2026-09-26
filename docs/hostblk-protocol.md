@@ -191,6 +191,20 @@ the `N`th tick at the earliest. Unlike MIRAGE's engine, this one is
 (`MachineBus::tick`'s own doc comment): gating it that way reliably
 wedges a real Kickstart 3.2.2 boot before Startup-Sequence ever runs.
 
+**Driver feedback: a request must be marked in flight before the
+doorbell.** exec's `WaitIO`/`CheckIO`/`DoIO` treat `ln_Type ==
+NT_REPLYMSG` as "finished", and `ReplyMsg` leaves that value on the
+node afterwards. A driver's `BeginIO` must therefore set `ln_Type =
+NT_MESSAGE` on every request it will complete asynchronously, before
+it writes `DOORBELL`. Kickstart's ROM FFS reuses one IORequest for
+every `DoIO`, so without that assignment each resubmission already
+looks complete. The first `hostblk.device` omitted it. That went
+unnoticed while `MachineBus::tick` ran this engine after every
+instruction, because the completion interrupt always arrived before
+`DoIO` looked. At one line of latency the boot wedged after four FFS
+reads (`m68k/hostblk-rom/hostblk-diagrom.s`, `dev_beginio`, has the
+trace).
+
 INT2 is checked on both the read and the write path in `lib.rs`'s
 routing (mirroring `gayle.rs`'s hard-won lesson: a device whose state
 can change without a preceding write must still be checked on reads, or

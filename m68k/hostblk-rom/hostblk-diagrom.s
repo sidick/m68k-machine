@@ -184,6 +184,8 @@ NODE_SIZE       equ     14
 
 NT_INTERRUPT    equ     2
 NT_DEVICE       equ     3
+NT_MESSAGE      equ     5       ; exec/nodes.h -- see dev_beginio for why
+                                ; this driver writes it
 
 * exec/libraries.h: struct Library (34 bytes) -- struct Node lib_Node(14),
 * UBYTE lib_Flags, UBYTE lib_pad, UWORD lib_NegSize, UWORD lib_PosSize,
@@ -930,8 +932,9 @@ dev_extfunc:
 *     protocol section 8's self-limiting requirement: it structurally
 *     cannot over-submit, so it needs no devsoak `maxinflight` quirk).
 *     Clearing IOF_QUICK on a DoIO() caller is fine: exec's DoIO then
-*     waits for the ReplyMsg int_handler posts (exec 47.13's wait loop at
-*     $F809D4 polls the request's ln_Type for NT_REPLYMSG). This was
+*     waits for the ReplyMsg int_handler posts (exec 47.13's inline
+*     WaitIO at $F809D4 tests the request's ln_Type for NT_REPLYMSG and
+*     only Wait()s if it is not already set). This was
 *     re-verified deliberately after a debugging detour: a find_free_slot
 *     register clobber (see its header) once made int_handler "reply"
 *     garbage instead of the real IORequest, which mimicked a
@@ -940,8 +943,36 @@ dev_extfunc:
 *     always-asynchronous form boots Kickstart's ROM FFS to Workbench
 *     unmodified, so that extra path was dropped again.
 *   - anything else: IOERR_NOCMD.
+*
+* ln_Type = NT_MESSAGE on entry, before anything else (in particular
+* before submit_or_queue can ring the doorbell): exec's WaitIO/CheckIO
+* (and DoIO's inline WaitIO) take "ln_Type == NT_REPLYMSG" to mean "this
+* request is finished", and ReplyMsg leaves NT_REPLYMSG set on the node
+* forever afterwards. Kickstart's ROM FFS reuses a single IORequest for
+* every DoIO it issues, so without this line each resubmission starts
+* out already looking complete. That was masked for as long as
+* MachineBus::tick ran the card's engine on every instruction: the
+* completion interrupt always landed before BeginIO even returned, so
+* by the time DoIO looked, NT_REPLYMSG was true again. With the engine
+* ticked once per raster line (docs/bus-fast-path-plan.md step 4.1) the
+* reply arrives ~100 instructions later instead, DoIO saw the stale
+* NT_REPLYMSG, skipped Wait(), Remove()d a node that was not on the
+* reply port's list, and returned; FFS then reused the IORequest for
+* TD_MOTOR while its read was still in flight, and the late ReplyMsg
+* landed on an idle request -- the boot wedged after the fourth
+* FFS read. Confirmed by a guest-state trace at each doorbell (ln_Type
+* was already 7 on every resubmission, in both the per-instruction and
+* per-line runs) and an instruction trace through exec's DoIO.
+* Autodocs/exec.doc "DoIO", IMPLEMENTATION: "Active requests have type
+* NT_MESSAGE"; the same note calls resubmitting an NT_REPLYMSG request
+* illegal, but ROM FFS does it on every call, so the device has to be
+* the one that marks a request active. Harmless for the quick/synchronous commands below:
+* an IOF_QUICK caller never looks at ln_Type, and a non-quick one gets
+* ReplyMsg, which sets NT_REPLYMSG itself.
 *-----------------------------------------------------------------------------
 dev_beginio:
+        move.b  #NT_MESSAGE,LN_TYPE(a1)   ; see header: must precede the
+                                           ; doorbell
         movem.l d2-d7/a2-a6,-(sp)
         move.l  a6,a3                     ; a3 = device base for the rest of
                                            ; this routine

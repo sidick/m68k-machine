@@ -42,7 +42,7 @@ SHA256 of the file exactly as committed here (recompute and compare after
 a rebuild to confirm the toolchain reproduced the same bytes):
 
 ```
-e043d75af9360ed468a6935461c409d7dbc765ce0877b22aec403dff57f049ac  hostblk-diagrom.bin
+a0dd1e4fcc2831954bed93c69a104c6fe32b216aa213ea5d47d589f7a99cd486  hostblk-diagrom.bin
 ```
 
 ## License
