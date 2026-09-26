@@ -30,6 +30,18 @@ clean, and their tested behaviour (address-bus/memory-map correctness,
 the run loop's limit/wedge/halt logic) is correct, on every commit, in
 well under a minute.
 
+Release builds (`cargo build --release`, including the two board
+targets, since they share the workspace profile) use fat LTO and one
+codegen unit (root `Cargo.toml`'s `[profile.release]`), so that
+`MachineBus` inlines across the crate boundary into the generic `m68k`
+dispatch loop -- worth ~13% bare / ~8% full wall clock on the hosted
+runner's boot benchmark (`docs/bus-fast-path-plan.md` step 2). None of
+this workflow's jobs currently build `--release` (`test` runs `cargo
+test` debug; `qemu-virt`/`qemu-q35` build the board crates without
+`--release`, and `scripts/run-qemu-virt.sh`/`run-qemu-q35.sh` default to
+the debug path), so the profile is exercised today only by a release
+build done by hand, not by CI.
+
 ## `qemu-virt` and `qemu-q35`
 
 Build the aarch64 (`aarch64-unknown-none`) and x86-64 UEFI

@@ -276,4 +276,4 @@ makes them true.
 | Step | Bare 1500f | Full 1500f | Notes |
 |---|---|---|---|
 | baseline | 12.27 s (11.1 MIPS) | 8.67 s (10.2 MIPS) | §0 profile |
-| 2 LTO (measured, not landed) | 10.69 s | 7.95 s | |
+| 2 LTO | 11.025 s (12.4 MIPS) | 8.065 s (11.0 MIPS) | landed; `cargo build --release -p machine-hosted`, `--no-build` bench |

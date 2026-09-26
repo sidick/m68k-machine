@@ -65,3 +65,16 @@ m68k = { git = "https://github.com/sidick/m68k-rs", rev = "5d27b8c083e1e6db6c135
 # on top of `9e123e0`, nothing else in between) -- back to a normal
 # crates.io dependency.
 amiga-rom = "0.4.0"
+
+# Release profile (docs/bus-fast-path-plan.md step 2). Fat LTO and one
+# codegen unit let the compiler inline `MachineBus` across the crate
+# boundary into the generic `m68k` dispatch loop, instead of stopping at
+# machine-core's own codegen units the way thin/default LTO does.
+# Measured on this plan's baseline: bare -13%, full -8% wall clock (see
+# the plan's Results table). `panic = "abort"` is deliberately NOT set
+# here -- it would apply workspace-wide and break `cargo test`'s
+# unwinding harness; `.cargo/config.toml` scopes it to
+# aarch64-unknown-none alone, and that's where it stays.
+[profile.release]
+lto = "fat"
+codegen-units = 1
