@@ -132,6 +132,110 @@ pub trait GuestMemory {
     fn ram_slice_mut(&mut self, addr: u32, len: u32) -> Option<&mut [u8]>;
 }
 
+/// This machine's actual guest RAM: chip RAM (always present) and fast
+/// RAM (only once [`MachineBus::with_fast_ram`] attaches it), split out
+/// of [`MachineBus`] so it can implement [`GuestMemory`] on its own.
+///
+/// The reason this needs to be its own field rather than two fields
+/// among [`MachineBus`]'s many others: a device engine's `tick` takes a
+/// `&mut dyn GuestMemory` (`hostblk::Hostblk::tick`/
+/// `pktport::Pktport::tick`/`pcibridge::PciBridge::tick`), which used to
+/// mean handing it the *whole* bus (since `MachineBus` was what
+/// implemented `GuestMemory`) -- and `self` cannot be borrowed while
+/// `self.hostblk` (say) already is, so `MachineBus::tick` had to lift
+/// the device out of its `Option`, call it, and put it straight back,
+/// just to break that aliasing for the duration of one call. With RAM
+/// living in its own field, `&mut self.ram` and `&mut self.hostblk` are
+/// a disjoint field borrow the compiler accepts directly: no `take()`,
+/// no put-back, no comment explaining why the gap is unobservable.
+///
+/// `MachineBus` keeps a delegating [`GuestMemory`] impl (below) so
+/// `machine-hosted`'s `screenshot.rs`/`introspect.rs`/`pktvol.rs` — all
+/// of which just want "is this a RAM address" — need no change.
+pub struct GuestRam<'a> {
+    chip_ram: &'a mut [u8; CHIP_RAM_SIZE],
+    /// Fast RAM (`fastram`), when the board layer has attached some via
+    /// [`MachineBus::with_fast_ram`]. See that method's doc comment for
+    /// why a machine with none attached is completely unaffected.
+    fast_ram: Option<&'a mut [u8]>,
+    /// AUTOCONFIG chain index fast RAM's single board landed at, once
+    /// [`MachineBus::with_fast_ram`] has registered it.
+    fast_ram_board: Option<usize>,
+    /// Fast RAM's placed `(base, len)` window, cached from
+    /// `autoconfig.placement(fast_ram_board)` by
+    /// [`MachineBus::refresh_windows`] -- `None` until AUTOCONFIG has
+    /// actually configured the board ([`MachineBus::with_fast_ram`] alone
+    /// only adds it to the chain, it does not place it). Both the bus
+    /// fast path ([`MachineBus::fast_region`]/`fast_region_mut`) and
+    /// [`Self::fast_ram_span`] check this instead of asking
+    /// [`AutoConfig`] to scan, which is the whole point: derived only
+    /// from `autoconfig.placement`, never a constant
+    /// (`docs/device-ledger.md`, standing rule 2). Refreshed at every
+    /// placement mutation site, so it is never stale on a read.
+    fast_window: Option<(u32, u32)>,
+}
+
+impl<'a> GuestRam<'a> {
+    fn new(chip_ram: &'a mut [u8; CHIP_RAM_SIZE]) -> Self {
+        Self {
+            chip_ram,
+            fast_ram: None,
+            fast_ram_board: None,
+            fast_window: None,
+        }
+    }
+
+    /// `[addr, addr + len)`'s position within chip RAM, if it lies
+    /// entirely inside it. Shared by both [`GuestMemory`] methods below.
+    fn chip_ram_span(&self, addr: u32, len: u32) -> Option<core::ops::Range<usize>> {
+        let end = addr.checked_add(len)?;
+        if end > CHIP_RAM_END {
+            return None;
+        }
+        let start = (addr - CHIP_RAM_BASE) as usize;
+        Some(start..start + len as usize)
+    }
+
+    /// `[addr, addr + len)`'s position within fast RAM's *real* backing
+    /// store, if fast RAM is attached, configured, and the whole span
+    /// lies inside both its cached placed window ([`Self::fast_window`])
+    /// and the actual buffer a board layer supplied (which may be
+    /// shorter than the window -- [`MachineBus::with_fast_ram`]'s doc
+    /// comment).
+    fn fast_ram_span(&self, addr: u32, len: u32) -> Option<core::ops::Range<usize>> {
+        let (base, window_len) = self.fast_window?;
+        let end = addr.checked_add(len)?;
+        if addr < base || end > base.checked_add(window_len)? {
+            return None;
+        }
+        let start = (addr - base) as usize;
+        let end = start + len as usize;
+        (end <= self.fast_ram.as_ref()?.len()).then_some(start..end)
+    }
+}
+
+impl<'a> GuestMemory for GuestRam<'a> {
+    fn ram_slice(&self, addr: u32, len: u32) -> Option<&[u8]> {
+        if let Some(span) = self.chip_ram_span(addr, len) {
+            return Some(&self.chip_ram[span]);
+        }
+        if let Some(span) = self.fast_ram_span(addr, len) {
+            return Some(&self.fast_ram.as_ref()?[span]);
+        }
+        None
+    }
+
+    fn ram_slice_mut(&mut self, addr: u32, len: u32) -> Option<&mut [u8]> {
+        if let Some(span) = self.chip_ram_span(addr, len) {
+            return Some(&mut self.chip_ram[span]);
+        }
+        if let Some(span) = self.fast_ram_span(addr, len) {
+            return Some(&mut self.fast_ram.as_mut()?[span]);
+        }
+        None
+    }
+}
+
 /// The m68k-visible address space of the machine.
 ///
 /// `MachineBus` borrows its backing storage from the board layer rather
@@ -145,7 +249,9 @@ pub trait GuestMemory {
 /// by mirroring the image across the window, matching how a real Amiga's
 /// address decoder mirrors an undersized ROM across its window.
 pub struct MachineBus<'a> {
-    chip_ram: &'a mut [u8; CHIP_RAM_SIZE],
+    /// Chip RAM and fast RAM, split into their own [`GuestMemory`]
+    /// implementer -- see [`GuestRam`]'s own doc comment for why.
+    ram: GuestRam<'a>,
     rom: &'a [u8],
     /// AROS extended ROM at `$E00000`, empty when booting a single ROM.
     ext_rom: &'a [u8],
@@ -209,23 +315,14 @@ pub struct MachineBus<'a> {
     /// as [`Self::mirage_board`].
     hostblk_board: Option<usize>,
 
-    /// Fast RAM (`fastram`), when the board layer has attached some via
-    /// [`Self::with_fast_ram`]. Absent by default -- with no call to
-    /// `with_fast_ram`, neither its AUTOCONFIG board nor this field's
-    /// routing branch exist, so a machine with no fast RAM attached is
-    /// completely unaffected, and every existing baseline (planar and
-    /// RTG) stays bit-identical (the same guarantee [`Self::mirage`],
-    /// [`Self::hostblk`] and [`Self::graphics`] already give). Unlike
-    /// those, this is plain borrowed storage rather than a device with
-    /// its own register model -- `fastram`'s whole job is the AUTOCONFIG
-    /// identity that gets it linked into the guest's free-memory list,
-    /// not any behaviour once mapped.
-    fast_ram: Option<&'a mut [u8]>,
-    /// AUTOCONFIG chain index fast RAM's single board landed at, once
-    /// [`Self::with_fast_ram`] has registered it -- the same seam shape
-    /// as [`Self::mirage_board`]/[`Self::hostblk_board`].
-    fast_ram_board: Option<usize>,
-
+    // Fast RAM (`fastram`) lives on `self.ram` (a [`GuestRam`]) rather
+    // than as fields here -- see [`GuestRam`]'s own doc comment. Absent
+    // by default: with no call to [`Self::with_fast_ram`], neither its
+    // AUTOCONFIG board nor any routing branch that reaches it exist, so
+    // a machine with no fast RAM attached is completely unaffected, and
+    // every existing baseline (planar and RTG) stays bit-identical (the
+    // same guarantee [`Self::mirage`], [`Self::hostblk`] and
+    // [`Self::graphics`] already give).
     /// The native input card ([`input`]), when the board layer has
     /// attached one via [`Self::with_input`]. Absent by default -- with
     /// no call to `with_input`, neither its AUTOCONFIG board nor this
@@ -275,15 +372,6 @@ pub struct MachineBus<'a> {
     /// as [`Self::mirage_board`]/[`Self::hostblk_board`].
     pcibridge_board: Option<usize>,
 
-    /// Fast RAM's placed `(base, len)` window, cached from
-    /// `autoconfig.placement(fast_ram_board)` by [`Self::refresh_windows`]
-    /// -- `None` until AUTOCONFIG has actually configured the board
-    /// ([`Self::with_fast_ram`] alone only adds it to the chain, it does
-    /// not place it). [`Self::fast_region`]/[`Self::fast_region_mut`]
-    /// check this instead of asking [`AutoConfig`] to scan, which is the
-    /// whole point: derived only from `autoconfig.placement`, never a
-    /// constant (`docs/device-ledger.md`, standing rule 2).
-    fast_window: Option<(u32, u32)>,
     /// `pcibridge`'s placed window, the same shape and the same reason,
     /// checked by [`Self::pcibridge_target`].
     pcibridge_window: Option<(u32, u32)>,
@@ -346,7 +434,7 @@ impl<'a> MachineBus<'a> {
     /// since there is nothing to mirror.
     pub fn new(chip_ram: &'a mut [u8; CHIP_RAM_SIZE], rom: &'a [u8]) -> Self {
         Self {
-            chip_ram,
+            ram: GuestRam::new(chip_ram),
             rom,
             ext_rom: &[],
             chipset: Chipset::new(),
@@ -368,8 +456,6 @@ impl<'a> MachineBus<'a> {
             mirage_board: None,
             hostblk: None,
             hostblk_board: None,
-            fast_ram: None,
-            fast_ram_board: None,
             input: None,
             input_board: None,
             pktport: None,
@@ -378,7 +464,6 @@ impl<'a> MachineBus<'a> {
             rtg_board: None,
             pcibridge: None,
             pcibridge_board: None,
-            fast_window: None,
             pcibridge_window: None,
             overlay: true,
         }
@@ -395,7 +480,8 @@ impl<'a> MachineBus<'a> {
     /// than threading a generation counter through `AutoConfig`, keeps
     /// the cache exactly as fresh as the placement it mirrors.
     fn refresh_windows(&mut self) {
-        self.fast_window = self
+        self.ram.fast_window = self
+            .ram
             .fast_ram_board
             .and_then(|idx| self.autoconfig.placement(idx))
             .map(|p| (p.base, p.size_bytes));
@@ -406,6 +492,7 @@ impl<'a> MachineBus<'a> {
 
         debug_assert!(
             !self
+                .ram
                 .fast_window
                 .is_some_and(|(base, len)| Self::overlaps_autoconfig_window(base, len)),
             "fast RAM's placed window must never overlap AUTOCONFIG's own"
@@ -518,10 +605,10 @@ impl<'a> MachineBus<'a> {
     /// real buffer simply reads open bus / discards writes, same as an
     /// undersized VRAM backing store (`fastram` module docs).
     pub fn with_fast_ram(mut self, mem: &'a mut [u8]) -> Self {
-        self.fast_ram_board = self
+        self.ram.fast_ram_board = self
             .autoconfig
             .add_board(fastram::autoconfig_board_spec(mem.len() as u32));
-        self.fast_ram = Some(mem);
+        self.ram.fast_ram = Some(mem);
         // Not yet placed (that happens later, through a guest AUTOCONFIG
         // write) so this is a no-op today, but keeps `fast_window` in
         // sync with `fast_ram_board` at every mutation site rather than
@@ -859,20 +946,17 @@ impl<'a> MachineBus<'a> {
             // grain here, and why this may run entirely independently of
             // MIRAGE (both coexist).
             //
-            // The card is lifted out of its `Option` for the call
-            // because it needs a `&mut dyn GuestMemory` view of the
-            // whole bus -- it asks which addresses are RAM rather than
-            // assuming a range, so it can reach fast RAM as well as chip
-            // RAM. `self` cannot be borrowed mutably while
-            // `self.hostblk` is, so the card stops occupying one of
-            // those borrows for the duration and is put straight back.
-            // Nothing observes the gap: `tick` is not re-entrant and no
-            // bus access happens inside it.
-            if let Some(mut h) = self.hostblk.take() {
-                h.tick(self);
-                let pending = h.irq_pending();
-                self.hostblk = Some(h);
-                if pending {
+            // Needs a `&mut dyn GuestMemory` view of guest RAM (it asks
+            // which addresses are RAM rather than assuming a range, so
+            // it can reach fast RAM as well as chip RAM) -- `&mut
+            // self.ram` and `&mut self.hostblk` are two different
+            // fields, so the compiler accepts both borrows at once with
+            // no `Option::take()`/put-back dance (`GuestRam`'s own doc
+            // comment on why that dance existed before this field
+            // split).
+            if let Some(h) = &mut self.hostblk {
+                h.tick(&mut self.ram);
+                if h.irq_pending() {
                     self.chipset.raise_int(chipset::intbit::PORTS);
                 }
             }
@@ -880,15 +964,13 @@ impl<'a> MachineBus<'a> {
             // `pktport`'s engine advances the same way, one request per
             // call: see `pktport`'s module docs, "One outstanding
             // request" -- with capacity 1 there is never more than a
-            // single request to service, but the shape (lift out of the
-            // `Option` for a `&mut dyn GuestMemory` view of the whole
-            // bus, put it straight back) is identical to `hostblk`'s,
-            // for the identical reason.
-            if let Some(mut p) = self.pktport.take() {
-                p.tick(self);
-                let pending = p.irq_pending();
-                self.pktport = Some(p);
-                if pending {
+            // single request to service, but the shape (a `&mut
+            // dyn GuestMemory` view of `self.ram`, borrowed disjointly
+            // from `self.pktport`) is identical to `hostblk`'s, for the
+            // identical reason.
+            if let Some(p) = &mut self.pktport {
+                p.tick(&mut self.ram);
+                if p.irq_pending() {
                     self.chipset.raise_int(chipset::intbit::PORTS);
                 }
             }
@@ -896,20 +978,17 @@ impl<'a> MachineBus<'a> {
             // `pcibridge`'s own register file has no engine to advance
             // (config cycles stay synchronous, module docs), but ADR
             // 0005 stage 3's virtio-net function behind it does: its
-            // virtqueues need a `&mut dyn GuestMemory` view of the whole
-            // bus to walk, exactly the reason `hostblk`/`pktport` lift
-            // themselves out of their own `Option` above. Ticking it
-            // here is also what keeps the `INTx` poll below honest:
-            // unlike every register-file write path, a used buffer added
-            // by this tick can raise the card's `INTx` line with no
+            // virtqueues need the same `&mut dyn GuestMemory` view of
+            // `self.ram` `hostblk`/`pktport` take above. Ticking it here
+            // is also what keeps the `INTx` poll below honest: unlike
+            // every register-file write path, a used buffer added by
+            // this tick can raise the card's `INTx` line with no
             // register write involved at all, the same reason
             // Graffity's card is polled here rather than only checked
             // after a write.
-            if let Some(mut dev) = self.pcibridge.take() {
-                dev.tick(self);
-                let pending = dev.irq_pending();
-                self.pcibridge = Some(dev);
-                if pending {
+            if let Some(dev) = &mut self.pcibridge {
+                dev.tick(&mut self.ram);
+                if dev.irq_pending() {
                     self.chipset.raise_int(chipset::intbit::PORTS);
                 }
             }
@@ -977,11 +1056,11 @@ impl<'a> MachineBus<'a> {
         if (CHIP_RAM_BASE..CHIP_RAM_END).contains(&address)
             && !(self.overlay && address < OVERLAY_END)
         {
-            return Some((&self.chip_ram[..], (address - CHIP_RAM_BASE) as usize));
+            return Some((&self.ram.chip_ram[..], (address - CHIP_RAM_BASE) as usize));
         }
-        if let Some((base, len)) = self.fast_window {
+        if let Some((base, len)) = self.ram.fast_window {
             if address >= base && address - base < len {
-                let mem = self.fast_ram.as_deref()?;
+                let mem = self.ram.fast_ram.as_deref()?;
                 return Some((mem, (address - base) as usize));
             }
         }
@@ -999,11 +1078,14 @@ impl<'a> MachineBus<'a> {
     /// is never covered here; it has nothing to write to.
     fn fast_region_mut(&mut self, address: u32) -> Option<(&mut [u8], usize)> {
         if (CHIP_RAM_BASE..CHIP_RAM_END).contains(&address) {
-            return Some((&mut self.chip_ram[..], (address - CHIP_RAM_BASE) as usize));
+            return Some((
+                &mut self.ram.chip_ram[..],
+                (address - CHIP_RAM_BASE) as usize,
+            ));
         }
-        if let Some((base, len)) = self.fast_window {
+        if let Some((base, len)) = self.ram.fast_window {
             if address >= base && address - base < len {
-                let mem = self.fast_ram.as_deref_mut()?;
+                let mem = self.ram.fast_ram.as_deref_mut()?;
                 return Some((mem, (address - base) as usize));
             }
         }
@@ -1025,7 +1107,7 @@ impl<'a> MachineBus<'a> {
         }
 
         if (CHIP_RAM_BASE..CHIP_RAM_END).contains(&address) {
-            self.chip_ram[(address - CHIP_RAM_BASE) as usize]
+            self.ram.chip_ram[(address - CHIP_RAM_BASE) as usize]
         } else if AutoConfig::responds_to(address) {
             self.autoconfig.read(address)
         } else if (CIA_BASE..CIA_END).contains(&address) {
@@ -1086,8 +1168,8 @@ impl<'a> MachineBus<'a> {
                     }
                     None => OPEN_BUS_BYTE,
                 }
-            } else if Some(idx) == self.fast_ram_board {
-                match &self.fast_ram {
+            } else if Some(idx) == self.ram.fast_ram_board {
+                match &self.ram.fast_ram {
                     Some(mem) => mem.get(offset as usize).copied().unwrap_or(OPEN_BUS_BYTE),
                     None => OPEN_BUS_BYTE,
                 }
@@ -1297,7 +1379,7 @@ impl<'a> MachineBus<'a> {
     /// Run an armed blit to completion and raise the blitter-finished
     /// interrupt. Synchronous by design — see [`blitter`]'s module docs.
     fn run_blitter(&mut self) {
-        if self.blitter.execute(self.chip_ram) {
+        if self.blitter.execute(self.ram.chip_ram) {
             self.chipset.raise_int(chipset::intbit::BLIT);
         }
     }
@@ -1380,7 +1462,7 @@ impl<'a> MachineBus<'a> {
         // write to and the OS relies on being able to build its vector
         // table at $000000 before clearing OVL.
         if (CHIP_RAM_BASE..CHIP_RAM_END).contains(&address) {
-            self.chip_ram[(address - CHIP_RAM_BASE) as usize] = value;
+            self.ram.chip_ram[(address - CHIP_RAM_BASE) as usize] = value;
         } else if AutoConfig::responds_to(address) {
             self.autoconfig.write(address, value);
             // The one AUTOCONFIG mutation site `docs/bus-fast-path-plan.md`
@@ -1418,8 +1500,8 @@ impl<'a> MachineBus<'a> {
                         self.chipset.raise_int(chipset::intbit::PORTS);
                     }
                 }
-            } else if Some(idx) == self.fast_ram_board {
-                if let Some(mem) = &mut self.fast_ram {
+            } else if Some(idx) == self.ram.fast_ram_board {
+                if let Some(mem) = &mut self.ram.fast_ram {
                     if let Some(slot) = mem.get_mut(offset as usize) {
                         *slot = value;
                     }
@@ -1564,57 +1646,20 @@ impl<'a> MachineBus<'a> {
         self.write_word(address, (value >> 16) as u16);
         self.write_word(address.wrapping_add(2), value as u16);
     }
-
-    /// `[addr, addr + len)`'s position within chip RAM, if it lies
-    /// entirely inside it. Shared by both [`GuestMemory`] methods below.
-    fn chip_ram_span(&self, addr: u32, len: u32) -> Option<core::ops::Range<usize>> {
-        let end = addr.checked_add(len)?;
-        if end > CHIP_RAM_END {
-            return None;
-        }
-        let start = (addr - CHIP_RAM_BASE) as usize;
-        Some(start..start + len as usize)
-    }
-
-    /// `[addr, addr + len)`'s position within fast RAM's *real* backing
-    /// store, if fast RAM is attached, configured, and the whole span
-    /// lies inside both its declared AUTOCONFIG window and the actual
-    /// buffer a board layer supplied (which may be shorter than the
-    /// window -- `with_fast_ram`'s doc comment). The AUTOCONFIG base is
-    /// never assumed here: it comes from `self.autoconfig.placement`,
-    /// wherever `expansion.library` actually put it.
-    fn fast_ram_span(&self, addr: u32, len: u32) -> Option<core::ops::Range<usize>> {
-        let idx = self.fast_ram_board?;
-        let placement = self.autoconfig.placement(idx)?;
-        let end = addr.checked_add(len)?;
-        if addr < placement.base || end > placement.base.checked_add(placement.size_bytes)? {
-            return None;
-        }
-        let start = (addr - placement.base) as usize;
-        let end = start + len as usize;
-        (end <= self.fast_ram.as_ref()?.len()).then_some(start..end)
-    }
 }
 
+/// Delegates straight to [`GuestRam`] -- `machine-hosted`'s
+/// `screenshot.rs`/`introspect.rs`/`pktvol.rs` (and anything else that
+/// just wants "is this a RAM address") keep calling this on
+/// [`MachineBus`] unchanged; see [`GuestRam`]'s own doc comment for why
+/// RAM moved to its own field.
 impl<'a> GuestMemory for MachineBus<'a> {
     fn ram_slice(&self, addr: u32, len: u32) -> Option<&[u8]> {
-        if let Some(span) = self.chip_ram_span(addr, len) {
-            return Some(&self.chip_ram[span]);
-        }
-        if let Some(span) = self.fast_ram_span(addr, len) {
-            return Some(&self.fast_ram.as_ref()?[span]);
-        }
-        None
+        self.ram.ram_slice(addr, len)
     }
 
     fn ram_slice_mut(&mut self, addr: u32, len: u32) -> Option<&mut [u8]> {
-        if let Some(span) = self.chip_ram_span(addr, len) {
-            return Some(&mut self.chip_ram[span]);
-        }
-        if let Some(span) = self.fast_ram_span(addr, len) {
-            return Some(&mut self.fast_ram.as_mut()?[span]);
-        }
-        None
+        self.ram.ram_slice_mut(addr, len)
     }
 }
 
@@ -2486,7 +2531,7 @@ mod tests {
         let rom = [0u8; ROM_WINDOW_SIZE];
         let bus = new_bus(&mut ram, &rom);
 
-        assert_eq!(bus.fast_ram_board, None);
+        assert_eq!(bus.ram.fast_ram_board, None);
         assert_eq!(bus.autoconfig.board_at(0x4000_0000), None);
     }
 
@@ -2497,7 +2542,7 @@ mod tests {
         let mut fast = std::vec![0u8; 0x0100_0000]; // 16 MB
         let mut bus = new_bus(&mut ram, &rom).with_fast_ram(&mut fast);
 
-        assert_eq!(bus.fast_ram_board, Some(0));
+        assert_eq!(bus.ram.fast_ram_board, Some(0));
         assert_eq!(
             bus.autoconfig.read(autoconfig::AUTOCONFIG_BASE + 4) >> 4,
             !fastram::PRODUCT >> 4,
@@ -2559,7 +2604,7 @@ mod tests {
 
         // Fast RAM is chain index 0 (registered first), Graffity's VRAM
         // and register boards are indices 1 and 2.
-        assert_eq!(bus.fast_ram_board, Some(0));
+        assert_eq!(bus.ram.fast_ram_board, Some(0));
 
         // Configure fast RAM's Z3 window, then Graffity's two Z2 boards,
         // exactly as `expansion.library` would walk the chain in order.
@@ -3028,7 +3073,7 @@ mod tests {
                 bus.input_board_base(),
                 bus.rtgboard_base(),
                 bus.autoconfig
-                    .placement(bus.fast_ram_board.expect("fast RAM registered"))
+                    .placement(bus.ram.fast_ram_board.expect("fast RAM registered"))
                     .map(|p| p.base),
                 bus.pktport_board_base(),
             )
@@ -3076,7 +3121,7 @@ mod tests {
         assert_eq!(bus.rtgboard_base(), bases_without_pcibridge.2);
         assert_eq!(
             bus.autoconfig
-                .placement(bus.fast_ram_board.expect("fast RAM registered"))
+                .placement(bus.ram.fast_ram_board.expect("fast RAM registered"))
                 .map(|p| p.base),
             bases_without_pcibridge.3
         );
@@ -3542,7 +3587,7 @@ mod tests {
         let mut fast = std::vec![0xAAu8; fastram::MIN_SIZE_BYTES as usize];
         let mut bus = new_bus(&mut ram, &rom).with_fast_ram(&mut fast);
 
-        assert_eq!(bus.fast_window, None, "not yet placed");
+        assert_eq!(bus.ram.fast_window, None, "not yet placed");
         let base = 0x4000_0000u32;
         assert_eq!(
             bus.fast_region(base),
@@ -3553,7 +3598,7 @@ mod tests {
 
         configure_hostblk_z3(&mut bus, base);
 
-        assert_eq!(bus.fast_window, Some((base, fastram::MIN_SIZE_BYTES)));
+        assert_eq!(bus.ram.fast_window, Some((base, fastram::MIN_SIZE_BYTES)));
         assert!(
             bus.fast_region(base).is_some(),
             "the fast path now answers for the placed window"
