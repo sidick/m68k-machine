@@ -277,3 +277,5 @@ makes them true.
 |---|---|---|---|
 | baseline | 12.27 s (11.1 MIPS) | 8.67 s (10.2 MIPS) | §0 profile |
 | 2 LTO | 11.025 s (12.4 MIPS) | 8.065 s (11.0 MIPS) | landed; `cargo build --release -p machine-hosted`, `--no-build` bench |
+| 3 bus fast path, before (this tree, no LTO) | 11.756 s (11.6 MIPS) | 8.390 s (10.5 MIPS) | matches §0 within noise on this machine |
+| 3 bus fast path, after | 6.566 s (20.8 MIPS) | 5.805 s (15.2 MIPS) | `read_byte`+`board_at`+`*_target` self time: 0.84%/0% bare, 0.94%/0% full -- both under the 10% done criterion, `board_at`/`*_target` no longer appear in either profile's top 30 at all |
