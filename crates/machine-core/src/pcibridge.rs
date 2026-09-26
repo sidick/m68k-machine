@@ -507,10 +507,11 @@ impl<'a> PciBridge<'a> {
     /// stage 3's virtio-net ring processing, forwarded straight through
     /// (module docs on [`PciBackend::tick`]). `pcibridge` itself has no
     /// engine of its own (config cycles stay synchronous, module docs),
-    /// so this is pure delegation; [`crate::MachineBus::tick`] drives it,
-    /// once per raster line it crosses rather than once per call to it,
-    /// with the same lift-out-of-the-`Option`, call, put-back dance
-    /// `hostblk`/`pktport`'s own engines use.
+    /// so this is pure delegation; [`crate::MachineBus::tick`] drives it
+    /// once per call, not batched to once per raster line the way
+    /// MIRAGE's engine is -- measured, not assumed
+    /// (`MachineBus::tick`'s own doc comment): a real guest's virtio-net
+    /// loopback poll window does not tolerate the added latency.
     pub fn tick(&mut self, mem: &mut dyn crate::GuestMemory) {
         self.backend.tick(mem);
     }

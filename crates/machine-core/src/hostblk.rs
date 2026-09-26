@@ -89,11 +89,13 @@
 //! of guest memory yet, since that memory access isn't needed until a
 //! request is actually executed. All of the work — reading the
 //! descriptor, validating it, moving data, calling the [`BlockDevice`]
-//! — happens in [`Hostblk::tick`], called once per raster line
-//! [`crate::MachineBus::tick`] crosses (not once per call to it — one
-//! line's latency, ~908 CPU clocks, is invisible to the guest) the same
-//! way [`crate::mirage::Mirage::tick`] is. `tick` executes **at most
-//! one** submission per call (see "The
+//! — happens in [`Hostblk::tick`], called once per
+//! [`crate::MachineBus::tick`] the same way [`crate::mirage::Mirage::tick`]
+//! is -- unlike MIRAGE's own engine, this one is **not** batched to once
+//! per raster line: measured, not assumed (`MachineBus::tick`'s own
+//! doc comment on the call site), gating it that way reliably wedges a
+//! real Kickstart 3.2.2 boot before it ever reaches Startup-Sequence.
+//! `tick` executes **at most one** submission per call (see "The
 //! transfer engine" below for why doing the whole thing per tick, rather
 //! than one sector, is the right grain here) — so with `N` requests
 //! queued, the `N`th one completes on the `N`th tick at the earliest,

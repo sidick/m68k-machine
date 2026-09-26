@@ -184,12 +184,12 @@ synchronously at all. `DOORBELL`'s write handler only pushes a raw
 pointer onto an in-host submission ring — it does not even read the
 descriptor yet. All real work (reading the descriptor, validating it,
 moving data, calling the `BlockDevice`) happens in `Hostblk::tick`,
-called once per raster line `MachineBus::tick` crosses -- not once per
-call to it; one line's latency (~908 CPU clocks) is invisible to the
-guest, the same grain the STOP-path resync already ticks in -- which
-executes **at most one** submission per call. With `N` requests queued,
-the `N`th completes on the `N`th *line* at the earliest, not the `N`th
-call to `MachineBus::tick`.
+called once per `MachineBus::tick`, which executes **at most one**
+submission per call. With `N` requests queued, the `N`th completes on
+the `N`th tick at the earliest. Unlike MIRAGE's engine, this one is
+**not** batched to once per raster line -- measured, not assumed
+(`MachineBus::tick`'s own doc comment): gating it that way reliably
+wedges a real Kickstart 3.2.2 boot before Startup-Sequence ever runs.
 
 INT2 is checked on both the read and the write path in `lib.rs`'s
 routing (mirroring `gayle.rs`'s hard-won lesson: a device whose state

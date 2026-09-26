@@ -284,10 +284,13 @@ map. `INTX_ENABLE` is the mask a driver sets (`Prm_AddIntServer`,
 computed fresh on every call — `MachineBus` polls it after every
 register write that could change the answer (`INTX_ENABLE`/`INTX_TEST`
 writes, and, indirectly, a config-cycle write that changes a device's
-own asserted state) and once per raster line the host tick crosses
-besides (not once per host tick call — one line's latency is invisible
-to the guest), because `PciBackend::intx_levels()` can change with no
-register write at all --
+own asserted state) and once per host tick besides, because
+`PciBackend::intx_levels()` can change with no register write at all --
+this is deliberately *not* batched to once per raster line the way
+MIRAGE's own engine is: measured, not assumed
+(`crates/machine-core/src/lib.rs`'s `MachineBus::tick` doc comment), a
+real guest's virtio-net loopback poll window does not tolerate the
+added latency --
 **stage 3's virtio-net ISR now does exactly that**, raising/lowering it
 from its own function logic (`docs/virtionet.md`). The chipset's own
 shared `INT2` (`PORTS`) latch is unaffected by this liveness, though:
