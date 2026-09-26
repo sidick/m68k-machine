@@ -73,8 +73,8 @@
 //! The design that actually works combines both drafts' partial insight
 //! without either failure mode: make a delivery attempt, then go
 //! completely quiet (no delivery offered at all, `poll_receive` returns
-//! `None`) for [`REPLY_ATTEMPT_COOLDOWN_POLLS`] calls before trying
-//! again, for at most [`REPLY_MAX_ATTEMPTS`] attempts total. Each
+//! `None`) for [`REPLY_ATTEMPT_COOLDOWN_FRAMES`] guest frames before
+//! trying again, for at most [`REPLY_MAX_ATTEMPTS`] attempts total. Each
 //! attempt that lands in the no-reader window costs the driver exactly
 //! one drop-and-repost -- bounded, not self-perpetuating, because
 //! nothing new is offered again until the next attempt's own cooldown
@@ -84,6 +84,19 @@
 //! attempts across a wide span of ticks makes this self-correcting
 //! against however long that actually takes, the same spirit as the
 //! rejected "keep offering" draft, without its unbounded refill.
+//!
+//! # Why the cooldown is counted in guest frames, not `poll_receive` calls
+//!
+//! It used to be counted in calls (500,000 of them). `process_rx` calls
+//! `poll_receive` once per `MachineBus::tick`, so that only meant "a few
+//! frames" while the bus ticked the card after every instruction. Once
+//! `MachineBus::tick` ran the card once per raster line
+//! (`docs/bus-fast-path-plan.md` step 4.1), the same count became
+//! 500,000 lines, about 1,600 frames per cooldown, past the real-ROM
+//! test's own frame budget: the harness, not the device, made the test
+//! fail. [`HarnessNetBackend::new`] now takes a guest frame clock that
+//! `run.rs` advances from `chipset.frames`, so the spacing is guest time
+//! whatever the tick grain is.
 //!
 //! # Why a shared log, not a plain field
 //!
@@ -99,7 +112,7 @@
 //! read after the run even while the backend proper is still borrowed
 //! deep inside `pcibridge`'s trait-object chain.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use machine_core::pci::{NetBackend, VirtioNetStub};
@@ -168,21 +181,20 @@ impl NetHarnessLog {
     }
 }
 
-/// Gap between delivery attempts (module doc comment), counted in
-/// [`NetBackend::poll_receive`] calls -- `process_rx` calls it once per
-/// tick for as long as the guest has any rx descriptor available, which
-/// is true continuously from `post_rx_buffers` at `DevInit` onward, so
-/// this counter advances at the same steady rate the whole run already
-/// exercises. Far longer than any plausible stretch of interrupt
-/// servicing (confirmed empirically: a stretch as long as 5000 calls was
-/// still sometimes inside one), short enough that even
-/// [`REPLY_MAX_ATTEMPTS`] full cooldowns stay a small fraction of this
-/// test's own instruction budget.
-const REPLY_ATTEMPT_COOLDOWN_POLLS: u32 = 500_000;
+/// Gap between delivery attempts (module doc comment), in guest frames
+/// of the clock passed to [`HarnessNetBackend::new`] (module doc comment,
+/// "Why the cooldown is counted in guest frames"). 5 PAL frames is 100 ms
+/// of guest time, far longer than any plausible stretch of interrupt
+/// servicing (the longest one observed was under 5,000 instructions,
+/// about a twentieth of a frame at this machine's rate) and about what
+/// the old 500,000-call count came to when the card was ticked per
+/// instruction. [`REPLY_MAX_ATTEMPTS`] full cooldowns are 25 frames,
+/// a small fraction of the real-ROM test's 3,000-frame budget.
+const REPLY_ATTEMPT_COOLDOWN_FRAMES: u64 = 5;
 
 /// How many separated attempts (module doc comment) this backend makes
 /// before giving up silently. Five cooldowns spread the attempts across
-/// 2.5 million ticks -- generous head room over the handful of attempts
+/// 25 guest frames -- generous head room over the handful of attempts
 /// this backend has ever actually needed in practice, while still
 /// bounded (never an unconditional "keep offering").
 const REPLY_MAX_ATTEMPTS: u32 = 5;
@@ -195,7 +207,8 @@ const REPLY_MAX_ATTEMPTS: u32 = 5;
 enum ReplyState {
     Idle,
     Cooldown {
-        polls_remaining: u32,
+        /// The guest frame at or after which the next attempt is made.
+        due_frame: u64,
         attempts_left: u32,
     },
     GaveUp,
@@ -206,16 +219,26 @@ enum ReplyState {
 pub struct HarnessNetBackend {
     log: Rc<RefCell<NetHarnessLog>>,
     reply: ReplyState,
+    frames: Rc<Cell<u64>>,
 }
 
 impl HarnessNetBackend {
     /// Build a backend writing into `log` -- `run.rs` keeps its own clone
     /// of the same `Rc` for reporting after the run (module doc comment).
-    pub fn new(log: Rc<RefCell<NetHarnessLog>>) -> Self {
+    /// `frames` is the guest frame count, which `run.rs` keeps current
+    /// from `chipset.frames`; the reply cooldown is measured against it.
+    pub fn new(log: Rc<RefCell<NetHarnessLog>>, frames: Rc<Cell<u64>>) -> Self {
         Self {
             log,
             reply: ReplyState::Idle,
+            frames,
         }
+    }
+
+    fn next_due(&self) -> u64 {
+        self.frames
+            .get()
+            .saturating_add(REPLY_ATTEMPT_COOLDOWN_FRAMES)
     }
 }
 
@@ -228,26 +251,22 @@ impl NetBackend for HarnessNetBackend {
         // a fresh one.
         if let ReplyState::Idle = self.reply {
             self.reply = ReplyState::Cooldown {
-                polls_remaining: REPLY_ATTEMPT_COOLDOWN_POLLS,
+                due_frame: self.next_due(),
                 attempts_left: REPLY_MAX_ATTEMPTS,
             };
         }
     }
 
     fn poll_receive(&mut self, buf: &mut [u8]) -> Option<usize> {
-        match &mut self.reply {
+        let now = self.frames.get();
+        match self.reply {
             ReplyState::Idle | ReplyState::GaveUp => None,
-            ReplyState::Cooldown {
-                polls_remaining, ..
-            } if *polls_remaining > 0 => {
-                *polls_remaining -= 1;
-                None
-            }
+            ReplyState::Cooldown { due_frame, .. } if now < due_frame => None,
             ReplyState::Cooldown { attempts_left, .. } => {
-                let attempts_left = *attempts_left - 1;
+                let attempts_left = attempts_left - 1;
                 self.reply = if attempts_left > 0 {
                     ReplyState::Cooldown {
-                        polls_remaining: REPLY_ATTEMPT_COOLDOWN_POLLS,
+                        due_frame: self.next_due(),
                         attempts_left,
                     }
                 } else {
@@ -272,10 +291,16 @@ impl NetBackend for HarnessNetBackend {
 mod tests {
     use super::*;
 
+    fn backend() -> (HarnessNetBackend, Rc<RefCell<NetHarnessLog>>, Rc<Cell<u64>>) {
+        let log = Rc::new(RefCell::new(NetHarnessLog::default()));
+        let frames = Rc::new(Cell::new(0));
+        let backend = HarnessNetBackend::new(Rc::clone(&log), Rc::clone(&frames));
+        (backend, log, frames)
+    }
+
     #[test]
     fn records_transmitted_frames_verbatim_and_in_order() {
-        let log = Rc::new(RefCell::new(NetHarnessLog::default()));
-        let mut backend = HarnessNetBackend::new(Rc::clone(&log));
+        let (mut backend, log, _) = backend();
 
         backend.transmit(&[1, 2, 3]);
         backend.transmit(&[4, 5]);
@@ -285,11 +310,20 @@ mod tests {
     }
 
     /// Run `backend` through one cooldown-then-attempt cycle, asserting
-    /// every cooldown poll returns `None` and the attempt itself returns
-    /// `Some`. Returns the delivered length.
-    fn expect_one_attempt(backend: &mut HarnessNetBackend, buf: &mut [u8]) -> usize {
-        for _ in 0..REPLY_ATTEMPT_COOLDOWN_POLLS {
-            assert_eq!(backend.poll_receive(buf), None);
+    /// the cooldown stays silent however many times it is polled in
+    /// each frame (the point of counting frames rather than polls), and
+    /// that the attempt itself returns `Some`. Returns the delivered
+    /// length.
+    fn expect_one_attempt(
+        backend: &mut HarnessNetBackend,
+        frames: &Cell<u64>,
+        buf: &mut [u8],
+    ) -> usize {
+        for _ in 0..REPLY_ATTEMPT_COOLDOWN_FRAMES {
+            for _ in 0..1000 {
+                assert_eq!(backend.poll_receive(buf), None);
+            }
+            frames.set(frames.get() + 1);
         }
         backend
             .poll_receive(buf)
@@ -298,14 +332,13 @@ mod tests {
 
     #[test]
     fn delivers_nothing_before_the_first_cooldown_elapses() {
-        let log = Rc::new(RefCell::new(NetHarnessLog::default()));
-        let mut backend = HarnessNetBackend::new(log);
+        let (mut backend, _, frames) = backend();
         let mut buf = [0u8; VirtioNetStub::MAX_ETH_PAYLOAD];
 
         assert_eq!(backend.poll_receive(&mut buf), None);
 
         backend.transmit(&[0xAA]);
-        let len = expect_one_attempt(&mut backend, &mut buf);
+        let len = expect_one_attempt(&mut backend, &frames, &mut buf);
         assert_eq!(&buf[..6], &VirtioNetStub::MAC);
         assert_eq!(&buf[6..12], &REPLY_SRC_MAC);
         assert_eq!(&buf[12..14], &REPLY_ETHERTYPE);
@@ -314,19 +347,33 @@ mod tests {
 
     #[test]
     fn makes_exactly_reply_max_attempts_then_gives_up_silently() {
-        let log = Rc::new(RefCell::new(NetHarnessLog::default()));
-        let mut backend = HarnessNetBackend::new(log);
+        let (mut backend, _, frames) = backend();
         let mut buf = [0u8; VirtioNetStub::MAX_ETH_PAYLOAD];
 
         backend.transmit(&[1]);
         backend.transmit(&[2]); // a second transmit does not reset the budget
 
         for _ in 0..REPLY_MAX_ATTEMPTS {
-            expect_one_attempt(&mut backend, &mut buf);
+            expect_one_attempt(&mut backend, &frames, &mut buf);
         }
 
         // Budget exhausted: no further attempt, ever, however long polled.
-        for _ in 0..(REPLY_ATTEMPT_COOLDOWN_POLLS * 2) {
+        for _ in 0..(REPLY_ATTEMPT_COOLDOWN_FRAMES * 4) {
+            frames.set(frames.get() + 1);
+            assert_eq!(backend.poll_receive(&mut buf), None);
+        }
+    }
+
+    #[test]
+    fn exactly_one_attempt_per_elapsed_cooldown_however_often_polled() {
+        let (mut backend, _, frames) = backend();
+        let mut buf = [0u8; VirtioNetStub::MAX_ETH_PAYLOAD];
+
+        backend.transmit(&[1]);
+        frames.set(REPLY_ATTEMPT_COOLDOWN_FRAMES);
+        assert!(backend.poll_receive(&mut buf).is_some());
+        // Same frame, polled again: the next cooldown has only just begun.
+        for _ in 0..1000 {
             assert_eq!(backend.poll_receive(&mut buf), None);
         }
     }

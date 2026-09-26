@@ -380,8 +380,14 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     let net_harness_log = std::rc::Rc::new(std::cell::RefCell::new(
         crate::netharness::NetHarnessLog::default(),
     ));
-    let mut pcibridge_net_backend =
-        crate::netharness::HarnessNetBackend::new(std::rc::Rc::clone(&net_harness_log));
+    // The harness's reply cooldown is measured in guest frames, not in
+    // `poll_receive` calls (`netharness.rs`'s module docs): `run_guest`
+    // keeps this current from `chipset.frames`.
+    let guest_frames = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    let mut pcibridge_net_backend = crate::netharness::HarnessNetBackend::new(
+        std::rc::Rc::clone(&net_harness_log),
+        std::rc::Rc::clone(&guest_frames),
+    );
     let mut pcibridge_netstub = pci::VirtioNetStub::new(&mut pcibridge_net_backend);
     let mut pcibridge_slots = [
         pci::VirtualSlot {
@@ -610,6 +616,7 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         serial_script.as_mut(),
         input_script.as_mut(),
         serial_tcp.as_ref(),
+        &guest_frames,
     );
 
     if let Some(script) = &serial_script {
@@ -669,6 +676,7 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     report
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_guest(
     args: &Args,
     console: &mut Console,
@@ -677,6 +685,7 @@ fn run_guest(
     mut serial_script: Option<&mut SerialScript>,
     mut input_script: Option<&mut InputScript>,
     serial_tcp: Option<&SerialTcpBridge>,
+    guest_frames: &std::cell::Cell<u64>,
 ) -> Report {
     let mut total_instructions: u64 = 0;
     let mut last_progress_frame: u64 = 0;
@@ -713,7 +722,9 @@ fn run_guest(
     // "nothing to do yet" check, but on a normal run `frames` is
     // unchanged on the overwhelming majority of calls (many instructions
     // per frame), so skipping the call outright when it hasn't changed
-    // avoids paying even that check every retired instruction.
+    // avoids paying even that check every retired instruction. The
+    // same once-per-frame branch keeps `guest_frames` (the net
+    // harness's clock) current.
     let mut screenshot_last_frame: Option<u64> = None;
 
     let outcome = 'outer: loop {
@@ -826,6 +837,7 @@ fn run_guest(
             // see `screenshot_last_frame`'s own doc comment.
             if screenshot_last_frame != Some(frames) {
                 screenshot_last_frame = Some(frames);
+                guest_frames.set(frames);
                 if let Some(job) = screenshot_job.as_mut() {
                     job.maybe_capture(frames, args.max_frames, &mut bus.0, console);
                 }
@@ -945,6 +957,7 @@ fn run_guest(
                 let frames = bus.0.chipset.frames;
                 if screenshot_last_frame != Some(frames) {
                     screenshot_last_frame = Some(frames);
+                    guest_frames.set(frames);
                     if let Some(job) = screenshot_job.as_mut() {
                         job.maybe_capture(frames, args.max_frames, &mut bus.0, console);
                     }

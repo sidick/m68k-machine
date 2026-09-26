@@ -182,9 +182,16 @@ one drop-and-repost — bounded, not self-perpetuating, because nothing
 new is offered again until the next attempt's own cooldown elapses. The
 cooldown is far longer than any plausible stretch of interrupt
 servicing, so by the next attempt the guest is certainly back at task
-level; spreading a handful of attempts across a wide span of ticks makes
-this self-correcting against however long that actually takes, without
-the unbounded refill that broke the "keep offering" draft.
+level; spreading a handful of attempts across a wide span of guest time
+makes this self-correcting against however long that actually takes,
+without the unbounded refill that broke the "keep offering" draft.
+
+The cooldown is counted in guest frames (5 per attempt), from a frame
+clock `run.rs` feeds the harness. It used to be 500,000 `poll_receive`
+calls, which only meant a few frames while `MachineBus::tick` ran the
+rings after every instruction; once they ran once per raster line, the
+same count was ~1,600 frames per cooldown and the real-ROM test ran out
+of budget before the first attempt.
 
 **A genuine guest-side bug this chase surfaced.** With every backend
 design above, `C:VNetTest`'s `CMD_READ` step reported a spurious `PASS`
