@@ -214,6 +214,21 @@ break happened at poll iteration `0`, `ln_Type == NT_REPLYMSG`,
 `io_Flags == 0`, i.e. not even `IOF_QUICK`) before the fix, and a correct
 match (real ethertype and payload) after it.
 
+That diagnosis put the fix on the wrong side. `SendIO` calls `BeginIO`
+synchronously, so the first `CheckIO` does run after the driver has
+seen the request. The driver never marked the request active, though,
+so the stale `NT_REPLYMSG` was still there. `hostblk.device` had the
+same bug and it wedged a Kickstart boot (`docs/hostblk-protocol.md`).
+The rule both drivers now follow: **`BeginIO` sets `ln_Type =
+NT_MESSAGE` on entry, before any ring work** (Autodocs/exec.doc
+"DoIO", IMPLEMENTATION: active requests have type `NT_MESSAGE`).
+`VNetBeginIO` does this as its first statement. `vnettest.c`'s reset and
+the matching one in SanaConform are still there, but they are no
+longer needed. A scratch `VNetTest` built without its reset showed the
+difference. Against the old driver it printed the spurious `ethertype
+$0000` "PASS" and the real-ROM test failed. Against the fixed driver
+it received the real `$88B5` reply and the test passed.
+
 **A real tap/socket backend is deliberately deferred.** This increment's
 brief was host-side virtqueue processing, the seam trait, and a
 first-packet proof — not a host network path. `HarnessNetBackend` proves

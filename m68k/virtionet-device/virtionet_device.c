@@ -979,6 +979,19 @@ static void VNetBeginIO(struct IOSana2Req *io __asm("a1"),
 {
     struct VNetUnit *unit = (struct VNetUnit *)io->ios2_Req.io_Unit;
 
+    /* Mark the request active before anything else, in particular before
+     * cmd_read/cmd_write can put it on a ring. exec's WaitIO/CheckIO (and
+     * DoIO's inline WaitIO) take ln_Type == NT_REPLYMSG to mean "finished",
+     * and ReplyMsg leaves NT_REPLYMSG on the node afterwards, so a client
+     * that reuses one IORequest would otherwise see every resubmission as
+     * already complete (Autodocs/exec.doc "DoIO", IMPLEMENTATION: "Active
+     * requests have type NT_MESSAGE"). Same rule, and the trace that found
+     * it, as hostblk.device's dev_beginio (m68k/hostblk-rom/
+     * hostblk-diagrom.s). Harmless for the synchronous commands: an
+     * IOF_QUICK caller never looks at ln_Type, and TermIO's ReplyMsg sets
+     * NT_REPLYMSG itself. */
+    io->ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
+
     io->ios2_Req.io_Error = 0;
     io->ios2_WireError = 0;
 
