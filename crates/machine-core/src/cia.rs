@@ -393,9 +393,44 @@ impl Cia {
     /// Advance timers and the keyboard serial handshake by whole E-clock
     /// ticks. TOD is not driven from here; see `tod_tick`.
     fn tick_eclock(&mut self, ticks: u32) {
+        if self.is_idle() {
+            // Neither timer running, and the keyboard has nothing queued
+            // or mid-handshake: every iteration of the loop below would
+            // be a no-op (see `is_idle`'s doc comment for exactly why),
+            // so skip it rather than spend `ticks` iterations proving
+            // that. A guest that never programs a timer or plugs in a
+            // keyboard event (the overwhelming majority of ticks once a
+            // one-shot delay has already fired and cleared START) pays
+            // nothing here.
+            return;
+        }
         for _ in 0..ticks {
             self.tick_one_eclock();
         }
+    }
+
+    /// Whether a whole `tick_eclock` call is guaranteed to be a no-op:
+    /// neither timer started, and the keyboard has nothing queued
+    /// (`keyboard_len`) or mid-handshake (`kbd_delay`).
+    ///
+    /// Bit-identical to running the loop, not an approximation: with
+    /// `CRA_START`/`CRB_START` both clear, `tick_one_eclock`'s timer
+    /// arms are gated on those same bits and do nothing; with
+    /// `keyboard_len == 0 && kbd_delay == 0`, `tick_keyboard`'s own body
+    /// is `if kbd_delay == 0 && !kbd_loaded && keyboard_len > 0` (false)
+    /// then `if kbd_delay > 0` (false) -- a no-op regardless of
+    /// `kbd_loaded`, since a byte already sitting in `SDR` waiting for
+    /// the OS to read it advances only on that register read, never on a
+    /// tick. `keyboard_len`/`kbd_delay` are shared state (not per-CIA
+    /// behaviour), but `tick_keyboard` itself is only ever called for
+    /// CIA-A (`tick_one_eclock`'s `id == CiaId::A` guard), so this check
+    /// costs CIA-B nothing extra and is always true there once its own
+    /// timers are stopped.
+    fn is_idle(&self) -> bool {
+        self.cra & CRA_START == 0
+            && self.crb & CRB_START == 0
+            && self.keyboard_len == 0
+            && self.kbd_delay == 0
     }
 
     fn tick_one_eclock(&mut self) {
@@ -845,6 +880,76 @@ mod tests {
         }
         assert!(advance(&mut cia, 1), "underflow on the 4th tick");
         assert_eq!(cia.timer_a, 3, "reloaded from the latch");
+    }
+
+    /// Step 4.3's whole point: a CIA with both timers stopped and no
+    /// keyboard activity must come out of many E-clocks bit-identical to
+    /// one that was never ticked at all -- `tick_eclock`'s `is_idle`
+    /// early return must never be observably different from running the
+    /// loop, only faster.
+    #[test]
+    fn a_stopped_cia_ticked_for_many_eclocks_stays_bit_identical_to_an_untouched_one() {
+        let untouched = Cia::new(CiaId::A);
+        let mut ticked = Cia::new(CiaId::A);
+        assert_eq!(ticked.cra & CRA_START, 0, "both timers start stopped");
+        assert_eq!(ticked.crb & CRB_START, 0);
+
+        advance(&mut ticked, 10_000);
+
+        assert_eq!(ticked.timer_a, untouched.timer_a);
+        assert_eq!(ticked.timer_b, untouched.timer_b);
+        assert_eq!(ticked.cra, untouched.cra);
+        assert_eq!(ticked.crb, untouched.crb);
+        assert_eq!(ticked.icr_data, untouched.icr_data);
+        assert_eq!(ticked.sdr, untouched.sdr);
+        assert_eq!(
+            ticked.irq_pending(),
+            untouched.irq_pending(),
+            "no interrupt must appear from ticking alone"
+        );
+        // TOD is unaffected either way -- `tick_eclock` never drives it
+        // (`tod_tick` does, called separately from `MachineBus::tick`) --
+        // checked anyway since it is exactly the kind of field a future
+        // change to `is_idle` could start missing.
+        assert_eq!(ticked.tod, untouched.tod);
+    }
+
+    /// The early return in `tick_eclock` must not affect a *running*
+    /// timer's underflow count -- this is the same assertion as
+    /// [`timer_a_underflows_after_latch_plus_one_ticks`], kept as its own
+    /// test so step 4.3 has an explicit "still counts correctly while
+    /// active" companion to the idle test above.
+    #[test]
+    fn a_running_timer_still_underflows_at_the_right_count_after_the_idle_check() {
+        let mut cia = Cia::new(CiaId::A);
+        cia.icr_mask = 1 << icr::TA;
+        start_timer_a(&mut cia, 7, false);
+
+        for i in 0..7 {
+            assert!(!advance(&mut cia, 1), "no underflow yet at tick {i}");
+        }
+        assert!(advance(&mut cia, 1), "underflow on the 8th tick");
+        assert_eq!(cia.timer_a, 7, "reloaded from the latch");
+    }
+
+    /// The other half of step 4.3's "be careful": a keyboard handshake
+    /// already in flight must keep advancing even though both timers are
+    /// stopped -- `is_idle` must not treat a nonzero `kbd_delay`/
+    /// `keyboard_len` as idle.
+    #[test]
+    fn a_keyboard_handshake_in_flight_still_advances_with_both_timers_stopped() {
+        let mut cia = Cia::new(CiaId::A);
+        assert_eq!(cia.cra & CRA_START, 0);
+        assert_eq!(cia.crb & CRB_START, 0);
+        cia.queue_keycode(0x40);
+
+        // The handshake delay must actually elapse and load SDR, not
+        // stay parked at its initial state forever.
+        for _ in 0..KEYBOARD_HANDSHAKE_TICKS {
+            advance(&mut cia, 1);
+        }
+        assert!(cia.kbd_loaded, "the queued byte must have loaded into SDR");
+        assert_eq!(cia.read(reg::SDR), encode_keyboard_byte(0x40));
     }
 
     /// The 8520 auto-start Kickstart's timer.device depends on: with
