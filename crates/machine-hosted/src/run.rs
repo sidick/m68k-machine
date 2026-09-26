@@ -707,6 +707,14 @@ fn run_guest(
             args.screenshot_every,
         )
     });
+    // Last frame `screenshot_job.maybe_capture` was offered, shared
+    // between the hook closure below and the `Stopped` branch's own
+    // catch-up call -- `maybe_capture` already has its own cheap
+    // "nothing to do yet" check, but on a normal run `frames` is
+    // unchanged on the overwhelming majority of calls (many instructions
+    // per frame), so skipping the call outright when it hasn't changed
+    // avoids paying even that check every retired instruction.
+    let mut screenshot_last_frame: Option<u64> = None;
 
     let outcome = 'outer: loop {
         let trace = args.trace;
@@ -719,6 +727,8 @@ fn run_guest(
             bus.0.tick(cycles.max(0) as u32);
             cpu.set_irq(bus.0.pending_irq_level());
             drain_serial(bus, console, serial_tcp);
+
+            let frames = bus.0.chipset.frames;
             // Only serviced from here, not from the `Stopped` branch's own
             // catch-up tick below: this hook is guaranteed to run with the
             // CPU actively executing (never `stopped`), which is required
@@ -731,24 +741,39 @@ fn run_guest(
             // property `docs/phase0-findings.md`'s `STOP` section
             // documents -- so frame-granularity servicing here does not
             // miss frames even though it never runs while stopped.
-            service_host_serial(
-                args,
-                cpu,
-                bus,
-                console,
-                serial_script.as_deref_mut(),
-                input_script.as_deref_mut(),
-                serial_tcp,
-                &mut overlay_cleared_frame,
-                &mut last_serviced_frame,
-                &mut illegal_triggered,
-            );
+            //
+            // `service_host_serial` keeps its own `last_serviced_frame`
+            // check (needed for the STOP-path resync's own frame
+            // bookkeeping, and just cheap defence-in-depth), but checking
+            // it here too means the many-instructions-per-frame common
+            // case skips the whole call -- args, both scripts, the bridge
+            // -- rather than a function call that immediately returns.
+            if last_serviced_frame != Some(frames) {
+                service_host_serial(
+                    args,
+                    cpu,
+                    bus,
+                    console,
+                    serial_script.as_deref_mut(),
+                    input_script.as_deref_mut(),
+                    serial_tcp,
+                    &mut overlay_cleared_frame,
+                    &mut last_serviced_frame,
+                    &mut illegal_triggered,
+                );
+            }
 
             total_instructions += 1;
             let pc = cpu.ppc;
             // Feed the serial register trace (bus.rs) the PC of the next
-            // instruction to execute, so its accesses get attributed.
-            crate::bus::LAST_PC.store(cpu.pc, std::sync::atomic::Ordering::Relaxed);
+            // instruction to execute, so its accesses get attributed --
+            // but only when something could read it back: `LAST_PC` exists
+            // purely for `trace_serial`'s diagnostic output, so a plain
+            // run with `SERIAL_REG_TRACE` unset has no use for storing it
+            // on every retired instruction.
+            if bus.serial_trace_on() {
+                crate::bus::LAST_PC.store(cpu.pc, std::sync::atomic::Ordering::Relaxed);
+            }
 
             if trace {
                 let opcode = bus.0.read_word(pc);
@@ -786,7 +811,6 @@ fn run_guest(
                 return CycleBatchControl::Return;
             }
 
-            let frames = bus.0.chipset.frames;
             if frames >= last_progress_frame + PROGRESS_EVERY_FRAMES {
                 last_progress_frame = frames;
                 console.diag(&format!(
@@ -798,8 +822,13 @@ fn run_guest(
                 ));
             }
 
-            if let Some(job) = screenshot_job.as_mut() {
-                job.maybe_capture(frames, args.max_frames, &mut bus.0, console);
+            // Only offered to `maybe_capture` once per changed frame --
+            // see `screenshot_last_frame`'s own doc comment.
+            if screenshot_last_frame != Some(frames) {
+                screenshot_last_frame = Some(frames);
+                if let Some(job) = screenshot_job.as_mut() {
+                    job.maybe_capture(frames, args.max_frames, &mut bus.0, console);
+                }
             }
 
             if args.max_instructions != 0 && total_instructions >= args.max_instructions {
@@ -914,8 +943,11 @@ fn run_guest(
                 drain_serial(bus, console, serial_tcp);
 
                 let frames = bus.0.chipset.frames;
-                if let Some(job) = screenshot_job.as_mut() {
-                    job.maybe_capture(frames, args.max_frames, &mut bus.0, console);
+                if screenshot_last_frame != Some(frames) {
+                    screenshot_last_frame = Some(frames);
+                    if let Some(job) = screenshot_job.as_mut() {
+                        job.maybe_capture(frames, args.max_frames, &mut bus.0, console);
+                    }
                 }
                 if frames >= last_progress_frame + PROGRESS_EVERY_FRAMES {
                     last_progress_frame = frames;
@@ -1011,7 +1043,17 @@ fn run_guest(
 /// `take_serial_byte`), but nothing drained that buffer before this --
 /// `Console::guest_byte` existed and was already wired for exactly this,
 /// just never called.
+#[inline]
 fn drain_serial(bus: &mut Bus, console: &mut Console, serial_tcp: Option<&SerialTcpBridge>) {
+    // The overwhelming majority of calls (once per retired instruction)
+    // find nothing: guest serial writes are rare compared to instruction
+    // throughput. `has_serial_byte` is one field compare, so checking it
+    // before ever touching `console`/`serial_tcp` skips the whole drain
+    // -- including this call's own stack setup for the loop below -- on
+    // every one of those calls.
+    if !bus.0.chipset.has_serial_byte() {
+        return;
+    }
     while let Some(byte) = bus.0.chipset.take_serial_byte() {
         console.guest_byte(byte);
         // Composes with the console tee unconditionally: a connected

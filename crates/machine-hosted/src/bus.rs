@@ -56,6 +56,19 @@ fn trace_serial(enabled: bool, kind: &str, address: u32, value: u16) {
 /// it up itself.
 pub struct Bus<'a>(pub MachineBus<'a>, pub Option<BlitterTrace>, pub bool);
 
+impl Bus<'_> {
+    /// Whether `SERIAL_REG_TRACE` was set at construction (`.2`, read
+    /// once in `run.rs` rather than on every call) -- exposed as a
+    /// method so `run_guest`'s hook can skip storing
+    /// [`LAST_PC`] on every retired instruction when nothing is tracing
+    /// (`LAST_PC` exists purely to attribute [`trace_serial`]'s output,
+    /// so a plain run with no trace enabled has no use for it at all).
+    #[inline]
+    pub fn serial_trace_on(&self) -> bool {
+        self.2
+    }
+}
+
 impl AddressBus for Bus<'_> {
     fn read_byte(&mut self, address: u32) -> u8 {
         let value = self.0.read_byte(address);

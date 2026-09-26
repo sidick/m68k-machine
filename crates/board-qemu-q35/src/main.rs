@@ -470,7 +470,15 @@ impl GuestLine {
 }
 
 /// Drain any bytes the guest has written to `SERDAT` since the last call.
+#[inline]
 fn drain_serial(bus: &mut Bus, guest_line: &mut GuestLine) {
+    // Mirrors `machine-hosted`'s `run.rs::drain_serial`: guest serial
+    // writes are rare next to instruction throughput, so checking the
+    // cheap `has_serial_byte` first skips the whole drain on the
+    // overwhelming majority of per-instruction hook calls.
+    if !bus.0.chipset.has_serial_byte() {
+        return;
+    }
     while let Some(byte) = bus.0.chipset.take_serial_byte() {
         guest_line.push(byte);
     }

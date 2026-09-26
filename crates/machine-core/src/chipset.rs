@@ -359,6 +359,16 @@ impl Chipset {
         }
     }
 
+    /// Whether the guest's `SERDAT` debug channel has at least one byte
+    /// waiting -- a cheap `&self` check a caller can use to skip a drain
+    /// loop entirely on the (overwhelming majority of) calls where
+    /// nothing was written since the last drain, without needing to call
+    /// [`Self::take_serial_byte`] at all.
+    #[inline]
+    pub fn has_serial_byte(&self) -> bool {
+        self.serial_len != 0
+    }
+
     /// Take the next byte the guest wrote to `SERDAT`, oldest first, or
     /// `None` if the debug channel is empty.
     pub fn take_serial_byte(&mut self) -> Option<u8> {
