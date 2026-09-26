@@ -236,24 +236,19 @@ int main(void)
         io->ios2_DataLength = sizeof(rxBuffer);
         io->ios2_PacketType = 0; /* accept any ethertype */
 
-        /* Every prior command on this reused `io` went through DoIO
-         * (SendIO+WaitIO): WaitIO() removes the replied message from the
-         * reply port but does NOT reset io_Message.mn_Node.ln_Type back
-         * off NT_REPLYMSG -- real exec.library leaves that for whoever
-         * reuses the request next. SendIO() itself does not reset it
-         * either (it is a thin wrapper straight onto BeginIO()). This is
-         * invisible to every earlier step here because DoIO always
-         * WaitIO()s the fresh reply into existence before the next
-         * SendIO -- but this step is the first to call SendIO() and then
-         * poll CheckIO() directly (this function's own file-top comment:
-         * observational, no WaitIO). Left at NT_REPLYMSG from CMD_WRITE's
-         * own completion, the very first CheckIO() below would otherwise
-         * report "done" before virtionet.device's BeginIO ever runs --
-         * confirmed empirically (i2 == 0, stale ln_Type == NT_REPLYMSG,
-         * io_Flags == 0, i.e. not even IOF_QUICK). Resetting to
-         * NT_MESSAGE before SendIO() is what every other step here gets
-         * for free from starting each command with a properly reset
-         * request. */
+        /* Every prior command on this reused `io` went through DoIO, and
+         * ReplyMsg leaves ln_Type at NT_REPLYMSG afterwards; neither
+         * WaitIO() nor SendIO() resets it. SendIO() calls BeginIO()
+         * synchronously, so the device sees the request before the
+         * first CheckIO() below. Marking it active (NT_MESSAGE) is
+         * therefore the driver's job, and virtionet.device's BeginIO
+         * now does it (docs/virtionet.md section 6). Before that fix,
+         * this step was the first to poll CheckIO() rather than
+         * WaitIO(), and the first CheckIO() saw CMD_WRITE's stale
+         * NT_REPLYMSG and reported "done" at once (i2 == 0,
+         * io_Flags == 0). This reset is kept so the tool also behaves
+         * against a driver that lacks the fix; with the fixed driver
+         * it is redundant. */
         io->ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
 
         SendIO((struct IORequest *)io);
