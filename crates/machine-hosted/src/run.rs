@@ -527,7 +527,10 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         },
         None => None,
     };
-    let mut bus = Bus(machine_bus, blitter_trace);
+    // Read once here rather than on every bus access -- see `bus.rs`'s
+    // `Bus.2` doc comment and `docs/bus-fast-path-plan.md` §3.5.
+    let serial_trace_enabled = std::env::var_os("SERIAL_REG_TRACE").is_some();
+    let mut bus = Bus(machine_bus, blitter_trace, serial_trace_enabled);
 
     // Refused rather than silently prioritised: see `--serial-tcp`'s doc
     // comment on `Args` for why picking a winner between "a live client"

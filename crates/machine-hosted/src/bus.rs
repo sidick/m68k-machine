@@ -5,7 +5,6 @@
 //! foreign to this crate, so neither side can carry a blanket `impl`.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
 
 use m68k::AddressBus;
 use machine_core::MachineBus;
@@ -17,19 +16,22 @@ use crate::blitter_trace::BlitterTrace;
 /// accesses. Diagnostic only.
 pub static LAST_PC: AtomicU32 = AtomicU32::new(0);
 
-fn serial_trace_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SERIAL_REG_TRACE").is_some())
-}
-
 const CUSTOM_BASE: u32 = 0x00DF_F000;
 const CUSTOM_END: u32 = 0x00E0_0000;
 
 /// Diagnostic trace of every serial-related custom register access
 /// (SERDATR/SERDAT/SERPER, plus INTENA/INTREQ writes touching the RBF or
-/// TBE bits), gated on the `SERIAL_REG_TRACE` env var.
-fn trace_serial(kind: &str, address: u32, value: u16) {
-    if !serial_trace_enabled() || !(CUSTOM_BASE..CUSTOM_END).contains(&address) {
+/// TBE bits), gated on the `SERIAL_REG_TRACE` env var -- read once at
+/// [`Bus`] construction into [`Bus`]'s own `.2` field rather than through
+/// a `OnceLock` re-checked on every single access
+/// (`docs/bus-fast-path-plan.md` §3.5: this ran once per byte/word/long
+/// access on every guest instruction that touched the bus, whether or
+/// not the trace was ever enabled). `enabled` is that cached bool, so
+/// this is `#[inline]`: the common case (tracing off) is one branch and
+/// nothing else.
+#[inline]
+fn trace_serial(enabled: bool, kind: &str, address: u32, value: u16) {
+    if !enabled || !(CUSTOM_BASE..CUSTOM_END).contains(&address) {
         return;
     }
     let offset = (address - CUSTOM_BASE) as u16 & 0x1FE;
@@ -48,19 +50,22 @@ fn trace_serial(kind: &str, address: u32, value: u16) {
 /// `.1` is `--blitter-trace`'s recorder, `None` on a plain run (the
 /// default) -- every write path below pays exactly one `if let Some`
 /// check in that case and nothing else (`blitter_trace.rs`'s module doc
-/// comment on gating).
-pub struct Bus<'a>(pub MachineBus<'a>, pub Option<BlitterTrace>);
+/// comment on gating). `.2` is whether `SERIAL_REG_TRACE` was set at
+/// construction time (`docs/bus-fast-path-plan.md` §3.5) -- `trace_serial`
+/// takes it as its first, cheapest-to-check argument rather than looking
+/// it up itself.
+pub struct Bus<'a>(pub MachineBus<'a>, pub Option<BlitterTrace>, pub bool);
 
 impl AddressBus for Bus<'_> {
     fn read_byte(&mut self, address: u32) -> u8 {
         let value = self.0.read_byte(address);
-        trace_serial("Rb", address, value as u16);
+        trace_serial(self.2, "Rb", address, value as u16);
         value
     }
 
     fn read_word(&mut self, address: u32) -> u16 {
         let value = self.0.read_word(address);
-        trace_serial("R", address, value);
+        trace_serial(self.2, "R", address, value);
         value
     }
 
@@ -69,7 +74,7 @@ impl AddressBus for Bus<'_> {
     }
 
     fn write_byte(&mut self, address: u32, value: u8) {
-        trace_serial("Wb", address, value as u16);
+        trace_serial(self.2, "Wb", address, value as u16);
         self.0.write_byte(address, value);
     }
 
@@ -77,7 +82,7 @@ impl AddressBus for Bus<'_> {
         if let Some(trace) = &mut self.1 {
             trace.observe_word(address, value);
         }
-        trace_serial("W", address, value);
+        trace_serial(self.2, "W", address, value);
         self.0.write_word(address, value);
     }
 
@@ -90,8 +95,8 @@ impl AddressBus for Bus<'_> {
             trace.observe_word(address, (value >> 16) as u16);
             trace.observe_word(address.wrapping_add(2), value as u16);
         }
-        trace_serial("W", address, (value >> 16) as u16);
-        trace_serial("W", address.wrapping_add(2), value as u16);
+        trace_serial(self.2, "W", address, (value >> 16) as u16);
+        trace_serial(self.2, "W", address.wrapping_add(2), value as u16);
         self.0.write_long(address, value);
     }
 }
