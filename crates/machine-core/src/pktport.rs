@@ -391,8 +391,9 @@ impl<'a> Pktport<'a> {
 
     /// Advance the engine by one step: service at most one latched
     /// request against `mem` (module docs, "One outstanding request").
-    /// Called once per [`crate::MachineBus::tick`], mirroring
-    /// `hostblk::Hostblk::tick`/`mirage::Mirage::tick`.
+    /// Called once per raster line [`crate::MachineBus::tick`] crosses,
+    /// not once per call to it -- one line's latency is invisible to the
+    /// guest -- mirroring `hostblk::Hostblk::tick`/`mirage::Mirage::tick`.
     pub fn tick(&mut self, mem: &mut dyn crate::GuestMemory) {
         let Some(ptr) = self.pending.take() else {
             return;

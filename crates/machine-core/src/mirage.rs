@@ -432,9 +432,13 @@ impl<'a> Mirage<'a> {
     }
 
     /// Advance the deferred-completion state machine by one step. Called
-    /// once per [`crate::MachineBus::tick`], regardless of how many CPU
-    /// clocks that tick spans -- see [`TICKS_PER_SECTOR`]'s doc comment
-    /// for why this counts calls, not time.
+    /// once per raster line [`crate::MachineBus::tick`] crosses, not once
+    /// per call to it -- one line's latency (~908 CPU clocks) is
+    /// invisible to the guest, and this state machine's whole contract
+    /// (`TICKS_PER_SECTOR`'s doc comment) is "more than zero real steps",
+    /// not any particular grain of time. Still never scaled by *how
+    /// many* lines a call crossed -- at most one step per call, exactly
+    /// as before.
     pub fn tick(&mut self) {
         if self.ticks_left == 0 {
             return;

@@ -507,7 +507,8 @@ impl<'a> PciBridge<'a> {
     /// stage 3's virtio-net ring processing, forwarded straight through
     /// (module docs on [`PciBackend::tick`]). `pcibridge` itself has no
     /// engine of its own (config cycles stay synchronous, module docs),
-    /// so this is pure delegation; [`crate::MachineBus::tick`] drives it
+    /// so this is pure delegation; [`crate::MachineBus::tick`] drives it,
+    /// once per raster line it crosses rather than once per call to it,
     /// with the same lift-out-of-the-`Option`, call, put-back dance
     /// `hostblk`/`pktport`'s own engines use.
     pub fn tick(&mut self, mem: &mut dyn crate::GuestMemory) {

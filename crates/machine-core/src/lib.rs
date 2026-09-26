@@ -782,6 +782,11 @@ impl<'a> MachineBus<'a> {
     /// Advance time by `cpu_clocks`, ticking the frame clock and both
     /// CIAs. Call this from the CPU's `sync` hook so device time and
     /// guest time stay in step.
+    ///
+    /// MIRAGE, `hostblk`, `pktport` and `pcibridge`'s deferred-completion
+    /// engines (and their `irq_pending()` polls) run once per raster line
+    /// crossed, not once per call -- see the comment at their call site
+    /// below. Chipset and both CIAs still advance on every call.
     pub fn tick(&mut self, cpu_clocks: u32) {
         let beam = self.chipset.tick(cpu_clocks, CPU_CLOCKS_PER_COLOUR_CLOCK);
 
@@ -820,72 +825,93 @@ impl<'a> MachineBus<'a> {
             }
         }
 
-        // MIRAGE's deferred-completion state machine advances one step
-        // per call, not scaled to `cpu_clocks` -- see `mirage`'s module
-        // docs on why a pending operation only needs "more than zero"
-        // real asynchronous boundary, not a modelled duration.
-        if let Some(m) = &mut self.mirage {
-            m.tick();
-            if m.irq_pending() {
-                self.chipset.raise_int(chipset::intbit::PORTS);
+        // MIRAGE, `hostblk`, `pktport` and `pcibridge`'s engines advance
+        // once per raster line *crossed*, not once per call: each is
+        // already a "deferred completion, one step per call" state
+        // machine (module docs), and one line's worth of latency (~908
+        // CPU clocks, ~100 instructions at this machine's timebase) is
+        // invisible to the guest -- exactly the grain the STOP-path
+        // resync in `machine-hosted`'s `run.rs`/the board `main.rs`
+        // hook loops already ticks in (`STOP_TICK_SLICE`, one line per
+        // slice), so that resync still services every engine every
+        // slice. A normal per-instruction tick spans far less than one
+        // line, so gating on `beam.lines_started > 0` costs these four
+        // engines nothing on most calls and still runs each at most once
+        // per call the rare time a call does cross a line (this is not
+        // scaled by how many lines were crossed, the same "at most one
+        // step" contract as before).
+        if beam.lines_started > 0 {
+            // MIRAGE's deferred-completion state machine advances one
+            // step per call, not scaled to `cpu_clocks` -- see
+            // `mirage`'s module docs on why a pending operation only
+            // needs "more than zero" real asynchronous boundary, not a
+            // modelled duration.
+            if let Some(m) = &mut self.mirage {
+                m.tick();
+                if m.irq_pending() {
+                    self.chipset.raise_int(chipset::intbit::PORTS);
+                }
             }
-        }
 
-        // `hostblk`'s engine advances the same way: one step per call,
-        // not scaled to `cpu_clocks` -- see `hostblk`'s module docs on
-        // why "at most one request per tick" is the right grain here,
-        // and why this may run entirely independently of MIRAGE (both
-        // coexist).
-        //
-        // The card is lifted out of its `Option` for the call because it
-        // needs a `&mut dyn GuestMemory` view of the whole bus -- it
-        // asks which addresses are RAM rather than assuming a range, so
-        // it can reach fast RAM as well as chip RAM. `self` cannot be
-        // borrowed mutably while `self.hostblk` is, so the card stops
-        // occupying one of those borrows for the duration and is put
-        // straight back. Nothing observes the gap: `tick` is not
-        // re-entrant and no bus access happens inside it.
-        if let Some(mut h) = self.hostblk.take() {
-            h.tick(self);
-            let pending = h.irq_pending();
-            self.hostblk = Some(h);
-            if pending {
-                self.chipset.raise_int(chipset::intbit::PORTS);
+            // `hostblk`'s engine advances the same way: one step per
+            // call, not scaled to `cpu_clocks` -- see `hostblk`'s module
+            // docs on why "at most one request per tick" is the right
+            // grain here, and why this may run entirely independently of
+            // MIRAGE (both coexist).
+            //
+            // The card is lifted out of its `Option` for the call
+            // because it needs a `&mut dyn GuestMemory` view of the
+            // whole bus -- it asks which addresses are RAM rather than
+            // assuming a range, so it can reach fast RAM as well as chip
+            // RAM. `self` cannot be borrowed mutably while
+            // `self.hostblk` is, so the card stops occupying one of
+            // those borrows for the duration and is put straight back.
+            // Nothing observes the gap: `tick` is not re-entrant and no
+            // bus access happens inside it.
+            if let Some(mut h) = self.hostblk.take() {
+                h.tick(self);
+                let pending = h.irq_pending();
+                self.hostblk = Some(h);
+                if pending {
+                    self.chipset.raise_int(chipset::intbit::PORTS);
+                }
             }
-        }
 
-        // `pktport`'s engine advances the same way, one request per call:
-        // see `pktport`'s module docs, "One outstanding request" -- with
-        // capacity 1 there is never more than a single request to
-        // service, but the shape (lift out of the `Option` for a
-        // `&mut dyn GuestMemory` view of the whole bus, put it straight
-        // back) is identical to `hostblk`'s, for the identical reason.
-        if let Some(mut p) = self.pktport.take() {
-            p.tick(self);
-            let pending = p.irq_pending();
-            self.pktport = Some(p);
-            if pending {
-                self.chipset.raise_int(chipset::intbit::PORTS);
+            // `pktport`'s engine advances the same way, one request per
+            // call: see `pktport`'s module docs, "One outstanding
+            // request" -- with capacity 1 there is never more than a
+            // single request to service, but the shape (lift out of the
+            // `Option` for a `&mut dyn GuestMemory` view of the whole
+            // bus, put it straight back) is identical to `hostblk`'s,
+            // for the identical reason.
+            if let Some(mut p) = self.pktport.take() {
+                p.tick(self);
+                let pending = p.irq_pending();
+                self.pktport = Some(p);
+                if pending {
+                    self.chipset.raise_int(chipset::intbit::PORTS);
+                }
             }
-        }
 
-        // `pcibridge`'s own register file has no engine to advance (config
-        // cycles stay synchronous, module docs), but ADR 0005 stage 3's
-        // virtio-net function behind it does: its virtqueues need a
-        // `&mut dyn GuestMemory` view of the whole bus to walk, exactly
-        // the reason `hostblk`/`pktport` lift themselves out of their own
-        // `Option` above. Ticking it here, unconditionally, is also what
-        // keeps the `INTx` poll below honest: unlike every register-file
-        // write path, a used buffer added by this tick can raise the
-        // card's `INTx` line with no register write involved at all, the
-        // same reason Graffity's card is polled here rather than only
-        // checked after a write.
-        if let Some(mut dev) = self.pcibridge.take() {
-            dev.tick(self);
-            let pending = dev.irq_pending();
-            self.pcibridge = Some(dev);
-            if pending {
-                self.chipset.raise_int(chipset::intbit::PORTS);
+            // `pcibridge`'s own register file has no engine to advance
+            // (config cycles stay synchronous, module docs), but ADR
+            // 0005 stage 3's virtio-net function behind it does: its
+            // virtqueues need a `&mut dyn GuestMemory` view of the whole
+            // bus to walk, exactly the reason `hostblk`/`pktport` lift
+            // themselves out of their own `Option` above. Ticking it
+            // here is also what keeps the `INTx` poll below honest:
+            // unlike every register-file write path, a used buffer added
+            // by this tick can raise the card's `INTx` line with no
+            // register write involved at all, the same reason
+            // Graffity's card is polled here rather than only checked
+            // after a write.
+            if let Some(mut dev) = self.pcibridge.take() {
+                dev.tick(self);
+                let pending = dev.irq_pending();
+                self.pcibridge = Some(dev);
+                if pending {
+                    self.chipset.raise_int(chipset::intbit::PORTS);
+                }
             }
         }
 
@@ -1600,6 +1626,14 @@ mod tests {
         MachineBus::new(chip_ram, rom)
     }
 
+    /// CPU clocks in exactly one raster line -- the grain
+    /// `MachineBus::tick` now gates MIRAGE/`hostblk`/`pktport`/
+    /// `pcibridge`'s engines on (`beam.lines_started > 0`). Tests that
+    /// used to tick by `1` to land a deferred-completion step now tick
+    /// by this, since a sub-line tick no longer crosses a line boundary
+    /// at all.
+    const ONE_LINE_CLOCKS: u32 = chipset::PAL_COLOUR_CLOCKS_PER_LINE * CPU_CLOCKS_PER_COLOUR_CLOCK;
+
     // Chip RAM is 2 MB: too big for a default test-thread stack, so tests
     // heap-allocate it via `Box` rather than declaring it as a local
     // array. `machine-core` itself never does this (no `alloc`); it's a
@@ -2166,7 +2200,7 @@ mod tests {
             0
         );
 
-        bus.tick(1); // MachineBus::tick's MIRAGE arm lands the WritePending step
+        bus.tick(ONE_LINE_CLOCKS); // MachineBus::tick's MIRAGE arm lands the WritePending step
         assert_eq!(
             bus.read_byte(base + mirage::reg::CMD_STATUS + 3),
             mirage::status::DRQ
@@ -2181,7 +2215,7 @@ mod tests {
             "full sector queued for commit"
         );
 
-        bus.tick(1); // commit lands here, on the read path's irq_pending check
+        bus.tick(ONE_LINE_CLOCKS); // commit lands here, on the read path's irq_pending check
         assert_eq!(bus.read_byte(base + mirage::reg::CMD_STATUS + 3), 0);
         assert_ne!(
             bus.read_word(CUSTOM_BASE + chipset::reg::INTREQR as u32) & ports,
@@ -2195,6 +2229,56 @@ mod tests {
         disk.read_sector(5, &mut check);
         assert_eq!(check[0], 0);
         assert_eq!(check[4], 1);
+    }
+
+    /// The step-4.1 contract itself: MIRAGE's (and by the same code path,
+    /// `hostblk`/`pktport`/`pcibridge`'s) engine must not advance on a
+    /// tick that stays within one raster line, and must advance exactly
+    /// once a tick crosses a line boundary -- `MachineBus::tick` gates
+    /// all four on `beam.lines_started > 0`, not on being called at all.
+    #[test]
+    fn mirage_engine_does_not_advance_within_a_line_but_does_once_a_line_is_crossed() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut disk = MirageDisk::new(64);
+        let mut bus = new_bus(&mut ram, &rom).with_mirage(0, &mut disk);
+        configure_mirage(&mut bus, 0x20);
+        let base = 0x0020_0000u32;
+
+        bus.write_byte(base + mirage::reg::UNIT_SELECT + 3, 0);
+        bus.write_long(base + mirage::reg::LBA, 5);
+        bus.write_long(base + mirage::reg::COUNT, 1);
+        bus.write_byte(base + mirage::reg::CMD_STATUS + 3, mirage::cmd::WRITE);
+        assert_eq!(
+            bus.read_byte(base + mirage::reg::CMD_STATUS + 3),
+            mirage::status::BUSY,
+            "queued, not yet landed"
+        );
+
+        // Many ticks, but every one of them stays inside the same raster
+        // line (`hpos` starts at 0, so anything under one line's worth of
+        // colour clocks never crosses `PAL_COLOUR_CLOCKS_PER_LINE`):
+        // `lines_started` is 0 every time, so MIRAGE's `tick()` must
+        // never run, and `WritePending` must not have landed.
+        for _ in 0..50 {
+            bus.tick(ONE_LINE_CLOCKS / 64);
+        }
+        assert_eq!(
+            bus.read_byte(base + mirage::reg::CMD_STATUS + 3),
+            mirage::status::BUSY,
+            "no line boundary crossed yet: the engine must not have advanced"
+        );
+
+        // One more tick that crosses the remaining distance to the next
+        // line boundary: `lines_started` becomes 1, and MIRAGE's engine
+        // must land its one step, exactly as it would have on the very
+        // first call before this batching existed.
+        bus.tick(ONE_LINE_CLOCKS);
+        assert_eq!(
+            bus.read_byte(base + mirage::reg::CMD_STATUS + 3),
+            mirage::status::DRQ,
+            "a crossed line boundary must advance the engine exactly one step"
+        );
     }
 
     // ---- hostblk wiring: brief item 7 ("all three coexist", "unaffected") -
@@ -2306,7 +2390,7 @@ mod tests {
             bus.write_long(desc_addr + 12, 0);
             bus.write_long(desc_addr + 16, buf);
             bus.write_long(hb_base + hostblk::reg::DOORBELL, desc_addr);
-            bus.tick(1);
+            bus.tick(ONE_LINE_CLOCKS);
             let err = bus.read_byte(hb_base + hostblk::reg::COMPLETION_ERROR + 3);
             bus.write_byte(hb_base + hostblk::reg::COMPLETION_ADVANCE + 3, 0);
             err
@@ -2372,7 +2456,7 @@ mod tests {
             0
         );
 
-        bus.tick(1); // MachineBus::tick's hostblk arm executes the request
+        bus.tick(ONE_LINE_CLOCKS); // MachineBus::tick's hostblk arm executes the request
         assert_eq!(
             bus.read_long(base + hostblk::reg::COMPLETION_PTR),
             desc_addr
@@ -3324,8 +3408,9 @@ mod tests {
             // Drive the engine: MachineBus::tick's pcibridge dance walks
             // the tx ring, hands the frame to the backend, and publishes
             // a used-buffer completion -- see `MachineBus::tick`'s own
-            // doc comment on this.
-            bus.tick(1);
+            // doc comment on this. A full line's worth of clocks, since
+            // the engine now only runs once a line boundary is crossed.
+            bus.tick(ONE_LINE_CLOCKS);
 
             assert_eq!(
                 pcibridge_read_u32(&mut bus, pcibridge_base + pcibridge::reg::INTX_STATUS) & 1,
