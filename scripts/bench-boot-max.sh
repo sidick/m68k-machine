@@ -31,9 +31,13 @@
 #                          (default: 1000, ~20s of guest/wall time)
 #
 # Flags:
-#   --no-build   skip `cargo build --release -p machine-hosted`
-#   --label TEXT label for the Markdown results row (default: short git hash)
-#   --help       print this usage and exit
+#   --no-build         skip `cargo build --release -p machine-hosted`
+#   --label TEXT       label for the Markdown results row (default: short git hash)
+#   --backend NAME     `--cpu-backend` to pass to every max-mode invocation
+#                      (plan step 7.2 part 3): `interp` (default) or
+#                      `batch`. Never passed in cycle mode, which refuses
+#                      `--cpu-backend batch` outright.
+#   --help             print this usage and exit
 
 set -euo pipefail
 
@@ -42,15 +46,17 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 NO_BUILD=0
 LABEL=""
+BACKEND="interp"
 
 usage() {
-    sed -n '1,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed '1d'
+    sed -n '1,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed '1d'
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-build) NO_BUILD=1; shift ;;
         --label) LABEL="${2:-}"; shift 2 ;;
+        --backend) BACKEND="${2:-}"; shift 2 ;;
         --help|-h) usage; exit 0 ;;
         *) echo "error: unrecognized argument: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -123,12 +129,117 @@ run_and_measure() {
         rm -f "$out"
         exit 1
     fi
+
+    # `--cpu-speed max`'s own end-of-run timing line (`run.rs`'s
+    # `Report::timing_report`, plan step 7.2 part 1) -- absent in cycle
+    # mode, which has no sleep concept and prints nothing here.
+    RUN_TIMING="$(grep -F 'max-mode timing:' "$out" | tail -n1 || true)"
+    if [ -n "$RUN_TIMING" ]; then
+        echo "  [$name] $RUN_TIMING" >&2
+    fi
+
     RUN_OUT="$out"
 }
 
 mips() {
     python3 -c "print(f'{$1 / $2 / 1_000_000:.1f}')"
 }
+
+# measure_wb_ready MODE -- plan step 7.2's own baseline-metrics gap: the
+# frame-count-based "Workbench-ready" measurement above (BOOT_FRAMES) is a
+# guest-time proxy, not direct evidence. This drives the exact scripted
+# input sequence `scripted_typing_in_a_shell_opened_three_double_clicks_
+# deep_is_echoed` and `max_cpu_speed_boots_to_workbench_and_keeps_real_
+# time_across_wait_5` (crates/machine-hosted/tests/real_rom.rs) use to
+# reach an open Shell three double-clicks deep, types `ECHO WBREADY
+# >SER:`, and times wall clock from process start to the `WBREADY` marker
+# arriving on serial -- the same "serial marker + host timestamp on
+# arrival" evidence those tests use for `Wait 5`, chosen here because
+# stock Kickstart otherwise narrates nothing over serial to time against
+# (`crates/machine-hosted/src/introspect.rs`'s module doc comment). This
+# is a *lower bound* on the frame-count proxy above, since it also waits
+# out three double-clicks and a typed command after Workbench is already
+# up; it exists as a direct cross-check on that proxy, not a replacement.
+measure_wb_ready() {
+    local mode="$1"
+    local backend_args=()
+    if [ "$mode" = "max" ]; then
+        backend_args=(--cpu-backend "$BACKEND")
+    fi
+    python3 - "$BIN" "$ROM" "$HDF" "$WB_READY_SCRIPT" "$mode" "${backend_args[@]}" <<'PYEOF'
+import subprocess, sys, time
+
+bin_path, rom, hdf, script, mode = sys.argv[1:6]
+extra = sys.argv[6:]
+args = [
+    bin_path, "--rom", rom, "--hostblk", hdf,
+    "--input-script", script, "--cpu-speed", mode,
+    "--max-frames", "6500", "--max-instructions", "0",
+    *extra,
+]
+start = time.time()
+proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+marker_at = None
+for line in proc.stdout:
+    if "WBREADY" in line:
+        marker_at = time.time()
+        break
+proc.terminate()
+try:
+    proc.wait(timeout=5)
+except subprocess.TimeoutExpired:
+    proc.kill()
+if marker_at is None:
+    print("ERROR: WBREADY marker never seen on serial", file=sys.stderr)
+    sys.exit(1)
+print(f"{marker_at - start:.3f}")
+PYEOF
+}
+
+WB_READY_SCRIPT="$(mktemp "${TMPDIR:-/tmp}/bench-boot-max.wbready.XXXXXX.input")"
+cat > "$WB_READY_SCRIPT" <<'EOF'
+SLEEP 4200
+MOVE 42 73
+SLEEP 10
+BUTTONDOWN LEFT
+BUTTONUP LEFT
+SLEEP 5
+BUTTONDOWN LEFT
+BUTTONUP LEFT
+SLEEP 300
+MOVE 170 84
+SLEEP 10
+BUTTONDOWN LEFT
+BUTTONUP LEFT
+SLEEP 5
+BUTTONDOWN LEFT
+BUTTONUP LEFT
+SLEEP 300
+MOVE 192 108
+SLEEP 10
+BUTTONDOWN LEFT
+BUTTONUP LEFT
+SLEEP 5
+BUTTONDOWN LEFT
+BUTTONUP LEFT
+SLEEP 600
+TYPE "ECHO WBREADY >SER:"
+SLEEP 30
+KEYDOWN 0x44
+SLEEP 2
+KEYUP 0x44
+SLEEP 300
+EOF
+
+echo "==> wall clock to WBREADY serial marker (Shell open, three double-clicks deep), cycle mode" >&2
+CYCLE_WBREADY_WALL="$(measure_wb_ready cycle)" || CYCLE_WBREADY_WALL="?"
+echo "  [wbready-cycle] ${CYCLE_WBREADY_WALL}s" >&2
+
+echo "==> wall clock to WBREADY serial marker (Shell open, three double-clicks deep), max mode" >&2
+MAX_WBREADY_WALL="$(measure_wb_ready max)" || MAX_WBREADY_WALL="?"
+echo "  [wbready-max] ${MAX_WBREADY_WALL}s" >&2
+
+rm -f "$WB_READY_SCRIPT"
 
 echo "==> wall clock to Workbench-ready ($BOOT_FRAMES frames), cycle mode" >&2
 run_and_measure boot-cycle --rom "$ROM" --hostblk "$HDF" --cpu-speed cycle \
@@ -139,14 +250,15 @@ rm -f "$RUN_OUT"
 
 echo "==> wall clock to Workbench-ready ($BOOT_FRAMES frames), max mode" >&2
 run_and_measure boot-max --rom "$ROM" --hostblk "$HDF" --cpu-speed max \
-    --max-frames "$BOOT_FRAMES" --max-instructions 0
+    --cpu-backend "$BACKEND" --max-frames "$BOOT_FRAMES" --max-instructions 0
 MAX_BOOT_WALL="$RUN_WALL"
 MAX_BOOT_INSTR="$RUN_INSTR"
+MAX_BOOT_TIMING="$RUN_TIMING"
 rm -f "$RUN_OUT"
 
 echo "==> guest MIPS over a fixed idle window ($IDLE_FRAMES further frames), max mode" >&2
 run_and_measure idle-max --rom "$ROM" --hostblk "$HDF" --cpu-speed max \
-    --max-frames "$((BOOT_FRAMES + IDLE_FRAMES))" --max-instructions 0
+    --cpu-backend "$BACKEND" --max-frames "$((BOOT_FRAMES + IDLE_FRAMES))" --max-instructions 0
 IDLE_WALL_TOTAL="$RUN_WALL"
 IDLE_INSTR_TOTAL="$RUN_INSTR"
 rm -f "$RUN_OUT"
@@ -160,7 +272,7 @@ IDLE_ONLY_WALL="$(python3 -c "print(f'{${IDLE_WALL_TOTAL} - ${MAX_BOOT_WALL}:.3f
 echo "==> idle host CPU cost over the same idle window, max mode (/usr/bin/time -l)" >&2
 IDLE_TIME_OUT="$(mktemp "${TMPDIR:-/tmp}/bench-boot-max.idle-time.XXXXXX")"
 /usr/bin/time -l "$BIN" --rom "$ROM" --hostblk "$HDF" --cpu-speed max \
-    --max-frames "$((BOOT_FRAMES + IDLE_FRAMES))" --max-instructions 0 \
+    --cpu-backend "$BACKEND" --max-frames "$((BOOT_FRAMES + IDLE_FRAMES))" --max-instructions 0 \
     >/dev/null 2>"$IDLE_TIME_OUT" || true
 IDLE_TIME_LINE="$(grep -E '^\s*[0-9.]+ real\s' "$IDLE_TIME_OUT" || true)"
 if [ -z "$IDLE_TIME_LINE" ]; then
@@ -187,8 +299,11 @@ MAX_BOOT_MIPS="$(mips "$MAX_BOOT_INSTR" "$MAX_BOOT_WALL")"
 echo
 echo "cycle mode, $BOOT_FRAMES frames: wall=${CYCLE_BOOT_WALL}s instructions=${CYCLE_BOOT_INSTR} mips=${CYCLE_MIPS}"
 echo "max mode,   $BOOT_FRAMES frames: wall=${MAX_BOOT_WALL}s instructions=${MAX_BOOT_INSTR} mips=${MAX_BOOT_MIPS}"
+echo "max mode,   $BOOT_FRAMES frames, own timing report: ${MAX_BOOT_TIMING:-not available}"
 echo "wall-clock-to-frame-$BOOT_FRAMES speedup, cycle over max: ${BOOT_SPEEDUP}x (expected >1: max mode is wall-clock-paced, cycle mode is not)"
+echo "wall clock to WBREADY serial marker, cycle mode: ${CYCLE_WBREADY_WALL}s"
+echo "wall clock to WBREADY serial marker, max mode:   ${MAX_WBREADY_WALL}s"
 echo "idle window (frames $BOOT_FRAMES..$((BOOT_FRAMES + IDLE_FRAMES))), max mode: wall=${IDLE_ONLY_WALL}s instructions=${IDLE_ONLY_INSTR} mips=${IDLE_MIPS}"
 echo "idle host CPU over that window (/usr/bin/time -l): real=${IDLE_REAL}s user=${IDLE_USER}s sys=${IDLE_SYS}s"
 echo
-echo "| ${LABEL} | cycle ${CYCLE_BOOT_WALL}s (${CYCLE_MIPS} MIPS) | max ${MAX_BOOT_WALL}s (${MAX_BOOT_MIPS} MIPS) | idle max ${IDLE_MIPS} MIPS, user=${IDLE_USER}s+sys=${IDLE_SYS}s over ${IDLE_ONLY_WALL}s real | |"
+echo "| ${LABEL} | cycle ${CYCLE_BOOT_WALL}s (${CYCLE_MIPS} MIPS) | max ${MAX_BOOT_WALL}s (${MAX_BOOT_MIPS} MIPS), ${MAX_BOOT_TIMING:-timing n/a} | WBREADY cycle ${CYCLE_WBREADY_WALL}s / max ${MAX_WBREADY_WALL}s | idle max ${IDLE_MIPS} MIPS, user=${IDLE_USER}s+sys=${IDLE_SYS}s over ${IDLE_ONLY_WALL}s real | |"
