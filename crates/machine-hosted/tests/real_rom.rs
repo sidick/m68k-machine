@@ -124,6 +124,17 @@ fn unattended_hd_image() -> String {
     fixture("M68K_UNATTENDED_HDF", "m68k-machine-unattended.hdf")
 }
 
+/// The CPU benchmark's patched HDF (docs/bus-fast-path-plan.md step 8) --
+/// the same `amibake` base as `hd_image()`, patched by
+/// `scripts/build-cpubench.sh` + `scripts/patch-cpubench-hdf.sh`: installs
+/// `C/CPUBench` (kernels.s's eleven kernels plus the ported CoreMark, see
+/// `m68k/cpubench/`) and prepends `Stack 100000` + `C:CPUBench` to
+/// `S/Startup-Sequence`, so a plain boot runs it before anything else and
+/// narrates every `CPUBENCH ...` line to both stdout and `SER:`.
+fn cpubench_hd_image() -> String {
+    fixture("M68K_TEST_CPUBENCH_HDF", "m68k-machine-cpubench.hdf")
+}
+
 /// Locate `xdftool` (amitools) the same way every `scripts/patch-*-hdf.sh`
 /// script does: `$XDFTOOL`, else `xdftool` on `PATH`, else the usual venv/
 /// pipx install locations. Used here to extract `SYS:sanaconform.log`
@@ -2494,4 +2505,165 @@ fn max_cpu_speed_boots_to_workbench_and_keeps_real_time_across_wait_5() {
     );
 
     let _ = std::fs::remove_file(&script_path);
+}
+
+/// The CPU benchmark's real-ROM proof (docs/bus-fast-path-plan.md step 8):
+/// boots the `m68k-machine-cpubench.hdf` fixture under `--cpu-speed max`
+/// (cycle mode budgets the guest CPU to 14.19 MHz -- ADR 0006 -- which
+/// would make every rate this program reports meaningless, not just slow)
+/// and reads `CPUBench`'s own `CPUBENCH ...` lines back off `SER:` (the
+/// same `--serial-log` mechanism `kickstart_3_2_2_a1200_pciprobe_proves_
+/// the_prometheus_library_api` above uses, simpler than the scripted-Shell
+/// approach the `Wait 5` timer test needs: `CPUBench` runs automatically
+/// from `S/Startup-Sequence`, before Workbench even loads, so there is no
+/// Shell to open or mouse to script here at all).
+///
+/// Deliberately asserts only that every kernel *reported*, with a
+/// positive rate, plus the final `CPUBENCH DONE` marker -- never a speed
+/// threshold (the task this test was written for is explicit about this:
+/// a threshold baked into a test is either a false failure the first time
+/// this machine gets faster, or a stale check nobody adjusts back down
+/// when it gets slower). The actual numbers belong in
+/// `docs/bus-fast-path-plan.md`'s own step 8 table, gathered by hand
+/// alongside the bare `cpu-bench` harness's numbers on the same kernels.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and the patched cpubench HDF on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_cpubench_reports_every_kernel_under_max_speed() {
+    let rom = kickstart_a1200();
+    let hd = cpubench_hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+
+    let serial_log_path = std::env::temp_dir().join(format!(
+        "machine-hosted-kickstart-cpubench-{}.serial.log",
+        std::process::id()
+    ));
+
+    // Generous budgets: CPUBench's eleven kernels each calibrate to ~1
+    // real second, CoreMark's own auto-iteration calibration typically
+    // runs ~10 real seconds on top of that, and max mode advances guest
+    // frames at roughly one per 20ms of real time regardless of how busy
+    // the CPU is (docs/adr-0006's own measurements) -- so 6000 frames is
+    // about 120 real seconds of headroom over the ~35-50s this run is
+    // expected to actually need, and 5 billion instructions is generous
+    // headroom over the ~30 M/s busy rate ADR 0006 measured times that
+    // many active seconds.
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--cpu-speed",
+        "max",
+        "--max-frames",
+        "6000",
+        "--max-instructions",
+        "5000000000",
+        "--serial-log",
+        serial_log_path.to_str().unwrap(),
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    let serial_log = std::fs::read_to_string(&serial_log_path)
+        .unwrap_or_else(|e| panic!("read serial log {serial_log_path:?}: {e}"));
+
+    // Order matches kernels.s's own _KernelTable exactly (that file's
+    // header comment is the authoritative list).
+    const KERNEL_NAMES: [&str; 11] = [
+        "reg_addq_bra",
+        "reg_tst_bne",
+        "reg_mix",
+        "mem_copy",
+        "mem_fill",
+        "struct_walk",
+        "movem_saverestore",
+        "jsr_rts_chain",
+        "muldiv_mix",
+        "bitfield_ops",
+        "cmp_branchy",
+    ];
+
+    println!("CPUBench (max mode, in-machine) results:");
+    println!(
+        "{:<20} {:>14} {:>14} {:>12}",
+        "kernel", "instructions", "microseconds", "M instr/s"
+    );
+
+    for name in KERNEL_NAMES {
+        let prefix = format!("CPUBENCH {name} ");
+        let line = serial_log
+            .lines()
+            .find(|l| l.starts_with(&prefix))
+            .unwrap_or_else(|| {
+                panic!("never saw a \"{prefix}...\" line on serial -- serial log:\n{serial_log}")
+            });
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(
+            fields.len(),
+            5,
+            "expected \"CPUBENCH {name} <instructions> <microseconds> <mips>\", got {line:?}"
+        );
+        let instructions: u64 = fields[2]
+            .parse()
+            .unwrap_or_else(|e| panic!("parse instructions in {line:?}: {e}"));
+        let microseconds: u64 = fields[3]
+            .parse()
+            .unwrap_or_else(|e| panic!("parse microseconds in {line:?}: {e}"));
+        let mips: f64 = fields[4]
+            .parse()
+            .unwrap_or_else(|e| panic!("parse M instr/s in {line:?}: {e}"));
+        assert!(
+            instructions > 0,
+            "expected a positive instruction count for kernel {name}, got {line:?}"
+        );
+        assert!(
+            microseconds > 0,
+            "expected a positive elapsed time for kernel {name}, got {line:?}"
+        );
+        assert!(
+            mips > 0.0,
+            "expected a positive M instr/s rate for kernel {name}, got {line:?}"
+        );
+        println!("{name:<20} {instructions:>14} {microseconds:>14} {mips:>12.1}");
+    }
+
+    // CoreMark: a positive iterations/sec rate is required; the "CoreMark
+    // 1.0 : ..." validated score line is printed only if the run's CRCs
+    // matched the standard performance-run seeds (core_portme.c's own
+    // comment on this) -- present in every run this project has observed,
+    // but not asserted here, in keeping with this test's "report, don't
+    // threshold" posture.
+    let coremark_prefix = "CPUBENCH coremark ";
+    let coremark_line = serial_log
+        .lines()
+        .find(|l| l.starts_with(coremark_prefix))
+        .unwrap_or_else(|| {
+            panic!(
+                "never saw a \"{coremark_prefix}...\" line on serial -- serial log:\n{serial_log}"
+            )
+        });
+    let coremark_rate: f64 = coremark_line
+        .split_whitespace()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("parse CoreMark iterations/sec in {coremark_line:?}"));
+    assert!(
+        coremark_rate > 0.0,
+        "expected a positive CoreMark iterations/sec rate, got {coremark_line:?}"
+    );
+    println!("coremark             iterations/sec = {coremark_rate:.3}");
+
+    if let Some(score_line) = serial_log.lines().find(|l| l.starts_with("CoreMark 1.0")) {
+        println!("{score_line}");
+    } else {
+        println!("(no validated \"CoreMark 1.0 : ...\" score line printed -- see serial log)");
+    }
+
+    assert!(
+        serial_log.lines().any(|l| l == "CPUBENCH DONE"),
+        "never saw the final \"CPUBENCH DONE\" marker -- serial log:\n{serial_log}"
+    );
 }

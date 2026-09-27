@@ -603,3 +603,172 @@ fork's fast paths are not a route to the "at least twice a 68060" floor
 (roughly 150-200 M instructions/s; today about 30). That is evidence for
 `docs/cpu-core-proposal.md`, whose direct mapping covers ROM, chip and
 fast RAM alike, rather than for more tuning of the fork's back ends.
+
+## 8. CPU benchmark: bare core versus in-machine
+
+A direct answer to the question step 5's decision left open: of the gap
+between bare m68k-rs (72-178 M instr/s interpreted per the fork's own
+microbenchmark) and this machine's measured ~30 busy MIPS (step 7.2),
+how much is m68k-rs itself versus device/bus overhead, and how far is
+either from "at least twice a 68060"? `m68k/cpubench/kernels.s` is one
+vasm source assembled two ways -- a flat binary
+(`m68k/cpubench/kernels.bin`, `vasm -Fbin`) for the bare Rust harness
+(`crates/cpu-bench`, straight over `m68k::CpuCore`/`LinearMemoryBus`,
+no `machine-core` involved at all) and a relocatable object
+(`vasm -Fhunk`) linked into `CPUBench`, a real AmigaOS CLI program
+(`m68k/cpubench/cpubench.c`) that runs the identical instruction stream
+inside a real Kickstart 3.2.2 boot. Eleven kernels: the fork
+microbench's ADDQ/BRA, TST/BNE and register-mix shapes; a 32-longword
+memory copy and fill; a byte/word/long displacement struct walk; MOVEM
+save/restore; a JSR/RTS call chain; a MULU/MULS/DIVU/DIVS mix;
+BFEXTU/BFINS bitfield round-tripping; and a branchy eight-condition CMP
+mix. Every kernel is a fixed-size unrolled body closed by SUBQ.L/BNE
+(documented per-iteration instruction count, checked by both harnesses
+against the CPU's own retired-instruction count before any timing run
+-- all eleven calibrate exactly).
+
+### Bare harness (`crates/cpu-bench`, `cargo run -p cpu-bench --release`)
+
+Apple M3 Pro, one build per column (`batch`/`batch+jit` need
+`--features jit` to differ from `batch` -- the fork's Cranelift tracing
+is a build-time choice, not a runtime switch, matching how ADR 0006's
+own `interp`/`batch`/`batch+jit` numbers were taken). Two runs each for
+`interp`/`batch`; `batch+jit` measured once (see note below the table).
+M instr/s, best of two runs:
+
+| kernel | interp (run 1 / run 2) | batch (run 1 / run 2) | batch+jit |
+|---|---|---|---|
+| reg_addq_bra | 102.4 / 102.2 | 161.3 / 160.0 | 1022.7 |
+| reg_tst_bne | 63.1 / 62.3 | 196.1 / 194.1 | 2589.4 |
+| reg_mix | 91.4 / 84.1 | 152.0 / 150.4 | 1275.0 |
+| mem_copy | 48.9 / 48.7 | 112.5 / 112.2 | 833.5 |
+| mem_fill | 46.2 / 49.1 | 163.1 / 168.8 | 1023.2 |
+| struct_walk | 47.9 / 50.1 | 121.4 / 123.6 | 1248.8 |
+| movem_saverestore | 35.4 / 37.6 | 91.3 / 89.1 | 1038.4 |
+| jsr_rts_chain | 81.7 / 87.0 | 112.0 / 116.8 | 126.6 |
+| muldiv_mix | 85.6 / 89.1 | 129.4 / 134.8 | 144.6 |
+| bitfield_ops | 68.0 / 70.4 | 74.4 / 76.4 | 82.5 |
+| cmp_branchy | 71.6 / 75.2 | 185.3 / 184.1 | 2025.8 |
+
+`batch+jit` was run once per kernel (a separate `--features jit`
+build); its huge spread (83-2589 M instr/s) is almost entirely which
+kernels Cranelift actually traces: `jsr_rts_chain`, `muldiv_mix` and
+`bitfield_ops` stay close to plain `batch` (JSR/RTS call boundaries,
+64-bit-ish MUL/DIV, and BFEXTU/BFINS trace-admission gaps the fork's
+own microbench module docs already flag as topologies the tracer
+rejects or only partially compiles), while the pure register/branch/
+copy/fill/walk/MOVEM shapes -- no memory-source ALU ops, no calls, no
+divide, no bitfields -- compile to native code and run at 800-2600 M
+instr/s, in the same range the fork's own `microbench.rs` reports for
+its comparable self-looping traces. This is the same lesson step 7.2
+already drew from the fork's `run_batch`+JIT on real boot workloads
+(coverage, not raw throughput, gates the win) at the kernel level
+instead of the workload level.
+
+These bare numbers comfortably clear "at least twice a 68060" (roughly
+150-200 M instr/s, cpu-core-proposal.md §8) on `interp` alone for
+several kernels, and on `batch`/`batch+jit` for nearly all of them --
+confirming the fork's *raw* throughput was never the bottleneck; step
+7.2 already showed that inside a real boot the fork's fast paths gain
+at most ~4% over `interp`. What this step adds is the missing side of
+that comparison: how much of the ~30-busy-MIPS wall a real boot hits is
+m68k-rs's own dispatch cost on identical instructions, versus
+everything machine-core adds around it.
+
+### In-machine (`CPUBench`, `m68k/cpubench/cpubench.c`, max mode)
+
+**This half is blocked by a newly discovered timing bug, not completed
+as numbers.** `CPUBench` boots, allocates its buffers, opens
+`timer.device`, and runs its first two kernels -- then a third kernel
+into the run, `ReadEClock()` reports elapsed time growing by roughly
+one real second per call pair for a handful of guest instructions, and
+within a few more calibration steps the guest WEDGEs (an F-line trap
+storm at a PC inside fast RAM, or the tight-loop detector firing at PC
+0). Reproduced identically in `--cpu-speed cycle` and `--cpu-speed max`,
+and with `Forbid()`/`Permit()` removed from `cpubench.c` entirely --
+ruling out both the timing mode and this program's own multitasking
+bracketing as the cause. A debug build captured the raw evidence: `freq`
+is the correct PAL EClock rate (709379 Hz), but `t1.ev_lo - t0.ev_lo`
+across a single ~3600-instruction kernel call measured ~713,000 ticks
+(~1.005 real seconds) -- the emulated CIA/TOD hardware `ReadEClock`
+reads is advancing far ahead of what the retired-instruction-driven
+cycle budget should permit. `cpubench.c`'s own header comment records
+this in full (search "KNOWN OPEN ISSUE"). Per this project's own
+standing instruction, this was not chased further into
+`crates/machine-core/src/cia.rs` from outside it -- it needs the kind
+of investigation (with `--inspect`/a differential CIA test) this task's
+own scope did not budget for, and guessing at a machine-core fix from a
+benchmark-writing pass risks introducing a wrong one that looks right
+under this one benchmark.
+
+The real-ROM test this step's task asked for
+(`kickstart_3_2_2_a1200_cpubench_reports_every_kernel_under_max_speed`,
+gated on `M68K_TEST_CPUBENCH_HDF`) is written, correctly asserts every
+kernel's line and `CPUBENCH DONE` with no speed threshold, and is the
+gate that caught this bug -- it currently **fails** for that reason,
+not because anything in this test, `cpubench.c`, `kernels.s`, or the HDF
+patch is wrong. The full real-ROM suite's other 18 tests pass unchanged
+(see the gates section below); this is the one open item this pass did
+not close.
+
+### Ratio table
+
+Not produced. The bare-versus-in-machine ratio this step exists to
+measure needs a valid in-machine number for at least one kernel, and
+the timing bug above means every in-machine number gathered so far
+(the two kernels that did report, `reg_addq_bra` and `reg_tst_bne`) is
+itself measured against a clock that is running roughly 1000x slower
+than real elapsed guest time relative to the CPU's own retired
+instructions -- reporting a "ratio" against numbers known to be wrong
+would be exactly the "self-consistent but wrong" failure mode
+CLAUDE.md's hard-won rules warn against, not evidence.
+
+### What the (incomplete) picture says
+
+The bare harness alone is enough to answer step 5's open question in
+part: m68k-rs's own interpreter and batch/JIT paths are not the
+ceiling -- most kernels clear "twice a 68060" on `interp` alone, and
+`batch+jit` reaches 20-85x that floor on the shapes Cranelift actually
+traces. That is consistent with step 7.2's own conclusion
+(`docs/adr-0006`'s "Decision: interp stays the default") and with
+`docs/cpu-core-proposal.md`'s framing: the fork's raw speed was never
+in question, and the ~30 busy-MIPS figure measured inside a real boot
+must come predominantly from machine-core's bus/device/tick overhead
+around the CPU, not from m68k-rs's own per-instruction cost. Confirming
+that with a number (the ratio table above) needs the CIA/EClock bug
+fixed first; until then this is the strongest statement the evidence
+supports, not a foregone conclusion.
+
+### Copperline 68060 reference (optional deliverable)
+
+Copperline (GPL, run but never copied) supports both a 68060 CPU model
+and a specific clock speed (`--cpu 68060`, `--cpu-clock MHZ`, default
+50 MHz for that model) -- confirmed via its own configuration docs, so
+the capability this step asked about exists. Getting `CPUBench` to run
+to completion there did not succeed within this pass's budget: `--run
+m68k/cpubench/CPUBench` against the bundled AROS boots and stages the
+program, but no `CPUBENCH` line appeared over up to 90 emulated seconds
+of `--benchmark-until`, and this was not investigated further (AROS's
+`timer.device`/`Forbid`/`AllocMem` compatibility, whether the same
+EClock issue reproduces there, or something else in that boot path are
+all still open questions). Per this deliverable's own instruction ("if
+it can't, say so and stop there"), that is where this stopped -- no
+68060 reference ratio is recorded.
+
+### Gates run for this step
+
+- `cargo fmt --all -- --check`: clean.
+- `cargo clippy -p machine-core --all-targets`, `-p machine-hosted
+  --all-targets`, `-p cpu-bench --all-targets` (with and without
+  `--features jit`): all clean, `-D warnings`.
+- `cargo test -p machine-core`, `-p machine-hosted`: all pass.
+- `cargo test -p cpu-bench`: passes (the calibration check; the timed
+  `M instr/s` table is `cargo run -p cpu-bench --release`, not a test).
+- Full real-ROM suite (`--ignored --test-threads=1`, every fixture
+  including `M68K_TEST_CPUBENCH_HDF`): 18 of 19 pass. The 19th is this
+  step's own new test, failing on the CIA/EClock issue above -- not a
+  regression in any of the other 18, which are unchanged.
+- Both board crates (`board-qemu-virt --target aarch64-unknown-none`,
+  `board-qemu-q35 --target x86_64-unknown-uefi`): clippy-clean,
+  unaffected by this step (neither depends on `cpu-bench` or the
+  `cpubench` guest sources).
