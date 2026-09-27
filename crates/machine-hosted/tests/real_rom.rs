@@ -2368,3 +2368,130 @@ fn aros_68k_pair() {
         "expected a final status line regardless of how far boot got"
     );
 }
+
+/// `--cpu-speed max`'s required evidence (ADR 0006, "Evidence required
+/// before max mode is called working"; plan step 7.4): a max-mode boot to
+/// Workbench with scripted input and serial markers, and timer.device
+/// keeping real time. Combined into one test rather than two, since both
+/// need the same ~150 real-second scripted boot-and-navigate sequence
+/// under max mode's wall-clock pacing (deliberately much slower in real
+/// time than the equivalent cycle-mode test, since pacing device time to
+/// the wall clock is the entire point) and running it twice would only
+/// double that cost for no additional coverage.
+///
+/// Reuses `scripted_typing_in_a_shell_opened_three_double_clicks_deep_is_echoed`'s
+/// three-double-clicks-deep Shell, then types three separate commands
+/// (`ECHO MARK1 >SER:`, `WAIT 5`, `ECHO MARK2 >SER:`), each submitted with
+/// its own `Return` -- AmigaDOS's Shell does not treat `;` as a
+/// multi-command separator the way a Unix shell does (a first attempt at
+/// one `;`-joined line just ran `ECHO` with everything after its
+/// redirection folded into its own argument text, so `WAIT`/the second
+/// `ECHO` never ran at all: `MARK2` never appeared on serial). The `SLEEP`
+/// padding between each `TYPE`/`Return` pair is kept as short as this
+/// input-card protocol tolerates (15 frames, ~0.3 s) rather than the
+/// generous padding `scripted_typing_...`'s own single-command test uses,
+/// since every one of those frames between `MARK1` and `WAIT 5` actually
+/// starting inflates the measured gap over the `WAIT 5` command's own 5 s
+/// -- measured empirically at +0.087 s total overhead across both
+/// commands at this padding, comfortably inside the tolerance below.
+/// timer.device's own accuracy is not this test's variable; the
+/// scripting overhead around it is, and this is the smallest that
+/// reliably still lands each keystroke. The child's stdout is read
+/// incrementally (not captured to a string and inspected afterward, like
+/// every other test in this file) so each `GUEST | MARK*` line can be
+/// timestamped the moment it is read -- that gap is the evidence, not
+/// anything the guest itself reports.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
+fn max_cpu_speed_boots_to_workbench_and_keeps_real_time_across_wait_5() {
+    let rom = kickstart_a1200();
+    let hd = hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+
+    let script_path = std::env::temp_dir().join(format!(
+        "machine-hosted-max-timer-{}.input",
+        std::process::id()
+    ));
+    std::fs::write(
+        &script_path,
+        "SLEEP 4200\n\
+         MOVE 42 73\nSLEEP 10\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 5\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 300\n\
+         MOVE 170 84\nSLEEP 10\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 5\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 300\n\
+         MOVE 192 108\nSLEEP 10\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 5\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 600\n\
+         TYPE \"ECHO MARK1 >SER:\"\nSLEEP 15\nKEYDOWN 0x44\nSLEEP 2\nKEYUP 0x44\nSLEEP 15\n\
+         TYPE \"WAIT 5\"\nSLEEP 15\nKEYDOWN 0x44\nSLEEP 2\nKEYUP 0x44\nSLEEP 15\n\
+         TYPE \"ECHO MARK2 >SER:\"\nSLEEP 15\nKEYDOWN 0x44\nSLEEP 2\nKEYUP 0x44\nSLEEP 300\n",
+    )
+    .expect("write input script");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_machine-hosted"))
+        .args([
+            "--rom",
+            &rom,
+            "--hostblk",
+            &hd,
+            "--input-script",
+            script_path.to_str().unwrap(),
+            "--cpu-speed",
+            "max",
+            "--max-frames",
+            "7500",
+            "--max-instructions",
+            "2000000000",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn machine-hosted");
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut mark1_at: Option<std::time::Instant> = None;
+    let mut mark2_at: Option<std::time::Instant> = None;
+    let mut saw_final_status = false;
+    let mut all_lines = Vec::new();
+
+    loop {
+        let mut line = String::new();
+        let n = stdout.read_line(&mut line).expect("read child stdout");
+        if n == 0 {
+            break; // EOF -- child exited
+        }
+        let now = std::time::Instant::now();
+        let trimmed = line.trim_end().to_string();
+        if trimmed.contains("MARK1") && mark1_at.is_none() {
+            mark1_at = Some(now);
+        }
+        if trimmed.contains("MARK2") && mark2_at.is_none() {
+            mark2_at = Some(now);
+        }
+        if trimmed.starts_with("host  | PHASE1 HOSTED:") {
+            saw_final_status = true;
+        }
+        all_lines.push(trimmed);
+    }
+    let status = child.wait().expect("wait for machine-hosted");
+    let stdout_text = all_lines.join("\n");
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout_text}");
+
+    assert!(
+        saw_final_status,
+        "expected a final PHASE1 HOSTED status line -- output:\n{stdout_text}"
+    );
+
+    let mark1_at =
+        mark1_at.unwrap_or_else(|| panic!("never saw MARK1 on serial -- output:\n{stdout_text}"));
+    let mark2_at =
+        mark2_at.unwrap_or_else(|| panic!("never saw MARK2 on serial -- output:\n{stdout_text}"));
+
+    let gap = mark2_at.duration_since(mark1_at).as_secs_f64();
+    eprintln!("measured Wait 5 gap under --cpu-speed max: {gap:.3}s");
+    assert!(
+        (gap - 5.0).abs() <= 0.5,
+        "expected the Wait 5 gap to be 5s +/- 0.5s under --cpu-speed max (timer.device keeping \
+         real time, ADR 0006), measured {gap:.3}s -- output:\n{stdout_text}"
+    );
+
+    let _ = std::fs::remove_file(&script_path);
+}

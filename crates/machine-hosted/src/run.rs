@@ -42,6 +42,49 @@
 //! the trap. This runner does no HLE, so it always takes the real 68k
 //! exception via `CpuCore::take_{aline,fline,trap,bkpt,illegal}_exception`
 //! and resumes, which is what unmodified hardware would do.
+//!
+//! # `--cpu-speed max`: a second run loop, not a mode flag on this one
+//!
+//! `docs/adr-0006-cycle-budgeted-and-wall-clock-paced-timing.md` adds a
+//! wall-clock-paced timing model alongside the cycle-budgeted one above.
+//! Rather than thread a mode flag through every branch of `run_guest`
+//! (the interrupt-delivery contract above, the trap handling above, the
+//! `Stopped` resync, the limit/wedge checks), max mode is a separate
+//! function, `run_guest_max`, sharing only `drain_serial`/
+//! `service_host_serial`/`track_exception` with `run_guest`. `run_guest`
+//! itself is untouched by any of this -- cycle mode's `run_for_cycles_with_hook`
+//! call, its per-instruction hook, and its `Stopped` handling are exactly
+//! what they were before this module gained `run_guest_max`.
+//!
+//! The two loops differ in what drives the CPU and how device time
+//! advances, not in the interrupt or trap contracts above: `run_guest_max`
+//! still forwards elapsed cycles into `MachineBus::tick` and sets `int_level`
+//! from `pending_irq_level` the same way, still takes every trap for real
+//! rather than doing HLE, and STOP is still resynced by ticking device
+//! time and resampling the IPL before resuming -- only the *source* of the
+//! CPU's cycles (hook-free `run_for_cycles` chunks instead of one
+//! `run_for_cycles_with_hook` call) and *how much* device time each tick
+//! advances by (a wall-clock-derived deadline instead of the chunk's own
+//! retired cycles) change. See `run_guest_max`'s own doc comment for the
+//! timing model, and the module-level constants above it
+//! (`MAX_MODE_CHUNK_TARGET_US` etc.) for the tuning knobs.
+//!
+//! The per-instruction hook's other duties -- serial/input scripts,
+//! screenshots, the overlay-cleared marker, `--max-instructions`/
+//! `--max-frames`, and progress output -- move to `max_chunk_boundary`,
+//! called once per chunk instead of once per instruction. Wedge detection
+//! changes shape entirely: cycle mode's `TIGHT_LOOP_THRESHOLD` counts
+//! instructions at one PC, which has no meaning when the CPU is
+//! unbudgeted, so max mode instead samples the PC once per chunk boundary
+//! and calls it a wedge after `MAX_MODE_WEDGE_SECONDS` of *wall clock*
+//! with the CPU not stopped (a `CycleBatchExit::Stopped` chunk resets the
+//! streak rather than extending it -- Kickstart's idle dispatcher legitimately
+//! holds the same PC in STOP forever, and this detector must never mistake
+//! that for a wedge).
+//!
+//! `--trace` (and anything else built on the per-instruction hook) has no
+//! equivalent in `run_guest_max` and is refused together with
+//! `--cpu-speed max` in `run`, before either run loop is reached.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -1258,7 +1301,18 @@ fn run_guest_max(
             cpu.set_irq(bus.0.pending_irq_level());
             drain_serial(bus, console, serial_tcp);
 
-            if cpu.pc == wedge_pc {
+            // "With the CPU not stopped" (ADR 0006): a `Stopped` exit
+            // retires no instructions and leaves `cpu.pc` unchanged by
+            // definition (Kickstart's idle dispatcher parks on the same
+            // STOP over and over, exactly like a real wedge would look),
+            // so it must reset the streak rather than extend it -- an
+            // idle Workbench sitting in STOP for longer than
+            // `MAX_MODE_WEDGE_SECONDS` is the expected, healthy case this
+            // detector must never fire on.
+            if result.exit == CycleBatchExit::Stopped {
+                wedge_pc = cpu.pc;
+                wedge_since = Instant::now();
+            } else if cpu.pc == wedge_pc {
                 let stuck_for = wedge_since.elapsed();
                 if stuck_for.as_secs_f64() >= MAX_MODE_WEDGE_SECONDS {
                     hook_wedge = Some(format!(
