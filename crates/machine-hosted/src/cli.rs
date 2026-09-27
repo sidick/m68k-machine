@@ -90,6 +90,22 @@ pub struct Args {
     #[arg(long, default_value = "cycle")]
     pub cpu_speed: CpuSpeed,
 
+    /// `--cpu-speed max`'s CPU back end (plan step 7.2): `interp` (the
+    /// default) runs `m68k::CpuCore::run_for_cycles`, exactly as before
+    /// this flag existed. `batch` runs `CpuCore::run_batch` instead --
+    /// instruction-budgeted, no per-access bus call inside a `FastMem`
+    /// window over fast RAM when one is available (refused whenever
+    /// `SERIAL_REG_TRACE` or `--blitter-trace` is active, or fast RAM
+    /// isn't attached/placed -- `bus.rs`'s `fast_mem` falls back to the
+    /// bus chain outside the window either way, so `batch` is always
+    /// correct, just not always faster). Refused together with
+    /// `--cpu-speed cycle`: cycle mode's reproducibility and per-
+    /// instruction cycle accounting need `run_for_cycles_with_hook`,
+    /// which `run_batch` does not provide (it does not maintain cycle
+    /// accounting at all -- `m68k`'s own doc comment on `run_batch`).
+    #[arg(long, default_value = "interp")]
+    pub cpu_backend: CpuBackend,
+
     /// Tee the serial console (guest output plus runner diagnostics) to
     /// this file in addition to stdout.
     #[arg(long)]
@@ -471,6 +487,18 @@ pub enum CpuSpeed {
     Cycle,
     /// Wall-clock-paced, unbudgeted CPU, "fastest possible".
     Max,
+}
+
+/// `--cpu-backend`'s two `--cpu-speed max` back ends -- see that flag's
+/// own doc comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum CpuBackend {
+    /// `m68k::CpuCore::run_for_cycles`, the default, unchanged since
+    /// before this flag existed.
+    Interp,
+    /// `m68k::CpuCore::run_batch`, with a `FastMem` window over fast RAM
+    /// when one is available.
+    Batch,
 }
 
 /// The CPU models this runner knows how to select. A thin wrapper around

@@ -89,7 +89,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use m68k::{CpuCore, CycleBatchControl, CycleBatchExit};
+use m68k::{BatchExit, CpuCore, CycleBatchControl, CycleBatchExit, CycleBatchResult};
 
 use machine_core::block::BlockDevice;
 use machine_core::{pci, MachineBus, CHIP_RAM_SIZE, CPU_CLOCKS_PER_ECLOCK};
@@ -132,6 +132,21 @@ const MAX_MODE_MIN_CHUNK_CYCLES: i32 = 256;
 /// ever wrong (e.g. right after a STOP-path resync, before a fresh
 /// measurement corrects it).
 const MAX_MODE_MAX_CHUNK_CYCLES: i32 = 400_000;
+
+/// `--cpu-backend batch`'s adaptive chunk size floor, in instructions
+/// rather than cycles: `run_batch` is instruction-budgeted and reports no
+/// cycle count at all (`m68k`'s own doc comment on `run_batch` -- it
+/// clobbers `cycles_remaining`), so this chunk-size estimate is derived
+/// entirely from wall-clock time per retired instruction, never from
+/// cycles or `cycles_remaining` (plan step 7.2's own requirement). Same
+/// floor rationale as [`MAX_MODE_MIN_CHUNK_CYCLES`].
+const MAX_MODE_MIN_CHUNK_INSTRS: u32 = 64;
+
+/// `--cpu-backend batch`'s adaptive chunk size ceiling, in instructions.
+/// Same rationale as [`MAX_MODE_MAX_CHUNK_CYCLES`]: bounds how far a
+/// single chunk can overshoot `MAX_MODE_CHUNK_TARGET_US` if the rate
+/// estimate is stale.
+const MAX_MODE_MAX_CHUNK_INSTRS: u32 = 100_000;
 
 /// `run_guest_max`'s backlog cap (ADR 0006, "When the host can't keep
 /// up"): device time is never allowed to fall more than this far behind
@@ -191,12 +206,32 @@ pub enum Outcome {
     SetupError(String),
 }
 
+/// `--cpu-speed max`'s own timing breakdown (plan step 7.2). 7.1's only
+/// MIPS figure averaged in time spent asleep in STOP and never measured
+/// wall clock to Workbench at all -- this splits wall time into sleep
+/// (STOP-path parking, ADR 0006's "STOP sleeps") and busy time, so
+/// [`Self::busy_mips`] reports instructions per second of actual CPU
+/// execution rather than diluting it by however idle the sampled window
+/// happened to be. `None` in cycle mode, which has no sleep concept.
+#[derive(Clone, Copy, Debug)]
+pub struct MaxModeTiming {
+    pub wall: Duration,
+    pub slept: Duration,
+}
+
+impl MaxModeTiming {
+    pub fn busy(&self) -> Duration {
+        self.wall.saturating_sub(self.slept)
+    }
+}
+
 pub struct Report {
     pub outcome: Outcome,
     pub instructions: u64,
     pub frames: u64,
     pub final_pc: u32,
     pub overlay_cleared: bool,
+    pub max_mode_timing: Option<MaxModeTiming>,
 }
 
 impl Report {
@@ -234,6 +269,25 @@ impl Report {
             self.final_pc,
         )
     }
+
+    /// `--cpu-speed max`'s end-of-run timing report (plan step 7.2):
+    /// total wall time, time slept in STOP, busy time, and busy MIPS
+    /// (instructions retired / busy seconds). `None` in cycle mode.
+    pub fn timing_report(&self) -> Option<String> {
+        let timing = self.max_mode_timing?;
+        let busy = timing.busy();
+        let busy_mips = if busy > Duration::ZERO {
+            self.instructions as f64 / busy.as_secs_f64() / 1_000_000.0
+        } else {
+            0.0
+        };
+        Some(format!(
+            "max-mode timing: wall={:.3}s slept={:.3}s busy={:.3}s busy_mips={busy_mips:.2}",
+            timing.wall.as_secs_f64(),
+            timing.slept.as_secs_f64(),
+            busy.as_secs_f64(),
+        ))
+    }
 }
 
 fn setup_error(console: &mut Console, reason: String) -> Report {
@@ -244,6 +298,7 @@ fn setup_error(console: &mut Console, reason: String) -> Report {
         frames: 0,
         final_pc: 0,
         overlay_cleared: false,
+        max_mode_timing: None,
     }
 }
 
@@ -628,12 +683,31 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     // `Bus.2` doc comment and `docs/bus-fast-path-plan.md` §3.5.
     let serial_trace_enabled = std::env::var_os("SERIAL_REG_TRACE").is_some();
     let cpu_speed_max = args.cpu_speed == crate::cli::CpuSpeed::Max;
+    // `BUS_COVERAGE` (plan step 7.2): read once at construction, same
+    // "diagnostic gated once, not re-checked per access" posture as
+    // `SERIAL_REG_TRACE` above (`docs/bus-fast-path-plan.md` §3.5).
+    let bus_coverage_enabled = std::env::var_os("BUS_COVERAGE").is_some();
     let mut bus = Bus(
         machine_bus,
         blitter_trace,
         serial_trace_enabled,
         cpu_speed_max,
+        bus_coverage_enabled.then(crate::bus::Coverage::default),
     );
+
+    // `--cpu-backend batch` needs `--cpu-speed max`: cycle mode's
+    // reproducibility and per-instruction cycle accounting run through
+    // `run_for_cycles_with_hook`, which `run_batch` cannot provide (it
+    // does not maintain cycle accounting -- `m68k`'s own doc comment).
+    if args.cpu_backend == crate::cli::CpuBackend::Batch && !cpu_speed_max {
+        return setup_error(
+            console,
+            "--cpu-backend batch requires --cpu-speed max: run_batch is instruction-budgeted \
+             and does not maintain cycle accounting, so cycle mode (which needs exact \
+             per-instruction cycle charging) cannot use it"
+                .to_string(),
+        );
+    }
 
     // `--trace` (and `TRACE_WATCH_PCS`, gated on it) is a per-instruction
     // diagnostic driven from `run_guest`'s `run_for_cycles_with_hook`
@@ -797,6 +871,12 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
 
     if let Some(trace) = bus.1.take() {
         console.diag(&trace.finish());
+    }
+
+    if let Some(coverage) = bus.take_coverage() {
+        for line in coverage.format().lines() {
+            console.diag(line);
+        }
     }
 
     report
@@ -1169,6 +1249,7 @@ fn run_guest(
         frames: bus.0.frames(),
         final_pc: cpu.pc,
         overlay_cleared: !bus.0.overlay(),
+        max_mode_timing: None,
     }
 }
 
@@ -1240,6 +1321,16 @@ fn run_guest_max(
     let mut screenshot_last_frame: Option<u64> = None;
     let mut last_progress_real = Instant::now();
 
+    let backend = args.cpu_backend;
+    // Step 7.2's baseline metrics (a gap in 7.1: its only MIPS figure
+    // averaged in STOP sleep time and never measured wall clock at all).
+    // `slept` accumulates only the STOP-path sleep below; everything else
+    // this function does is "busy" by definition, including the outer
+    // loop's own bookkeeping -- `Report::timing_report` reports busy MIPS
+    // from `wall_start.elapsed() - slept`.
+    let wall_start = Instant::now();
+    let mut slept = Duration::ZERO;
+
     let clock_hz = max_mode_clock_hz();
     // The wall-clock instant device time is caught up to. Advanced by
     // exactly one event's worth of real time per iteration (ADR 0006
@@ -1252,8 +1343,12 @@ fn run_guest_max(
     // first chunk undershoots `MAX_MODE_CHUNK_TARGET_US`, which only
     // costs one extra `run_for_cycles` call before the estimate catches
     // up) rather than high (which could blow the latency bound on a slow
-    // host's very first chunk).
+    // host's very first chunk). Used only by the `interp` back end.
     let mut chunk_cycles: i32 = 4_000;
+    // The `batch` back end's equivalent, in instructions rather than
+    // cycles (`run_batch` reports no cycle count -- `MAX_MODE_MIN_CHUNK_INSTRS`'s
+    // own doc comment on why this never touches `cycles_remaining`).
+    let mut chunk_instrs: u32 = 1_000;
 
     let outcome = 'outer: loop {
         let deadline = bus.0.next_event_deadline_clocks();
@@ -1272,8 +1367,29 @@ fn run_guest_max(
         // a while loop.
         loop {
             let chunk_start = Instant::now();
-            let budget = chunk_cycles.clamp(MAX_MODE_MIN_CHUNK_CYCLES, MAX_MODE_MAX_CHUNK_CYCLES);
-            let result = cpu.run_for_cycles(bus, budget);
+            let result: CycleBatchResult = match backend {
+                crate::cli::CpuBackend::Interp => {
+                    let budget =
+                        chunk_cycles.clamp(MAX_MODE_MIN_CHUNK_CYCLES, MAX_MODE_MAX_CHUNK_CYCLES);
+                    cpu.run_for_cycles(bus, budget)
+                }
+                crate::cli::CpuBackend::Batch => {
+                    let budget =
+                        chunk_instrs.clamp(MAX_MODE_MIN_CHUNK_INSTRS, MAX_MODE_MAX_CHUNK_INSTRS);
+                    let batch = cpu.run_batch(bus, budget, &[]);
+                    CycleBatchResult {
+                        // `run_batch` reports no cycle count at all; `0`
+                        // here is inert -- nothing below reads `.cycles`
+                        // for the `Batch` arm (the chunk-size update
+                        // below is instruction-based instead), and device
+                        // time is advanced from `deadline`, never from
+                        // this field, in both back ends.
+                        cycles: 0,
+                        instructions: batch.instructions,
+                        exit: map_batch_exit(batch.exit),
+                    }
+                }
+            };
             let chunk_elapsed = chunk_start.elapsed();
 
             total_instructions += result.instructions as u64;
@@ -1281,15 +1397,36 @@ fn run_guest_max(
             // Correct the chunk-size estimate from this chunk's actual
             // rate -- skipped when nothing ran (e.g. an already-stopped
             // CPU's zero-cycle exit), which would corrupt the estimate
-            // rather than refine it.
-            if result.cycles > 0 && chunk_elapsed > Duration::ZERO {
-                let cycles_per_us = result.cycles as f64 / chunk_elapsed.as_secs_f64() / 1e6;
-                let target = (cycles_per_us * MAX_MODE_CHUNK_TARGET_US).round();
-                if target.is_finite() {
-                    chunk_cycles = (target as i64).clamp(
-                        MAX_MODE_MIN_CHUNK_CYCLES as i64,
-                        MAX_MODE_MAX_CHUNK_CYCLES as i64,
-                    ) as i32;
+            // rather than refine it. Each back end adapts its own chunk
+            // unit (cycles for `interp`, instructions for `batch`) from
+            // its own measured rate; neither reads the other's budget or
+            // `cycles_remaining`.
+            match backend {
+                crate::cli::CpuBackend::Interp => {
+                    if result.cycles > 0 && chunk_elapsed > Duration::ZERO {
+                        let cycles_per_us =
+                            result.cycles as f64 / chunk_elapsed.as_secs_f64() / 1e6;
+                        let target = (cycles_per_us * MAX_MODE_CHUNK_TARGET_US).round();
+                        if target.is_finite() {
+                            chunk_cycles = (target as i64).clamp(
+                                MAX_MODE_MIN_CHUNK_CYCLES as i64,
+                                MAX_MODE_MAX_CHUNK_CYCLES as i64,
+                            ) as i32;
+                        }
+                    }
+                }
+                crate::cli::CpuBackend::Batch => {
+                    if result.instructions > 0 && chunk_elapsed > Duration::ZERO {
+                        let instrs_per_us =
+                            result.instructions as f64 / chunk_elapsed.as_secs_f64() / 1e6;
+                        let target = (instrs_per_us * MAX_MODE_CHUNK_TARGET_US).round();
+                        if target.is_finite() {
+                            chunk_instrs = (target as i64).clamp(
+                                MAX_MODE_MIN_CHUNK_INSTRS as i64,
+                                MAX_MODE_MAX_CHUNK_INSTRS as i64,
+                            ) as u32;
+                        }
+                    }
                 }
             }
 
@@ -1492,7 +1629,9 @@ fn run_guest_max(
                         }
                     }
                 }
-                std::thread::sleep((t_event - now).min(MAX_MODE_STOP_SLEEP_SLICE));
+                let slice = (t_event - now).min(MAX_MODE_STOP_SLEEP_SLICE);
+                std::thread::sleep(slice);
+                slept += slice;
             }
 
             // Advance device time event by event up to the real now, the
@@ -1547,6 +1686,30 @@ fn run_guest_max(
         frames: bus.0.frames(),
         final_pc: cpu.pc,
         overlay_cleared: !bus.0.overlay(),
+        max_mode_timing: Some(MaxModeTiming {
+            wall: wall_start.elapsed(),
+            slept,
+        }),
+    }
+}
+
+/// Map `run_batch`'s [`BatchExit`] onto the same [`CycleBatchExit`] shape
+/// `run_guest_max`'s chunk-exit handling already switches on, so
+/// `--cpu-backend batch` reuses that match unchanged. `WatchedPc` never
+/// occurs: `run_guest_max` always calls `run_batch` with an empty
+/// `watch_pcs` list.
+fn map_batch_exit(exit: BatchExit) -> CycleBatchExit {
+    match exit {
+        BatchExit::BudgetExhausted => CycleBatchExit::BudgetExhausted,
+        BatchExit::Stopped => CycleBatchExit::Stopped,
+        BatchExit::AlineTrap { opcode } => CycleBatchExit::AlineTrap { opcode },
+        BatchExit::FlineTrap { opcode } => CycleBatchExit::FlineTrap { opcode },
+        BatchExit::TrapInstruction { trap_num } => CycleBatchExit::TrapInstruction { trap_num },
+        BatchExit::Breakpoint { bp_num } => CycleBatchExit::Breakpoint { bp_num },
+        BatchExit::IllegalInstruction { opcode } => CycleBatchExit::IllegalInstruction { opcode },
+        BatchExit::WatchedPc { .. } => {
+            unreachable!("run_guest_max always calls run_batch with an empty watch_pcs list")
+        }
     }
 }
 

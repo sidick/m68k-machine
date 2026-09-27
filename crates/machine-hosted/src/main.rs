@@ -40,6 +40,9 @@ fn main() -> ExitCode {
 
     let report = run::run(&args, &mut console);
     let code = report.exit_code();
+    if let Some(timing) = report.timing_report() {
+        console.diag(&timing);
+    }
     console.diag(&format!("PHASE1 HOSTED: {}", report.status_line()));
 
     ExitCode::from(code)

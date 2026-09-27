@@ -1264,6 +1264,40 @@ impl<'a> MachineBus<'a> {
         self.chipset.frames
     }
 
+    /// Fast RAM's placed AUTOCONFIG base and length, clamped to whichever
+    /// is shorter: the declared AUTOCONFIG window or the actual buffer a
+    /// board layer supplied ([`Self::with_fast_ram`]'s own doc comment on
+    /// why those can differ). `None` until fast RAM is both attached and
+    /// configured by AUTOCONFIG -- never a constant, per
+    /// `docs/device-ledger.md`'s standing rule against hardcoding
+    /// AUTOCONFIG-placed addresses. Read-only counterpart of
+    /// [`Self::fast_ram_window_mut`], for callers (bus-access region
+    /// classification, `docs/bus-fast-path-plan.md` step 7.2) that only
+    /// need the window's extent, not a pointer into it.
+    pub fn fast_ram_window(&self) -> Option<(u32, u32)> {
+        let (base, window_len) = self.ram.fast_window?;
+        let mem_len = self.ram.fast_ram.as_deref()?.len();
+        Some((base, window_len.min(mem_len as u32)))
+    }
+
+    /// Fast RAM's placed AUTOCONFIG base and the mutable slice backing
+    /// it, clamped the same way [`Self::fast_ram_window`] is. This is the
+    /// seam `machine-hosted`'s `m68k::AddressBus::fast_mem` derives its
+    /// `FastMem` window from (`docs/bus-fast-path-plan.md` step 7.2): the
+    /// window is fast RAM's real backing storage, not a copy, matching
+    /// `FastMem`'s contract that `ptr[a - base]` is the bus's actual RAM.
+    /// `None` whenever [`Self::fast_ram_window`] would be, or when the
+    /// clamped window is empty.
+    pub fn fast_ram_window_mut(&mut self) -> Option<(u32, &mut [u8])> {
+        let (base, window_len) = self.ram.fast_window?;
+        let mem = self.ram.fast_ram.as_deref_mut()?;
+        let len = (window_len as usize).min(mem.len());
+        if len == 0 {
+            return None;
+        }
+        Some((base, &mut mem[..len]))
+    }
+
     /// Backing storage and within-region offset for a *read* at
     /// `address`, if it falls inside a region the fast path can answer
     /// directly without walking the rest of the chain: fast RAM (via
