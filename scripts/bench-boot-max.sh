@@ -18,9 +18,13 @@
 #   M68K_BENCH_HDF         path to a bootable hostblk image
 #                          (default: $REPO_ROOT/nondistribution/m68k-machine.hdf)
 #   BOOT_FRAMES            --max-frames for the boot-to-Workbench-ready
-#                          comparison (default: 2200 -- past the boot
-#                          menu and overlay-clear on this ROM/HDF pair;
-#                          not a full desktop-idle wait, see IDLE_FRAMES)
+#                          comparison (default: 4400 -- an idle Workbench
+#                          desktop is up and mouse-interactive by frame
+#                          ~4200 on this ROM/HDF pair, the same guest-frame
+#                          count scripted-input tests elsewhere in this
+#                          repo wait out before clicking; frame count is
+#                          guest-time, invariant between cycle and max
+#                          mode, which is exactly ADR 0006's point)
 #   IDLE_FRAMES            --max-frames for the idle-cost run, started
 #                          after BOOT_FRAMES so the guest is already past
 #                          boot when the idle window is measured
@@ -54,7 +58,7 @@ done
 
 ROM="${M68K_KICKSTART_A1200:-$REPO_ROOT/nondistribution/A1200.47.115.rom}"
 HDF="${M68K_BENCH_HDF:-$REPO_ROOT/nondistribution/m68k-machine.hdf}"
-BOOT_FRAMES="${BOOT_FRAMES:-2200}"
+BOOT_FRAMES="${BOOT_FRAMES:-4400}"
 IDLE_FRAMES="${IDLE_FRAMES:-1000}"
 
 if [ ! -f "$ROM" ]; then

@@ -351,3 +351,74 @@ mode.
 | 4 lazy CIA/beam tick (this branch, `main` c7481b5 base), before | 4.862 s (28.0 MIPS) / 4.617 s (29.5 MIPS) | 2.941 s (30.1 MIPS) / 2.948 s (30.0 MIPS) | two runs on `main` c7481b5's own release build, interleaved with the "after" rows below on a machine under noticeable background load (bare varied 4.09-5.53 s across nominally identical runs on both sides, so wall clock alone is not trustworthy here -- the profile percentages below are the load-bearing numbers). Full-config profile: `tick` 15.25% inclusive, almost all of it `Cia::tick` (10.33% self) -- this is `MachineBus::tick`'s per-call CIA E-clock/beam-advance overhead the plan's step 4 set out to remove, confirmed still present on `main` going into this work |
 | 4 lazy CIA/beam tick, after | 4.776 s (28.5 MIPS) / 4.089 s (33.3 MIPS) | 3.273 s (27.0 MIPS) / 2.693 s (32.8 MIPS) | `MachineBus::tick` now only accumulates `pending_clocks` and flushes (applies the exact per-call path, `tick_exact`) when accumulated clocks reach `next_event_clocks` -- the nearest raster line boundary or CIA timer/keyboard deadline -- rather than every retired instruction; every CIA/custom-register accessor flushes first, and a write that can newly assert or clear a still-latched level interrupt (`write_cia`, `write_custom_word`, Graffity's write arm) reasserts it immediately (`reassert_level_irqs`) so guest-visible interrupt timing is unchanged. Proved exact by a 1.6M-step differential test (`lib.rs`, `lazy_tick_matches_eager_tick_across_random_sequences`) against the old eager path, both driven by the same `tick_exact`. `MachineBus::tick`/`tick_exact` are fully inlined away under this workspace's `lto = "fat"`/`codegen-units = 1`, so `flush` is the closest surviving symbol for the whole batched application: full-config profile `flush` 3.41% inclusive (`cia::Cia::tick` 2.40% self, `recompute_next_event` 1.28% self), bare-config `flush` 2.30% inclusive (`cia::Cia::tick` 1.94%) -- both **under the 5% target**, down from 15.25%/10.33% on `main`. Wall clock is noise-dominated on this run (see the "before" row) and does not show a clean win or loss either way, which is expected: step 4.1 had already removed the device-engine share of `tick`'s cost, so this step's win is a profile-share reduction (CIA/beam overhead that was ~10-15% of the full run is now ~1-3%) rather than a further multiple on top of step 4.1's already-large wall-clock gain |
 | 4 lazy CIA/beam tick, supervisor re-measure | 4.196 s (32.5 MIPS) vs `main` 4.693 s (29.0 MIPS) | 2.729 s (32.4 MIPS) vs `main` 3.024 s (29.2 MIPS) | best of two, alternating branch and `main` builds run by run; ~11% bare, ~10% full. `tick` inclusive in the full profile is now ~3.4% (`flush`), under the 5% gate |
+| 7.1 `--cpu-speed max` | n/a (see below) | n/a (see below) | landed: `MachineBus::next_event_deadline_clocks`/`take_boundary_request`, `run_guest_max` in `machine-hosted`. The bare/full 1500f columns don't apply -- max mode's whole point is that wall clock for a fixed frame count is meaningless to compare across configs (it's `frames/50` regardless of host speed by design), so `scripts/bench-boot-max.sh` measures wall-clock-to-a-fixed-frame-count and guest MIPS instead. See the paragraph below the table for numbers and the evidence checklist. |
+
+### 7.1 results
+
+`scripts/bench-boot-max.sh --label step-7.1`, this machine, boot-to-4400-
+frames on the real Kickstart 3.2.2 A1200 ROM/HDF pair (frame 4400 is an
+idle Workbench desktop, mouse-interactive -- the same guest-frame count
+the scripted-input real-ROM tests wait out before clicking):
+
+| | wall clock | guest instructions | guest MIPS |
+|---|---|---|---|
+| cycle mode, 4400 frames | 1.614 s | 41,894,978 | 26.0 |
+| max mode, 4400 frames | 87.892 s | 96,813,431 | 1.1 |
+
+Wall clock to frame 4400 under max mode is ~54x cycle mode's, and lands
+almost exactly on `4400 / 50 = 88 s` -- direct confirmation that device
+time is paced to the wall clock, not running unboundedly fast the way
+cycle mode's is. Guest MIPS *over the whole boot, wall-clock-averaged* is
+1.1, far below cycle mode's 26.0 -- expected and correct, not a
+regression: most of those 88 real seconds are STOP-parked (Kickstart's
+insert-disk wait, the boot menu, idle dispatcher ticks between device
+events), and a correctly-*sleeping* STOP retires no instructions during
+that time. A STOP that busy-spun instead would show a guest MIPS figure
+much closer to cycle mode's, padded with wasted work -- 1.1 is itself
+evidence the sleep path is doing its job, not merely a slower number.
+
+Idle host CPU (`/usr/bin/time -l`, one continuous run to frame 5400 --
+4400 boot + 1000 further frames, 20 s, of idle Workbench): **user 3.46 s
++ sys 3.38 s over 107.82 s real, ~6.3% of one core averaged across the
+whole run** (boot's own more-active first ~88 s folded in with the last
+~20 s of genuine idle). Confirms the idle-cost requirement's spirit --
+close to zero, not close to 100% -- but is not an idle-only isolate:
+splitting "boot" from "idle" cost needs the runner to report an
+intermediate checkpoint from inside one continuous process (e.g. an
+`--inspect`-style dump at a chosen frame), which is not implemented and
+is left as follow-up.
+
+**A per-window guest-MIPS figure for the idle segment alone was attempted
+and abandoned**: `scripts/bench-boot-max.sh`'s first version subtracted a
+4400-frame run's own instruction count from a separate 5400-frame run's
+count to isolate the last 1000 frames. Both numbers came back from
+independent process launches, and max mode's own non-reproducibility
+(ADR 0006, "What is given up in max mode") means two separately-launched
+boots to the same frame count differ by more instructions (measured:
+~750,000 here) than the entire idle window itself likely contains --
+the subtraction went negative on both attempts. This is not a bug to fix
+so much as the expected shape of an unbudgeted CPU: the fix is measuring
+idle MIPS from *one* run's own internal accounting at two points, not
+two runs' totals, which is the same follow-up as the paragraph above.
+
+`Wait 5` timer accuracy (`crates/machine-hosted/tests/real_rom.rs`,
+`max_cpu_speed_boots_to_workbench_and_keeps_real_time_across_wait_5`):
+measured gap **5.093 s**, tolerance ±0.5 s (deviation +0.093 s). Same
+test also stands as the required "max-mode boot to Workbench with
+scripted input and serial markers" evidence.
+
+Evidence checklist (ADR 0006, "Evidence required before max mode is
+called working"):
+
+- [x] All 18 real-ROM tests (17 pre-existing + the new max-mode one),
+      both pktport proofs, and both QEMU boards pass in cycle mode,
+      unchanged.
+- [x] A max-mode boot to Workbench with scripted input and serial
+      markers.
+- [x] timer.device keeps real time (`Wait 5`, measured 5.093 s).
+- [~] An idle Workbench in max mode uses little host CPU -- confirmed at
+      whole-run granularity (~6.3% of one core over a window that
+      includes boot), not yet isolated to the idle segment alone (see
+      above).
+- [x] Benchmarks: wall clock to a fixed frame count and guest MIPS, cycle
+      vs max, above.
