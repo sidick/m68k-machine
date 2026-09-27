@@ -1658,6 +1658,30 @@ fn run_guest_max(
             }
             cpu.set_irq(bus.0.pending_irq_level());
             drain_serial(bus, console, serial_tcp);
+
+            // `run_batch` cannot wake a stopped CPU on its own: its own
+            // stopped check (the fork's `run_batch_inner`) returns
+            // `Stopped` immediately whenever `cpu.stopped != 0`, with no
+            // call to the interrupt-driven wake check `run_for_cycles`/
+            // `execute` make unconditionally before *their* stopped
+            // check. Confirmed empirically before this fix: a max-mode
+            // boot under `--cpu-backend batch` parked at Kickstart's idle
+            // STOP by frame ~3650 and never advanced again for the rest
+            // of a 6500-frame run (final PC frozen, busy MIPS near zero
+            // from the outer loop spinning on `Stopped` results). A
+            // minimal interpreter probe after every device-time advance
+            // gives the core's own wake-on-serviceable-interrupt logic
+            // (`stopped_supervisor_check`) the chance `run_batch` never
+            // does; it costs nothing when the CPU is not yet serviceable
+            // (`execute`'s own stopped branch returns without consuming
+            // cycles in that case) and only takes real work exactly when
+            // a wake is due, in cycle mode's `CycleBatchExit::Stopped` arm
+            // and the interp back end never need this because both drive
+            // `run_for_cycles`, which already includes this check.
+            if backend == crate::cli::CpuBackend::Batch {
+                let wake = cpu.run_for_cycles(bus, 4);
+                total_instructions += wake.instructions as u64;
+            }
             continue 'outer;
         }
 
