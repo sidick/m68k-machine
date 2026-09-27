@@ -2594,12 +2594,20 @@ fn kickstart_3_2_2_a1200_cpubench_reports_every_kernel_under_max_speed() {
 
     for name in KERNEL_NAMES {
         let prefix = format!("CPUBENCH {name} ");
-        let line = serial_log
+        // `--serial-log` captures the same "GUEST | ..."/"host  | ..."
+        // console lines `run()`'s own stdout does (confirmed by reading
+        // the file directly), not bare serial bytes -- so the marker is
+        // found with `contains`/`find` (a substring), never
+        // `starts_with` on the whole line, and everything from the
+        // marker onward (not the whole line, which still has "GUEST | "
+        // ahead of it) is what gets split into fields.
+        let full_line = serial_log
             .lines()
-            .find(|l| l.starts_with(&prefix))
+            .find(|l| l.contains(&prefix))
             .unwrap_or_else(|| {
                 panic!("never saw a \"{prefix}...\" line on serial -- serial log:\n{serial_log}")
             });
+        let line = &full_line[full_line.find(&prefix).unwrap()..];
         let fields: Vec<&str> = line.split_whitespace().collect();
         assert_eq!(
             fields.len(),
@@ -2637,14 +2645,15 @@ fn kickstart_3_2_2_a1200_cpubench_reports_every_kernel_under_max_speed() {
     // but not asserted here, in keeping with this test's "report, don't
     // threshold" posture.
     let coremark_prefix = "CPUBENCH coremark ";
-    let coremark_line = serial_log
+    let coremark_full_line = serial_log
         .lines()
-        .find(|l| l.starts_with(coremark_prefix))
+        .find(|l| l.contains(coremark_prefix))
         .unwrap_or_else(|| {
             panic!(
                 "never saw a \"{coremark_prefix}...\" line on serial -- serial log:\n{serial_log}"
             )
         });
+    let coremark_line = &coremark_full_line[coremark_full_line.find(coremark_prefix).unwrap()..];
     let coremark_rate: f64 = coremark_line
         .split_whitespace()
         .nth(2)
@@ -2656,14 +2665,14 @@ fn kickstart_3_2_2_a1200_cpubench_reports_every_kernel_under_max_speed() {
     );
     println!("coremark             iterations/sec = {coremark_rate:.3}");
 
-    if let Some(score_line) = serial_log.lines().find(|l| l.starts_with("CoreMark 1.0")) {
+    if let Some(score_line) = serial_log.lines().find(|l| l.contains("CoreMark 1.0")) {
         println!("{score_line}");
     } else {
         println!("(no validated \"CoreMark 1.0 : ...\" score line printed -- see serial log)");
     }
 
     assert!(
-        serial_log.lines().any(|l| l == "CPUBENCH DONE"),
+        serial_log.lines().any(|l| l.contains("CPUBENCH DONE")),
         "never saw the final \"CPUBENCH DONE\" marker -- serial log:\n{serial_log}"
     );
 }

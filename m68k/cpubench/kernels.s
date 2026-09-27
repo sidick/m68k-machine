@@ -141,7 +141,28 @@ _KernelFixedOverhead:
         xdef    _run_kernel_reg_addq_bra
         xdef    kernel_reg_addq_bra
 
+* C-callable entry: m68k-amigaos-gcc's calling convention treats only
+* d0-d1/a0-a1 as caller-saved scratch -- d2-d7/a2-a6 (which includes
+* the frame pointer a5 and any register gcc is holding a library base
+* in, typically a6) are callee-saved, and every kernel here clobbers
+* some of that range (kernels.s's own per-kernel header comments say
+* which). Calling the bare kernel body directly as a C function --
+* this file's first working version did exactly that -- corrupts
+* cpubench.c's own register state the moment a kernel touches
+* anything past d0/d1/a0/a1: found the hard way (real-ROM evidence,
+* not guesswork) when reg_mix (the third kernel, the first one that
+* writes d2-d7) left ReadEClock() reading a trashed base and the
+* guest eventually executing garbage. This thin wrapper is the fix:
+* save/restore the full callee-saved set around a BSR into the bare
+* body below, so the body can go on clobbering everything it wants.
+* Outside the timed per-iteration loop, so it costs nothing in the
+* per-iteration instruction counts kernels.s documents.
 _run_kernel_reg_addq_bra:
+        movem.l d2-d7/a2-a6,-(sp)
+        bsr     kernel_reg_addq_bra
+        movem.l (sp)+,d2-d7/a2-a6
+        rts
+
 kernel_reg_addq_bra:
 .loop:
         addq.l  #1,d1
@@ -188,7 +209,28 @@ kernel_reg_addq_bra:
         xdef    _run_kernel_reg_tst_bne
         xdef    kernel_reg_tst_bne
 
+* C-callable entry: m68k-amigaos-gcc's calling convention treats only
+* d0-d1/a0-a1 as caller-saved scratch -- d2-d7/a2-a6 (which includes
+* the frame pointer a5 and any register gcc is holding a library base
+* in, typically a6) are callee-saved, and every kernel here clobbers
+* some of that range (kernels.s's own per-kernel header comments say
+* which). Calling the bare kernel body directly as a C function --
+* this file's first working version did exactly that -- corrupts
+* cpubench.c's own register state the moment a kernel touches
+* anything past d0/d1/a0/a1: found the hard way (real-ROM evidence,
+* not guesswork) when reg_mix (the third kernel, the first one that
+* writes d2-d7) left ReadEClock() reading a trashed base and the
+* guest eventually executing garbage. This thin wrapper is the fix:
+* save/restore the full callee-saved set around a BSR into the bare
+* body below, so the body can go on clobbering everything it wants.
+* Outside the timed per-iteration loop, so it costs nothing in the
+* per-iteration instruction counts kernels.s documents.
 _run_kernel_reg_tst_bne:
+        movem.l d2-d7/a2-a6,-(sp)
+        bsr     kernel_reg_tst_bne
+        movem.l (sp)+,d2-d7/a2-a6
+        rts
+
 kernel_reg_tst_bne:
 .loop:
         tst.l   d1
@@ -223,7 +265,28 @@ kernel_reg_tst_bne:
         xdef    _run_kernel_reg_mix
         xdef    kernel_reg_mix
 
+* C-callable entry: m68k-amigaos-gcc's calling convention treats only
+* d0-d1/a0-a1 as caller-saved scratch -- d2-d7/a2-a6 (which includes
+* the frame pointer a5 and any register gcc is holding a library base
+* in, typically a6) are callee-saved, and every kernel here clobbers
+* some of that range (kernels.s's own per-kernel header comments say
+* which). Calling the bare kernel body directly as a C function --
+* this file's first working version did exactly that -- corrupts
+* cpubench.c's own register state the moment a kernel touches
+* anything past d0/d1/a0/a1: found the hard way (real-ROM evidence,
+* not guesswork) when reg_mix (the third kernel, the first one that
+* writes d2-d7) left ReadEClock() reading a trashed base and the
+* guest eventually executing garbage. This thin wrapper is the fix:
+* save/restore the full callee-saved set around a BSR into the bare
+* body below, so the body can go on clobbering everything it wants.
+* Outside the timed per-iteration loop, so it costs nothing in the
+* per-iteration instruction counts kernels.s documents.
 _run_kernel_reg_mix:
+        movem.l d2-d7/a2-a6,-(sp)
+        bsr     kernel_reg_mix
+        movem.l (sp)+,d2-d7/a2-a6
+        rts
+
 kernel_reg_mix:
 .loop:
         moveq   #5,d1
@@ -262,7 +325,28 @@ kernel_reg_mix:
         xdef    _run_kernel_mem_copy
         xdef    kernel_mem_copy
 
+* C-callable entry: m68k-amigaos-gcc's calling convention treats only
+* d0-d1/a0-a1 as caller-saved scratch -- d2-d7/a2-a6 (which includes
+* the frame pointer a5 and any register gcc is holding a library base
+* in, typically a6) are callee-saved, and every kernel here clobbers
+* some of that range (kernels.s's own per-kernel header comments say
+* which). Calling the bare kernel body directly as a C function --
+* this file's first working version did exactly that -- corrupts
+* cpubench.c's own register state the moment a kernel touches
+* anything past d0/d1/a0/a1: found the hard way (real-ROM evidence,
+* not guesswork) when reg_mix (the third kernel, the first one that
+* writes d2-d7) left ReadEClock() reading a trashed base and the
+* guest eventually executing garbage. This thin wrapper is the fix:
+* save/restore the full callee-saved set around a BSR into the bare
+* body below, so the body can go on clobbering everything it wants.
+* Outside the timed per-iteration loop, so it costs nothing in the
+* per-iteration instruction counts kernels.s documents.
 _run_kernel_mem_copy:
+        movem.l d2-d7/a2-a6,-(sp)
+        bsr     kernel_mem_copy
+        movem.l (sp)+,d2-d7/a2-a6
+        rts
+
 kernel_mem_copy:
 .loop:
         movea.l a0,a2
@@ -314,7 +398,28 @@ kernel_mem_copy:
         xdef    _run_kernel_mem_fill
         xdef    kernel_mem_fill
 
+* C-callable entry: m68k-amigaos-gcc's calling convention treats only
+* d0-d1/a0-a1 as caller-saved scratch -- d2-d7/a2-a6 (which includes
+* the frame pointer a5 and any register gcc is holding a library base
+* in, typically a6) are callee-saved, and every kernel here clobbers
+* some of that range (kernels.s's own per-kernel header comments say
+* which). Calling the bare kernel body directly as a C function --
+* this file's first working version did exactly that -- corrupts
+* cpubench.c's own register state the moment a kernel touches
+* anything past d0/d1/a0/a1: found the hard way (real-ROM evidence,
+* not guesswork) when reg_mix (the third kernel, the first one that
+* writes d2-d7) left ReadEClock() reading a trashed base and the
+* guest eventually executing garbage. This thin wrapper is the fix:
+* save/restore the full callee-saved set around a BSR into the bare
+* body below, so the body can go on clobbering everything it wants.
+* Outside the timed per-iteration loop, so it costs nothing in the
+* per-iteration instruction counts kernels.s documents.
 _run_kernel_mem_fill:
+        movem.l d2-d7/a2-a6,-(sp)
+        bsr     kernel_mem_fill
+        movem.l (sp)+,d2-d7/a2-a6
+        rts
+
 kernel_mem_fill:
 .loop:
         movea.l a0,a2
@@ -367,7 +472,28 @@ kernel_mem_fill:
         xdef    _run_kernel_struct_walk
         xdef    kernel_struct_walk
 
+* C-callable entry: m68k-amigaos-gcc's calling convention treats only
+* d0-d1/a0-a1 as caller-saved scratch -- d2-d7/a2-a6 (which includes
+* the frame pointer a5 and any register gcc is holding a library base
+* in, typically a6) are callee-saved, and every kernel here clobbers
+* some of that range (kernels.s's own per-kernel header comments say
+* which). Calling the bare kernel body directly as a C function --
+* this file's first working version did exactly that -- corrupts
+* cpubench.c's own register state the moment a kernel touches
+* anything past d0/d1/a0/a1: found the hard way (real-ROM evidence,
+* not guesswork) when reg_mix (the third kernel, the first one that
+* writes d2-d7) left ReadEClock() reading a trashed base and the
+* guest eventually executing garbage. This thin wrapper is the fix:
+* save/restore the full callee-saved set around a BSR into the bare
+* body below, so the body can go on clobbering everything it wants.
+* Outside the timed per-iteration loop, so it costs nothing in the
+* per-iteration instruction counts kernels.s documents.
 _run_kernel_struct_walk:
+        movem.l d2-d7/a2-a6,-(sp)
+        bsr     kernel_struct_walk
+        movem.l (sp)+,d2-d7/a2-a6
+        rts
+
 kernel_struct_walk:
 .loop:
         movea.l a0,a2
@@ -415,7 +541,28 @@ kernel_struct_walk:
         xdef    _run_kernel_movem_saverestore
         xdef    kernel_movem_saverestore
 
+* C-callable entry: m68k-amigaos-gcc's calling convention treats only
+* d0-d1/a0-a1 as caller-saved scratch -- d2-d7/a2-a6 (which includes
+* the frame pointer a5 and any register gcc is holding a library base
+* in, typically a6) are callee-saved, and every kernel here clobbers
+* some of that range (kernels.s's own per-kernel header comments say
+* which). Calling the bare kernel body directly as a C function --
+* this file's first working version did exactly that -- corrupts
+* cpubench.c's own register state the moment a kernel touches
+* anything past d0/d1/a0/a1: found the hard way (real-ROM evidence,
+* not guesswork) when reg_mix (the third kernel, the first one that
+* writes d2-d7) left ReadEClock() reading a trashed base and the
+* guest eventually executing garbage. This thin wrapper is the fix:
+* save/restore the full callee-saved set around a BSR into the bare
+* body below, so the body can go on clobbering everything it wants.
+* Outside the timed per-iteration loop, so it costs nothing in the
+* per-iteration instruction counts kernels.s documents.
 _run_kernel_movem_saverestore:
+        movem.l d2-d7/a2-a6,-(sp)
+        bsr     kernel_movem_saverestore
+        movem.l (sp)+,d2-d7/a2-a6
+        rts
+
 kernel_movem_saverestore:
 .loop:
         lea     32(a0),a2
@@ -444,7 +591,28 @@ kernel_movem_saverestore:
         xdef    _run_kernel_jsr_rts_chain
         xdef    kernel_jsr_rts_chain
 
+* C-callable entry: m68k-amigaos-gcc's calling convention treats only
+* d0-d1/a0-a1 as caller-saved scratch -- d2-d7/a2-a6 (which includes
+* the frame pointer a5 and any register gcc is holding a library base
+* in, typically a6) are callee-saved, and every kernel here clobbers
+* some of that range (kernels.s's own per-kernel header comments say
+* which). Calling the bare kernel body directly as a C function --
+* this file's first working version did exactly that -- corrupts
+* cpubench.c's own register state the moment a kernel touches
+* anything past d0/d1/a0/a1: found the hard way (real-ROM evidence,
+* not guesswork) when reg_mix (the third kernel, the first one that
+* writes d2-d7) left ReadEClock() reading a trashed base and the
+* guest eventually executing garbage. This thin wrapper is the fix:
+* save/restore the full callee-saved set around a BSR into the bare
+* body below, so the body can go on clobbering everything it wants.
+* Outside the timed per-iteration loop, so it costs nothing in the
+* per-iteration instruction counts kernels.s documents.
 _run_kernel_jsr_rts_chain:
+        movem.l d2-d7/a2-a6,-(sp)
+        bsr     kernel_jsr_rts_chain
+        movem.l (sp)+,d2-d7/a2-a6
+        rts
+
 kernel_jsr_rts_chain:
 .loop:
         jsr     .leaf
@@ -476,7 +644,28 @@ kernel_jsr_rts_chain:
         xdef    _run_kernel_muldiv_mix
         xdef    kernel_muldiv_mix
 
+* C-callable entry: m68k-amigaos-gcc's calling convention treats only
+* d0-d1/a0-a1 as caller-saved scratch -- d2-d7/a2-a6 (which includes
+* the frame pointer a5 and any register gcc is holding a library base
+* in, typically a6) are callee-saved, and every kernel here clobbers
+* some of that range (kernels.s's own per-kernel header comments say
+* which). Calling the bare kernel body directly as a C function --
+* this file's first working version did exactly that -- corrupts
+* cpubench.c's own register state the moment a kernel touches
+* anything past d0/d1/a0/a1: found the hard way (real-ROM evidence,
+* not guesswork) when reg_mix (the third kernel, the first one that
+* writes d2-d7) left ReadEClock() reading a trashed base and the
+* guest eventually executing garbage. This thin wrapper is the fix:
+* save/restore the full callee-saved set around a BSR into the bare
+* body below, so the body can go on clobbering everything it wants.
+* Outside the timed per-iteration loop, so it costs nothing in the
+* per-iteration instruction counts kernels.s documents.
 _run_kernel_muldiv_mix:
+        movem.l d2-d7/a2-a6,-(sp)
+        bsr     kernel_muldiv_mix
+        movem.l (sp)+,d2-d7/a2-a6
+        rts
+
 kernel_muldiv_mix:
         moveq   #7,d5
 .loop:
@@ -513,7 +702,28 @@ kernel_muldiv_mix:
         xdef    _run_kernel_bitfield_ops
         xdef    kernel_bitfield_ops
 
+* C-callable entry: m68k-amigaos-gcc's calling convention treats only
+* d0-d1/a0-a1 as caller-saved scratch -- d2-d7/a2-a6 (which includes
+* the frame pointer a5 and any register gcc is holding a library base
+* in, typically a6) are callee-saved, and every kernel here clobbers
+* some of that range (kernels.s's own per-kernel header comments say
+* which). Calling the bare kernel body directly as a C function --
+* this file's first working version did exactly that -- corrupts
+* cpubench.c's own register state the moment a kernel touches
+* anything past d0/d1/a0/a1: found the hard way (real-ROM evidence,
+* not guesswork) when reg_mix (the third kernel, the first one that
+* writes d2-d7) left ReadEClock() reading a trashed base and the
+* guest eventually executing garbage. This thin wrapper is the fix:
+* save/restore the full callee-saved set around a BSR into the bare
+* body below, so the body can go on clobbering everything it wants.
+* Outside the timed per-iteration loop, so it costs nothing in the
+* per-iteration instruction counts kernels.s documents.
 _run_kernel_bitfield_ops:
+        movem.l d2-d7/a2-a6,-(sp)
+        bsr     kernel_bitfield_ops
+        movem.l (sp)+,d2-d7/a2-a6
+        rts
+
 kernel_bitfield_ops:
 .loop:
         bfextu  (a0){0:8},d1
@@ -546,7 +756,28 @@ kernel_bitfield_ops:
         xdef    _run_kernel_cmp_branchy
         xdef    kernel_cmp_branchy
 
+* C-callable entry: m68k-amigaos-gcc's calling convention treats only
+* d0-d1/a0-a1 as caller-saved scratch -- d2-d7/a2-a6 (which includes
+* the frame pointer a5 and any register gcc is holding a library base
+* in, typically a6) are callee-saved, and every kernel here clobbers
+* some of that range (kernels.s's own per-kernel header comments say
+* which). Calling the bare kernel body directly as a C function --
+* this file's first working version did exactly that -- corrupts
+* cpubench.c's own register state the moment a kernel touches
+* anything past d0/d1/a0/a1: found the hard way (real-ROM evidence,
+* not guesswork) when reg_mix (the third kernel, the first one that
+* writes d2-d7) left ReadEClock() reading a trashed base and the
+* guest eventually executing garbage. This thin wrapper is the fix:
+* save/restore the full callee-saved set around a BSR into the bare
+* body below, so the body can go on clobbering everything it wants.
+* Outside the timed per-iteration loop, so it costs nothing in the
+* per-iteration instruction counts kernels.s documents.
 _run_kernel_cmp_branchy:
+        movem.l d2-d7/a2-a6,-(sp)
+        bsr     kernel_cmp_branchy
+        movem.l (sp)+,d2-d7/a2-a6
+        rts
+
 kernel_cmp_branchy:
 .loop:
         cmp.l   d2,d1

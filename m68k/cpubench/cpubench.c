@@ -35,28 +35,27 @@
  * design) so the two sides of step 8's ratio table were produced the
  * same way.
  *
- * KNOWN OPEN ISSUE (real-ROM evidence, not yet root-caused): on a real
- * Kickstart 3.2.2 boot, two back-to-back ReadEClock() calls bracketing
- * a single ~3600-instruction kernel call (reg_addq_bra/reg_tst_bne, the
- * two fastest kernels) measure a delta of roughly one real second's
- * worth of EClock ticks (freq correctly 709379 Hz; t1.ev_lo - t0.ev_lo
- * measured ~713,000 in one captured run) -- reproduced identically in
- * both `--cpu-speed cycle` and `--cpu-speed max`, and with Forbid()/
- * Permit() removed entirely, ruling out both the timing mode and this
- * file's own multitasking bracketing as the cause. A few calibration
- * steps later (once the outer iteration count has grown enough that a
- * kernel call takes a real amount of time), the accumulated skew
- * corrupts something further: the run eventually WEDGEs (an F-line
- * trap storm at a PC inside fast RAM, or a tight-loop detector firing
- * at PC 0). This smells like an issue in the emulated CIA's EClock/TOD
- * timer model rather than anything in this file (ReadEClock is used
- * exactly per the RKM: OpenDevice once, read the returned frequency
- * once per call, take a tick delta) -- but was not chased further into
- * crates/machine-core/src/cia.rs, per this project's own standing
- * instruction to stop and report a genuine divergence rather than
- * guess at a machine-core fix from outside it. See the CPU benchmark
- * task's final report for the full evidence trail (debug ReadEClock
- * dumps, cycle-vs-max and Forbid-vs-not comparisons).
+ * LESSON FOR THE NEXT PERSON WRITING GUEST ASSEMBLY CALLED FROM C ON
+ * THIS TOOLCHAIN: an early version of this file looked like it had
+ * found a machine-core CIA/EClock bug -- ReadEClock() calls bracketing
+ * a trivial kernel call measured about a real second of elapsed ticks,
+ * and a few kernels later the guest WEDGEd outright. It was not a CIA
+ * bug. `__asm("d0")`/`__asm("a0")`/`__asm("a1")` parameter bindings
+ * (kernels.s's whole calling convention) are part of a function's real
+ * type under this compiler, not merely a hint -- and a call made
+ * *through a function pointer* uses the pointer's own declared type to
+ * decide how to pass arguments, discarding whatever `__asm` bindings
+ * the pointed-to function actually has. This file used to store each
+ * kernel's address in a per-kernel `KernelFn fn` field and call
+ * `desc->fn(iters, a0, a1)` uniformly from a dispatch table; that
+ * compiles cleanly, and the first three kernels (which only read `d0`)
+ * even looked correct by coincidence, but every kernel that reads `a0`/
+ * `a1` was receiving garbage pointers and looping over whatever memory
+ * that garbage pointed to. See `call_kernel()` below (a plain `switch`
+ * that calls each kernel by its real, `__asm`-annotated name) for the
+ * fix, and the header comment above the externs for the full account,
+ * including the separate register-preservation bug (`_run_kernel_*`'s
+ * `movem.l` wrapper below) this one was first mistaken for.
  *---------------------------------------------------------------------------*/
 
 #include <exec/types.h>
@@ -79,24 +78,45 @@
 /*-----------------------------------------------------------------------------
  * Kernel externs. Every kernel in kernels.s follows the same
  * (ULONG d0, void *a0, void *a1) shape regardless of how many buffers it
- * actually reads (kernels.s's own header comment): a uniform C
- * prototype for all eleven means they share one function-pointer type
- * below instead of needing per-arity wrapper shims.
+ * actually reads (kernels.s's own header comment): unused registers are
+ * simply not read.
+ *
+ * IMPORTANT: these are called ONLY by their real name, directly, never
+ * through a function pointer -- see call_kernel() below for why, and
+ * for the actual dispatch. An earlier version of this file stored each
+ * kernel's address in a `KernelFn fn` field of a per-kernel table and
+ * called `desc->fn(iters, a0, a1)` uniformly for all eleven. That
+ * compiles cleanly and looked right for the first three kernels tried,
+ * but it is wrong, proven with a two-line isolated test (a tiny probe
+ * function that echoes `d0`/`a0`/`a1` straight back): calling a
+ * function *by its real name* with an `__asm("d0")`-annotated
+ * prototype puts the arguments in `d0`/`a0`/`a1` exactly as declared;
+ * calling the *same function* through a `void (*)(ULONG, void*,
+ * void*)` pointer -- with no `__asm` annotations, because a plain
+ * function-pointer type in this dialect cannot carry them at all --
+ * discards the register convention entirely and the callee reads
+ * whatever happened to already be in those registers. This is why
+ * `mem_copy`, the fourth kernel and the first one that reads a *second*
+ * register-passed pointer (`a1`), hung: it received garbage in `a0`/
+ * `a1` and looped over whatever memory that garbage pointed to. The
+ * first three kernels "worked" by coincidence -- they only read `d0`,
+ * and `d0` happened to already hold the right value at each of those
+ * particular call sites, not because the dispatch was actually correct.
+ * There is no function-pointer type in this dialect that fixes this;
+ * the fix is to never introduce one for these kernels at all.
  *---------------------------------------------------------------------------*/
 
-typedef void (*KernelFn)(ULONG iters, void *a0, void *a1);
-
-extern void run_kernel_reg_addq_bra(ULONG iters __asm("d0"));
-extern void run_kernel_reg_tst_bne(ULONG iters __asm("d0"));
-extern void run_kernel_reg_mix(ULONG iters __asm("d0"));
+extern void run_kernel_reg_addq_bra(ULONG iters __asm("d0"), void *a0 __asm("a0"), void *a1 __asm("a1"));
+extern void run_kernel_reg_tst_bne(ULONG iters __asm("d0"), void *a0 __asm("a0"), void *a1 __asm("a1"));
+extern void run_kernel_reg_mix(ULONG iters __asm("d0"), void *a0 __asm("a0"), void *a1 __asm("a1"));
 extern void run_kernel_mem_copy(ULONG iters __asm("d0"), void *a0 __asm("a0"), void *a1 __asm("a1"));
-extern void run_kernel_mem_fill(ULONG iters __asm("d0"), void *a0 __asm("a0"));
-extern void run_kernel_struct_walk(ULONG iters __asm("d0"), void *a0 __asm("a0"));
-extern void run_kernel_movem_saverestore(ULONG iters __asm("d0"), void *a0 __asm("a0"));
-extern void run_kernel_jsr_rts_chain(ULONG iters __asm("d0"));
-extern void run_kernel_muldiv_mix(ULONG iters __asm("d0"));
-extern void run_kernel_bitfield_ops(ULONG iters __asm("d0"), void *a0 __asm("a0"));
-extern void run_kernel_cmp_branchy(ULONG iters __asm("d0"));
+extern void run_kernel_mem_fill(ULONG iters __asm("d0"), void *a0 __asm("a0"), void *a1 __asm("a1"));
+extern void run_kernel_struct_walk(ULONG iters __asm("d0"), void *a0 __asm("a0"), void *a1 __asm("a1"));
+extern void run_kernel_movem_saverestore(ULONG iters __asm("d0"), void *a0 __asm("a0"), void *a1 __asm("a1"));
+extern void run_kernel_jsr_rts_chain(ULONG iters __asm("d0"), void *a0 __asm("a0"), void *a1 __asm("a1"));
+extern void run_kernel_muldiv_mix(ULONG iters __asm("d0"), void *a0 __asm("a0"), void *a1 __asm("a1"));
+extern void run_kernel_bitfield_ops(ULONG iters __asm("d0"), void *a0 __asm("a0"), void *a1 __asm("a1"));
+extern void run_kernel_cmp_branchy(ULONG iters __asm("d0"), void *a0 __asm("a0"), void *a1 __asm("a1"));
 
 /* kernels.s's own metadata tables -- the single source of truth for
  * per-iteration instruction counts, read directly out of the linked
@@ -109,26 +129,75 @@ extern ULONG KernelFixedOverhead[];
 
 struct KernelDesc {
     const char *name;
-    KernelFn fn;
+    int index;   /* position in kKernels == position in kernels.s's own
+                  * _KernelTable; call_kernel() below switches on this,
+                  * never on a stored function pointer (see the header
+                  * comment above the externs for why). */
     int buffers; /* 0, 1 (a0 only) or 2 (a0 and a1) */
 };
 
 /* Order MUST match kernels.s's _KernelTable exactly -- that file's own
  * header comment is the authoritative list. */
 static const struct KernelDesc kKernels[] = {
-    {"reg_addq_bra",      (KernelFn)run_kernel_reg_addq_bra,      0},
-    {"reg_tst_bne",       (KernelFn)run_kernel_reg_tst_bne,       0},
-    {"reg_mix",           (KernelFn)run_kernel_reg_mix,           0},
-    {"mem_copy",          (KernelFn)run_kernel_mem_copy,          2},
-    {"mem_fill",          (KernelFn)run_kernel_mem_fill,          1},
-    {"struct_walk",       (KernelFn)run_kernel_struct_walk,       1},
-    {"movem_saverestore", (KernelFn)run_kernel_movem_saverestore, 1},
-    {"jsr_rts_chain",     (KernelFn)run_kernel_jsr_rts_chain,     0},
-    {"muldiv_mix",        (KernelFn)run_kernel_muldiv_mix,        0},
-    {"bitfield_ops",      (KernelFn)run_kernel_bitfield_ops,      1},
-    {"cmp_branchy",       (KernelFn)run_kernel_cmp_branchy,       0},
+    {"reg_addq_bra", 0, 0},
+    {"reg_tst_bne", 1, 0},
+    {"reg_mix", 2, 0},
+    {"mem_copy", 3, 2},
+    {"mem_fill", 4, 1},
+    {"struct_walk", 5, 1},
+    {"movem_saverestore", 6, 1},
+    {"jsr_rts_chain", 7, 0},
+    {"muldiv_mix", 8, 0},
+    {"bitfield_ops", 9, 1},
+    {"cmp_branchy", 10, 0},
 };
 #define NUM_KERNELS ((int)(sizeof(kKernels) / sizeof(kKernels[0])))
+
+/* Calls kernel `index` by its real, __asm-annotated name -- never
+ * through a function pointer (see the header comment above the
+ * externs). Each case is a direct, statically-typed call, so the
+ * compiler always uses the correct d0/a0/a1 convention for whichever
+ * branch runs. */
+static void call_kernel(int index, ULONG iters, void *a0, void *a1)
+{
+    switch (index) {
+        case 0:
+            run_kernel_reg_addq_bra(iters, a0, a1);
+            break;
+        case 1:
+            run_kernel_reg_tst_bne(iters, a0, a1);
+            break;
+        case 2:
+            run_kernel_reg_mix(iters, a0, a1);
+            break;
+        case 3:
+            run_kernel_mem_copy(iters, a0, a1);
+            break;
+        case 4:
+            run_kernel_mem_fill(iters, a0, a1);
+            break;
+        case 5:
+            run_kernel_struct_walk(iters, a0, a1);
+            break;
+        case 6:
+            run_kernel_movem_saverestore(iters, a0, a1);
+            break;
+        case 7:
+            run_kernel_jsr_rts_chain(iters, a0, a1);
+            break;
+        case 8:
+            run_kernel_muldiv_mix(iters, a0, a1);
+            break;
+        case 9:
+            run_kernel_bitfield_ops(iters, a0, a1);
+            break;
+        case 10:
+            run_kernel_cmp_branchy(iters, a0, a1);
+            break;
+        default:
+            break;
+    }
+}
 
 /* Buffer sizes: generous against every kernel's own documented minimum
  * (the largest is 128 bytes). Allocated once with MEMF_ANY (fast RAM on
@@ -282,13 +351,15 @@ static void run_and_report_kernel(const struct KernelDesc *desc, ULONG instrs_pe
     while (total_usec < TARGET_USEC) {
         struct EClockVal t0, t1;
         ULONG freq;
+        unsigned long step_usec;
 
         freq = ReadEClock(&t0);
-        desc->fn(iters, a0, a1);
+        call_kernel(desc->index, iters, a0, a1);
         ReadEClock(&t1);
 
+        step_usec = eclock_delta_usec(&t0, &t1, freq);
         total_instructions += fixed_overhead + iters * instrs_per_iter;
-        total_usec += eclock_delta_usec(&t0, &t1, freq);
+        total_usec += step_usec;
 
         if (iters < (0x7FFFFFFFUL / 2UL)) {
             iters *= 2;

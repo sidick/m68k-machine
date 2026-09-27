@@ -70,6 +70,15 @@ extern struct Device *TimerBase;
 static struct EClockVal start_val, stop_val;
 static ULONG            eclock_freq;
 
+/* Exposed so coremark_amiga.c can compute the reported iterations/sec
+ * rate with plain integer arithmetic instead of trusting core_main.c's
+ * own floating-point "Iterations/Sec" line -- see this file's
+ * capture_known_lines() and coremark_amiga.c's own comment for why. */
+ee_u32 g_coremark_eclock_freq(void)
+{
+    return eclock_freq;
+}
+
 void start_time(void)
 {
     eclock_freq = ReadEClock(&start_val);
@@ -174,6 +183,13 @@ void portable_fini(core_portable *p)
 double g_coremark_iterations_per_sec = -1.0;
 int    g_coremark_have_score_line    = 0;
 char   g_coremark_score_line[160];
+
+/* Raw integers behind core_main.c's own "Total ticks" and "Iterations"
+ * lines (both printed with plain %lu, never touched by the soft-float
+ * bug below), captured the same way as the score line so
+ * coremark_amiga.c can compute the reported rate itself. */
+ee_u32 g_coremark_total_ticks     = 0;
+ee_u32 g_coremark_iterations_done = 0;
 
 static char sLineBuf[200];
 
@@ -289,10 +305,35 @@ static void append_float(unsigned int *pos, double value)
 
 static void capture_known_lines(const char *line)
 {
+    /* NOTE: "Iterations/Sec" is captured for completeness/diagnostics
+     * only. m68k-amigaos-gcc's soft-float division for this exact
+     * expression (core_main.c's own
+     * `default_num_contexts * results[0].iterations /
+     * time_in_secs(total_time)`) has been observed to produce a clean
+     * IEEE754 negative zero on this toolchain (reproduced with both
+     * -O0 and -O2, so not an optimizer artifact) even though
+     * `time_in_secs()` alone -- the very same function, called one
+     * line earlier for "Total time (secs)" -- returns the correct
+     * positive value. Not chased into libgcc's soft-float routines
+     * from here; coremark_amiga.c computes the rate this program
+     * actually reports (`CPUBENCH coremark ...`) from the two plain-
+     * integer lines below instead, which sidesteps the bug rather than
+     * fixing it. See coremark_amiga.c's own comment.
+     */
     if (strncmp(line, "Iterations/Sec", 14) == 0) {
         const char *colon = strchr(line, ':');
         if (colon != NULL) {
             g_coremark_iterations_per_sec = atof(colon + 1);
+        }
+    } else if (strncmp(line, "Total ticks", 11) == 0) {
+        const char *colon = strchr(line, ':');
+        if (colon != NULL) {
+            g_coremark_total_ticks = strtoul(colon + 1, NULL, 10);
+        }
+    } else if (strncmp(line, "Iterations", 10) == 0 && strncmp(line, "Iterations/Sec", 14) != 0) {
+        const char *colon = strchr(line, ':');
+        if (colon != NULL) {
+            g_coremark_iterations_done = strtoul(colon + 1, NULL, 10);
         }
     } else if (strncmp(line, "CoreMark 1.0", 12) == 0) {
         strncpy(g_coremark_score_line, line, sizeof(g_coremark_score_line) - 1);

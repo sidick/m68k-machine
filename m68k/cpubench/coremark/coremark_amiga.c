@@ -9,8 +9,28 @@
  * Written for this project; not part of the vendored upstream sources
  * (see PROVENANCE.md).
  *
- * MIT License. Copyright (c) 2026 the m68k Machine project. See ../../LICENSE.
- */
+ * The milli-iterations/sec figure is computed HERE, from
+ * g_coremark_iterations_done/g_coremark_total_ticks/
+ * g_coremark_eclock_freq() (three plain integers, captured from
+ * core_main.c's own %lu-printed lines), rather than from
+ * g_coremark_iterations_per_sec (a double, captured from core_main.c's
+ * own %f-printed "Iterations/Sec" line). Found the hard way: on this
+ * toolchain, core_main.c's own expression for that line
+ * (`default_num_contexts * results[0].iterations /
+ * time_in_secs(total_time)`) reliably evaluates to a clean IEEE754
+ * negative zero -- reproduced identically at -O0 and -O2, so not an
+ * optimizer artifact, and not a bug in this project's own ee_printf
+ * (dumping the raw double's bytes at the call site showed the value
+ * itself already broken before formatting, and the *same*
+ * `time_in_secs(total_time)` call one line earlier, for "Total time
+ * (secs)", returns the correct positive value). This looks like a
+ * libgcc soft-float bug specific to this expression shape, not
+ * something to chase from a benchmark harness or to fix by editing
+ * vendored core_main.c -- computing the same rate from three integers
+ * this project's own code already has sidesteps it instead:
+ * iterations * freq * 1000 / ticks, in `unsigned long long` to avoid
+ * overflowing a 32-bit intermediate.
+ *---------------------------------------------------------------------------*/
 #include <string.h>
 
 #include "coremark_amiga.h"
@@ -22,16 +42,20 @@ void coremark_amiga_run(long *iterations_per_sec_milli, char *score_line, unsign
 {
     char *argv[1];
 
-    argv[0] = "CPUBench-CoreMark";
-    g_coremark_iterations_per_sec = -1.0;
-    g_coremark_have_score_line    = 0;
-    g_coremark_score_line[0]      = '\0';
+    argv[0]                        = "CPUBench-CoreMark";
+    g_coremark_iterations_per_sec  = -1.0;
+    g_coremark_have_score_line     = 0;
+    g_coremark_score_line[0]       = '\0';
+    g_coremark_total_ticks         = 0;
+    g_coremark_iterations_done     = 0;
 
     coremark_main(1, argv);
 
-    if (g_coremark_iterations_per_sec >= 0.0) {
-        double scaled = g_coremark_iterations_per_sec * 1000.0 + 0.5;
-        *iterations_per_sec_milli = (long)scaled;
+    if (g_coremark_iterations_done > 0 && g_coremark_total_ticks > 0 && g_coremark_eclock_freq() > 0) {
+        unsigned long long milli = (unsigned long long)g_coremark_iterations_done
+                                    * (unsigned long long)g_coremark_eclock_freq() * 1000ULL
+                                    / (unsigned long long)g_coremark_total_ticks;
+        *iterations_per_sec_milli = (long)milli;
     } else {
         *iterations_per_sec_milli = -1;
     }

@@ -159,6 +159,14 @@ extern double g_coremark_iterations_per_sec;
 extern int    g_coremark_have_score_line;
 extern char   g_coremark_score_line[160];
 
+/* Raw integers coremark_amiga.c uses to compute the reported rate
+ * itself, bypassing the soft-float bug in core_main.c's own
+ * "Iterations/Sec" expression -- see core_portme.c's
+ * capture_known_lines() and coremark_amiga.c's own comment. */
+extern ee_u32 g_coremark_total_ticks;
+extern ee_u32 g_coremark_iterations_done;
+ee_u32        g_coremark_eclock_freq(void);
+
 /* core_main.c's `main` renamed via -Dmain=coremark_main on this
    directory's compile line (scripts/build-cpubench.sh) so it coexists
    with cpubench.c's own `main` -- see that script's own comment. */
