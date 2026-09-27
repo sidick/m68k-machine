@@ -425,6 +425,40 @@ called working"):
 
 ### 7.2 results
 
+> **Supervisor correction (2026-09-27), read this first.** The busy-MIPS,
+> idle-host-CPU and `WBREADY` figures in the tables below were measured
+> over runs that are mostly idle, and do not measure what their labels
+> say:
+>
+> - **"busy MIPS" of 2-4** is idle-dominated: over an 88 s run in which
+>   the guest spends nearly all its time in exec's idle `STOP`, the
+>   non-sleeping time is mostly per-wake overhead, not CPU throughput.
+>   Measured over the busy part of the boot instead (max mode, hostblk
+>   HDF, frames 0-200, two runs each, same M3 Pro), all three back ends
+>   run at the same speed:
+>
+>   | back end | busy MIPS (run 1 / run 2) |
+>   |---|---|
+>   | interp | 30.65 / 29.88 |
+>   | batch | 30.04 / 30.07 |
+>   | batch+jit | 31.32 / 31.06 |
+>
+>   (The JIT binary was checked to be the Cranelift build: 3.8 MB against
+>   1.7 MB, 1,438 Cranelift symbols against none.)
+> - **Idle host CPU of ~30%** came from a 1000-frame run that includes
+>   the whole boot. A max-mode run held at idle Workbench for 30 s after
+>   boot costs about 1.1 s of host CPU over those 30 s, roughly 4% of one
+>   core, so STOP does sleep.
+> - **`WBREADY` at ~109 s** measures the scripted input's fixed frame
+>   schedule (clicks and typing timed to guest frames), not boot time. In
+>   max mode the hostblk boot reaches an idle Workbench desktop by about
+>   frame 200, roughly 4 s of real time (screenshot-confirmed).
+>
+> Everything else below stands: the coverage numbers, the `run_batch`
+> STOP-wake hang and its host-side fix, the `Wait 5` regression under
+> `batch`, and the JIT trace-cache regression test.
+
+
 Machine and load: Apple M3 Pro, 11 logical cores, arm64 macOS. Not
 perfectly idle -- some measurements below ran back-to-back or briefly
 overlapped a build, noted where it happened; treat single-run figures as
@@ -557,17 +591,15 @@ re-measured against the interactive script (where plain batch already
 showed its best result) given the time this pass had left; that
 comparison is the natural next measurement.
 
-**Recommendation.** Keep `interp` the default, exactly as shipped: it is
-the only back end with no correctness caveat (no STOP-wake dependency,
-no measured timer-latency regression) and it wins or ties on every
-plain-boot number measured here. `batch` (with or without `jit`) is
-useful as an explicit opt-in for fast-RAM-heavy interactive workloads
-(its 4.15 busy-MIPS figure under the scripted click-and-type script,
-against interp's 2.2-2.7 range elsewhere), but ships two open costs: the
-measured `Wait 5` regression (+0.65s over interp, outside the existing
-test's tolerance) and dependence on a host-side STOP-wake probe that
-substitutes for something the fork itself doesn't do. Before drawing a
-final verdict, the coverage numbers say the highest-leverage next step
-is a ROM shadow in fast RAM, not more back-end tuning: at 35.7% of
-fetches, ROM residency is the largest single item neither `batch` nor
-`jit` can do anything about today.
+**Recommendation (corrected).** Keep `interp` the default. Over busy
+guest work, neither `run_batch` over a fast-RAM `FastMem` window nor the
+fork's Cranelift JIT moves throughput by more than about 4% (table in the
+correction above), and `batch` carries two costs `interp` does not: the
+`Wait 5` regression (+0.65 s, outside the test's tolerance) and a
+host-side STOP-wake probe standing in for something the fork doesn't do.
+Coverage explains part of it: 35.7% of fetches are ROM-resident and never
+reach the window or the trace cache. But even allowing for that, the
+fork's fast paths are not a route to the "at least twice a 68060" floor
+(roughly 150-200 M instructions/s; today about 30). That is evidence for
+`docs/cpu-core-proposal.md`, whose direct mapping covers ROM, chip and
+fast RAM alike, rather than for more tuning of the fork's back ends.

@@ -8,7 +8,9 @@ per the measurements in `docs/bus-fast-path-plan.md` step 7.2 -- `batch`
 is available as an explicit opt-in (`--cpu-backend batch`) with two
 measured, open costs (a `Wait 5` timer-latency regression, and a
 host-side workaround for a `run_batch` STOP-wake gap the fork itself
-does not close); see that section for the numbers. This status line
+does not close); see that section for the numbers, which
+were corrected after review (the first busy-MIPS figures were
+idle-dominated). This status line
 records what was measured, not a re-opened decision.
 
 **Context:** `docs/bus-fast-path-plan.md` (steps 1–4: the host-side
@@ -206,11 +208,11 @@ Two further steps are available in the pinned fork and were measured
   boundary requests inside `run_batch`, or a shorter cycle-aware chunk
   bound than this pass implemented.
 
-  Busy MIPS: batch beat interp (4.15 vs interp's 2.2-2.7 range) on a
-  fast-RAM-heavy interactive script, but lost to it (2.00 vs 2.67) on a
-  plain, mostly-idle boot -- consistent with the ROM-residency number
-  above. No window exists while the 040 MMU is enabled (not exercised
-  here; this machine does not yet enable it).
+  Busy MIPS, measured over the busy part of the boot (the figures first
+  recorded here were idle-dominated and are corrected in the plan's 7.2
+  results): interp 30.7/29.9, batch 30.0/30.1, batch+jit 31.3/31.1 over
+  two runs each. No window exists while the 040 MMU is enabled (not
+  exercised here; this machine does not yet enable it).
 
 - **The trace JIT** (`jit` feature, Cranelift). Added as an
   off-by-default `machine-hosted` Cargo feature (`m68k/jit` on this
@@ -225,17 +227,16 @@ Two further steps are available in the pinned fork and were measured
   (`crates/machine-hosted/tests/jit_trace_regression.rs`) loads and runs
   a hand-assembled program over fast RAM that previously held a
   different one and confirms the second run executes the new code, not
-  a stale compiled trace -- passes. Measured effect on top of batch: a
-  small (~4%) busy-MIPS gain on the plain-boot workload (2.08 vs batch's
-  2.00), no change to the `Wait 5` gap (5.738s). Not yet measured on the
-  fast-RAM-heavy interactive workload where batch showed its best
-  number.
+  a stale compiled trace -- passes. Measured effect on top of batch: about
+  +4% busy MIPS over busy boot work (31.3/31.1 against 30.0/30.1), and
+  no change to the `Wait 5` gap (5.738s).
 
-**Decision: `interp` stays the default.** It has no correctness caveat
-and wins or ties every plain-boot number above. `batch`/`batch+jit`
-are available opt-in (`--cpu-backend batch`) for workloads that spend
-more time in fast-RAM-resident code, with the two open costs above
-disclosed rather than hidden.
+**Decision: `interp` stays the default.** Over busy work the three back
+ends are within about 4% of each other (about 30 busy MIPS), and only
+`interp` has no correctness caveat. The fork's fast paths are therefore
+not the route to the speed target; `docs/cpu-core-proposal.md` is the
+candidate that is. `batch`/`batch+jit` remain available opt-in
+(`--cpu-backend batch`) with the two open costs above disclosed.
 
 ## Interaction with ADR 0001
 
