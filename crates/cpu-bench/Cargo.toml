@@ -1,0 +1,33 @@
+[package]
+name = "cpu-bench"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Bare-core CPU benchmark harness: runs m68k/cpubench/kernels.s over m68k-rs's CpuCore/LinearMemoryBus with no machine-core involved, for comparison against the in-machine CPUBench numbers (docs/bus-fast-path-plan.md step 8)"
+publish = false
+
+[[bin]]
+name = "cpu-bench"
+path = "src/main.rs"
+
+[features]
+# Run the `run_batch` path with the fork's Cranelift trace JIT, mirroring
+# machine-hosted's own `jit` feature (docs/adr-0006, plan step 7.2 part 4)
+# -- enables `m68k/jit` on this crate's own dependency only. This crate is
+# never a board dependency (CLAUDE.md's board build rule), so this feature
+# reaching either bare-metal board is not a concern the way it is for
+# machine-hosted, but the same off-by-default posture is kept anyway: a
+# std-only Cranelift dependency has no business being on by default in a
+# workspace that also builds no_std targets.
+jit = ["m68k/jit"]
+
+[dependencies]
+# The project's `no_std`-capable fork, pinned by `rev` in
+# [workspace.dependencies] (root Cargo.toml) -- same pin every other crate
+# in this workspace uses, for the same reason (docs/phase0-findings.md):
+# an unplanned bump could silently change the CPU semantics this
+# benchmark exists to measure.
+m68k = { workspace = true, features = ["std"] }
+
+[lints.clippy]
+all = "warn"
