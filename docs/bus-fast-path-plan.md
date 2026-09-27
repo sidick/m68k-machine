@@ -233,11 +233,10 @@ the hook closure's self time is under 3%.
 
 ## 5. Re-profile and decide the CPU-core question
 
-Run the harness, append rows, and produce the after-profile. If
-`dispatch_instruction`, `cycles_040`, `resolve_ea`, `read_imm_*` and
-the rest of the `m68k` frames are now the majority, the CPU-core
-proposal starts. Two facts for that decision, recorded here so they
-are not rediscovered:
+Superseded as a stand-alone step by step 7: the CPU back-end question
+is now asked of the wall-clock-paced mode, where it matters to users,
+and answered by step 7's measurements. The two facts recorded here
+still hold:
 
 - The fork already has `run_batch` with a `FastMem` window (single
   side-effect-free RAM region, direct host pointer, no bus call per
@@ -257,7 +256,9 @@ are not rediscovered:
 | 3 bus fast path | M | machine-core, machine-hosted | unit + real-ROM + QEMU + gate |
 | 4.1–4.3 tick | M | machine-core (+ protocol docs) | soak, pktport-e2e, QEMU |
 | 4.4 hook | S | machine-hosted, boards | real-ROM |
-| 5 re-profile | S | docs | numbers |
+| 5 re-profile | S | docs | numbers (superseded by 7) |
+| 7.1 max mode | M | machine-core (deadline, boundary requests), machine-hosted | cycle-mode gates unchanged; max-mode Workbench boot + `Wait 5` timer check |
+| 7.2 run_batch/JIT | M | machine-hosted (+ fork if boundary requests needed) | same, plus the DMA-over-code regression test |
 
 Steps 2, 3 and 4 are independent and can go to separate workers, each
 on its own branch, each landing with its Results row. Step 3 is the
@@ -270,6 +271,69 @@ Commit discipline per `CLAUDE.md`: fmt and clippy (`-D warnings`, both
 hosted crates and both board targets) before every commit; ledger,
 protocol docs and this file's Results table updated in the commit that
 makes them true.
+
+## 7. Wall-clock-paced "fastest possible" mode (ADR 0006)
+
+Change of target. Steps 1-4 made the cycle-budgeted machine faster, but
+that machine gives the guest about 4.5 M instructions per *guest*
+second however fast the host is, so host speed only makes guest time
+outrun the wall clock. `docs/adr-0006-cycle-budgeted-and-wall-clock-paced-timing.md`
+records the decision: cycle-budgeted stays the deterministic default
+for every test and gate, and a `--cpu-speed max` mode paces device time
+to the wall clock and runs the CPU unbudgeted. The metric for this step
+is **guest instructions per real second**, not wall clock per 1500
+frames.
+
+### 7.1 Hosted `--cpu-speed max`, hook-free interpreter
+
+Implement ADR 0006's timing model in `run.rs`, cycle mode unchanged:
+
+- expose `MachineBus`'s next-event deadline; advance device time one
+  event at a time, never past a deadline in one step;
+- run the CPU with hook-free `run_for_cycles` in adaptive chunks sized
+  to ~50 µs of real time, checking the host clock between chunks;
+- the bus requests a batch boundary whenever a write changes
+  `pending_irq_level()` (INTREQ/INTENA, CIA, device register writes),
+  and the runner sets the IPL at every boundary;
+- STOP sleeps until the next deadline's real time or host input;
+- minimum CPU share between events and a ~100 ms backlog cap, so a
+  host that can't keep up slows the guest instead of livelocking it;
+- the hook's duties (wedge detection, limits, serial/input scripts,
+  screenshots) move to chunk boundaries.
+
+### 7.2 `run_batch` + `FastMem`, then the JIT
+
+Measure, in max mode, first `run_batch` with a `FastMem` window over
+fast RAM, then the same with the fork's `jit` feature. Before relying
+on either: measure what share of a Workbench workload's fetches and
+data accesses fall in the window (a ROM shadow in fast RAM may be
+needed); no window while the 040 MMU is on; `run_batch` ignores
+boundary requests, so either the fork learns to or chunks stay short;
+and a regression test loads and runs a program over fast RAM that
+previously held other code, proving trace validation catches DMA-loaded
+code. No JIT on the bare-metal boards (Cranelift is `std`-only).
+
+### 7.3 Benchmarks for this step
+
+Added alongside, not instead of, the existing 1500-frame rows (which
+stay the cycle-mode regression yardstick):
+
+- **Guest MIPS per real second**: instructions retired over a fixed
+  real-time window of a max-mode Workbench workload, and separately
+  over the boot.
+- **Wall clock to Workbench** under pacing: host time from start to the
+  Workbench-ready serial marker, cycle mode versus max mode.
+- **Idle cost**: host CPU time over 30 s of idle Workbench in max mode
+  (STOP should sleep, so this should be near zero).
+- **Timer accuracy**: the `Wait 5` gap measured on the host, per run.
+
+### 7.4 Evidence
+
+Cycle mode: all 17 real-ROM tests, both pktport proofs, both QEMU
+boards through the CI marker checks, unchanged. Max mode: a boot to
+Workbench with scripted input and serial markers, and the `Wait 5`
+timer check within a stated tolerance, as real-ROM tests gated to max
+mode.
 
 ## Results
 
