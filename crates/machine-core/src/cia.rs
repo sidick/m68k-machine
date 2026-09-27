@@ -390,6 +390,66 @@ impl Cia {
         self.irq_pending()
     }
 
+    /// CPU clocks from the current timer/keyboard state until something
+    /// here could next change on its own -- the CIA half of the bound
+    /// `MachineBus`'s lazy tick (`docs/bus-fast-path-plan.md` step 4)
+    /// uses to know how far it can defer. `None` when nothing running
+    /// will ever reach an underflow or handshake step without a
+    /// register write first (both timers stopped, or started but wired
+    /// so they can never actually count -- `CRA_INMODE`/the CNT input
+    /// modes -- and no keyboard activity in flight), matching exactly
+    /// the set of states `tick_one_eclock` would spend `ticks`
+    /// iterations doing nothing to prove.
+    ///
+    /// Deliberately conservative for CRB's timer-A-underflow cascade
+    /// modes (`10`/`11`): rather than predicting how many TA underflows
+    /// away TB's own underflow is, this only ever contributes TA's own
+    /// deadline (already included below when TA is running) and lets
+    /// the flush-then-recompute cycle at that deadline reconsider TB
+    /// each time TA actually underflows. Correct either way -- TB
+    /// cannot advance before TA does in that mode, so it cannot fire
+    /// before a deadline this function already reports -- just not the
+    /// tightest possible bound for that one configuration, which
+    /// `docs/bus-fast-path-plan.md` step 4 does not require.
+    pub(crate) fn clocks_until_event(&self, cpu_clocks_per_eclock: u32) -> Option<u32> {
+        let mut eclocks: Option<u32> = None;
+        let mut consider = |v: u32| {
+            eclocks = Some(match eclocks {
+                Some(m) => m.min(v),
+                None => v,
+            });
+        };
+
+        // `step_timer`'s doc comment: a running timer with `count`
+        // ticks left underflows `count + 1` ticks from now.
+        if self.cra & CRA_START != 0 && self.cra & CRA_INMODE == 0 {
+            consider(self.timer_a as u32 + 1);
+        }
+        let crb_inmode = (self.crb & CRB_INMODE_MASK) >> CRB_INMODE_SHIFT;
+        if self.crb & CRB_START != 0 && crb_inmode == 0 {
+            consider(self.timer_b as u32 + 1);
+        }
+
+        // The keyboard handshake only exists on CIA-A (`tick_one_eclock`'s
+        // `id == CiaId::A` guard), and only while software isn't driving
+        // the pulse itself (`CRA_SPMODE`).
+        if self.id == CiaId::A && self.cra & CRA_SPMODE == 0 {
+            if self.kbd_delay > 0 {
+                consider(self.kbd_delay as u32);
+            } else if !self.kbd_loaded && self.keyboard_len > 0 {
+                // `tick_keyboard` sets `kbd_delay` to this and decrements
+                // it by one in the very same E-clock, so the byte lands
+                // exactly `KEYBOARD_HANDSHAKE_TICKS` ticks from now, not
+                // one more or fewer.
+                consider(KEYBOARD_HANDSHAKE_TICKS as u32);
+            }
+        }
+
+        let eclocks = eclocks?;
+        let total = eclocks as u64 * cpu_clocks_per_eclock as u64;
+        Some((total.saturating_sub(self.carry as u64)) as u32)
+    }
+
     /// Advance timers and the keyboard serial handshake by whole E-clock
     /// ticks. TOD is not driven from here; see `tod_tick`.
     fn tick_eclock(&mut self, ticks: u32) {

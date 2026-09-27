@@ -739,7 +739,7 @@ fn run_guest(
             cpu.set_irq(bus.0.pending_irq_level());
             drain_serial(bus, console, serial_tcp);
 
-            let frames = bus.0.chipset.frames;
+            let frames = bus.0.frames();
             // Only serviced from here, not from the `Stopped` branch's own
             // catch-up tick below: this hook is guaranteed to run with the
             // CPU actively executing (never `stopped`), which is required
@@ -868,7 +868,7 @@ fn run_guest(
             overlay_was_cleared = true;
             console.diag(&format!(
                 "PHASE1 HOSTED: reached overlay-cleared (frame {}, instr {total_instructions}, PC {:#010x})",
-                bus.0.chipset.frames, cpu.pc
+                bus.0.frames(), cpu.pc
             ));
         }
 
@@ -913,7 +913,7 @@ fn run_guest(
                 // forever still terminates -- the *next* time this arm is
                 // reached with the CPU still stopped, the bound has
                 // caught up.
-                let frames = bus.0.chipset.frames;
+                let frames = bus.0.frames();
                 if args.max_frames != 0 && frames >= args.max_frames {
                     break 'outer Outcome::LimitReached("max-frames");
                 }
@@ -954,7 +954,7 @@ fn run_guest(
                 cpu.set_irq(bus.0.pending_irq_level());
                 drain_serial(bus, console, serial_tcp);
 
-                let frames = bus.0.chipset.frames;
+                let frames = bus.0.frames();
                 if screenshot_last_frame != Some(frames) {
                     screenshot_last_frame = Some(frames);
                     guest_frames.set(frames);
@@ -1040,7 +1040,7 @@ fn run_guest(
     Report {
         outcome,
         instructions: total_instructions,
-        frames: bus.0.chipset.frames,
+        frames: bus.0.frames(),
         final_pc: cpu.pc,
         overlay_cleared: !bus.0.overlay(),
     }
@@ -1096,7 +1096,7 @@ fn service_host_serial(
     last_serviced_frame: &mut Option<u64>,
     illegal_triggered: &mut bool,
 ) {
-    let frame = bus.0.chipset.frames;
+    let frame = bus.0.frames();
     if !bus.0.overlay() && overlay_cleared_frame.is_none() {
         *overlay_cleared_frame = Some(frame);
     }

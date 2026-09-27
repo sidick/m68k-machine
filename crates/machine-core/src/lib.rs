@@ -382,6 +382,34 @@ pub struct MachineBus<'a> {
     /// PRA bit 0 (OVL), which is high out of reset; the OS clears it
     /// early in the strap once it no longer needs ROM at zero.
     overlay: bool,
+
+    /// CPU clocks accumulated by [`Self::tick`] since the last
+    /// [`Self::flush`], not yet applied to the chipset/CIA state --
+    /// `docs/bus-fast-path-plan.md` step 4. `tick` only ever grows this;
+    /// `flush` is the one place that drains it, through the exact
+    /// per-call code path ([`Self::tick_exact`]), so that arithmetic
+    /// stays the single source of truth for what "applying N clocks"
+    /// means.
+    pending_clocks: u32,
+    /// How many more clocks (from the state as of the last flush) can
+    /// accumulate before something guest-visible could change on its
+    /// own: the next raster line boundary (drives CIA-B TOD, VERTB at
+    /// frame wrap, Graffity retrace, and the once-per-line device
+    /// engines) and each CIA's next timer underflow or keyboard
+    /// handshake step, whichever comes first. [`Self::tick`] flushes
+    /// the instant accumulated clocks would reach this, so `tick`
+    /// itself is the only place clocks are compared against it;
+    /// recomputed at the end of every [`Self::flush`] and by any write
+    /// that can move the deadline without going through `flush` (a CIA
+    /// register write that starts, stops or reloads a timer, or changes
+    /// CRA/CRB). The raster-line source alone bounds this by one line's
+    /// clocks (`PAL_COLOUR_CLOCKS_PER_LINE * CPU_CLOCKS_PER_COLOUR_CLOCK`,
+    /// 908), which is what keeps the STOP-path resync in
+    /// `machine-hosted`'s `run.rs` (and the board `main.rs` loops)
+    /// exact: it ticks in one-line slices and checks
+    /// `pending_irq_level` after each, and a slice that size can never
+    /// undershoot this deadline.
+    next_event_clocks: u32,
 }
 
 /// The address range the ROM overlay covers while OVL is asserted:
@@ -433,7 +461,7 @@ impl<'a> MachineBus<'a> {
     /// slice makes the ROM window behave as open bus (reads all `$FF`)
     /// since there is nothing to mirror.
     pub fn new(chip_ram: &'a mut [u8; CHIP_RAM_SIZE], rom: &'a [u8]) -> Self {
-        Self {
+        let mut bus = Self {
             ram: GuestRam::new(chip_ram),
             rom,
             ext_rom: &[],
@@ -466,7 +494,16 @@ impl<'a> MachineBus<'a> {
             pcibridge_board: None,
             pcibridge_window: None,
             overlay: true,
-        }
+            pending_clocks: 0,
+            // Placeholder, replaced by the `recompute_next_event` call
+            // below -- a fresh chipset/pair of CIAs is fully idle, so
+            // the real first deadline is the initial raster line
+            // boundary, computed the same way any later one is rather
+            // than duplicated here.
+            next_event_clocks: 1,
+        };
+        bus.recompute_next_event();
+        bus
     }
 
     /// Recompute [`Self::fast_window`] and [`Self::pcibridge_window`]
@@ -866,15 +903,95 @@ impl<'a> MachineBus<'a> {
             .map(|p| p.base)
     }
 
-    /// Advance time by `cpu_clocks`, ticking the frame clock and both
-    /// CIAs. Call this from the CPU's `sync` hook so device time and
-    /// guest time stay in step.
+    /// Advance time by `cpu_clocks`. Call this from the CPU's `sync` hook
+    /// so device time and guest time stay in step.
+    ///
+    /// This only accumulates into [`Self::pending_clocks`] and returns;
+    /// the chipset/CIA state is not touched unless the accumulated total
+    /// reaches [`Self::next_event_clocks`], in which case [`Self::flush`]
+    /// applies it (through [`Self::tick_exact`], the code below -- moved
+    /// there unchanged) and recomputes the next deadline
+    /// (`docs/bus-fast-path-plan.md` step 4). This is exact, not an
+    /// approximation: nothing observable can change between two flushes
+    /// by construction of `next_event_clocks` (the nearest raster line
+    /// boundary and each CIA's nearest timer underflow/keyboard step),
+    /// and every accessor that could read or change that state
+    /// (`read_cia`/`write_cia`, `read_custom_word`/`write_custom_word`,
+    /// `pending_irq_level`, and `machine-hosted`'s/the boards' readers of
+    /// `chipset.frames` through [`Self::frames`]) flushes first. A single
+    /// call's `cpu_clocks` can overshoot the deadline (this only checks
+    /// once, after adding this call's share) rather than being sliced to
+    /// land exactly on it -- `tick_exact` is already correct for an
+    /// arbitrarily large batch (the STOP-path resync ticks whole raster
+    /// lines at once today, and coarser batches than that crossing
+    /// several frames at once were already exact before this), so
+    /// flushing everything accumulated so far, however much that is, is
+    /// equivalent to flushing in smaller steps as long as nothing
+    /// observed the state in between -- which holds here since the
+    /// overshoot is bounded by one instruction's own `cpu_clocks` (this
+    /// function runs after every retired instruction, so at most one
+    /// call's worth ever accumulates past the deadline before the check
+    /// below catches it).
+    pub fn tick(&mut self, cpu_clocks: u32) {
+        self.pending_clocks = self.pending_clocks.saturating_add(cpu_clocks);
+        if self.pending_clocks >= self.next_event_clocks {
+            self.flush();
+        }
+    }
+
+    /// Apply every clock accumulated by [`Self::tick`] since the last
+    /// flush, through the exact per-call path ([`Self::tick_exact`]), and
+    /// recompute [`Self::next_event_clocks`] from the state that leaves.
+    /// A no-op when nothing is pending (the common case for every
+    /// accessor below that calls this defensively before reading state
+    /// `tick` might not have caught up on yet).
+    fn flush(&mut self) {
+        if self.pending_clocks == 0 {
+            return;
+        }
+        let clocks = core::mem::replace(&mut self.pending_clocks, 0);
+        self.tick_exact(clocks);
+        self.recompute_next_event();
+    }
+
+    /// Recompute [`Self::next_event_clocks`] from the chipset/CIA state
+    /// as of the last flush: the nearest of the next raster line
+    /// boundary and each CIA's next timer underflow or keyboard
+    /// handshake step. Called at the end of every [`Self::flush`], and
+    /// by any write that can move the deadline without going through one
+    /// (a CIA register write that starts, stops, reloads a timer, or
+    /// changes CRA/CRB -- [`Self::write_cia`]).
+    fn recompute_next_event(&mut self) {
+        let mut deadline = self
+            .chipset
+            .clocks_until_line_boundary(CPU_CLOCKS_PER_COLOUR_CLOCK);
+        if let Some(c) = self.cia_a.clocks_until_event(CPU_CLOCKS_PER_ECLOCK) {
+            deadline = deadline.min(c);
+        }
+        if let Some(c) = self.cia_b.clocks_until_event(CPU_CLOCKS_PER_ECLOCK) {
+            deadline = deadline.min(c);
+        }
+        // Never 0 in practice (every source above reports at least one
+        // clock away), but `.max(1)` keeps `tick`'s `>=` check from ever
+        // spinning on a zero deadline if that invariant is ever broken --
+        // hostile-input-style defence against this crate's own state,
+        // not guest input.
+        self.next_event_clocks = deadline.max(1);
+    }
+
+    /// The exact per-call application of `cpu_clocks`: the whole of what
+    /// [`Self::tick`] used to do directly, before step 4's lazy
+    /// accumulation. This is what [`Self::flush`] calls, and the single
+    /// source of truth the differential test (`lib.rs` `tests` module,
+    /// `lazy_tick_matches_eager_tick`) checks the lazy path against by
+    /// calling this directly on a second bus every step instead of going
+    /// through `tick`/`flush`.
     ///
     /// The MIRAGE, `hostblk`, `pktport` and `pcibridge` engines (and
     /// their `irq_pending()` polls) run once per raster line crossed,
     /// not once per call -- see the comment at their call site below.
     /// Chipset and both CIAs advance on every call regardless.
-    pub fn tick(&mut self, cpu_clocks: u32) {
+    fn tick_exact(&mut self, cpu_clocks: u32) {
         let beam = self.chipset.tick(cpu_clocks, CPU_CLOCKS_PER_COLOUR_CLOCK);
 
         // The CIAs' TOD counters are the OS's wall clock, and each is
@@ -994,6 +1111,52 @@ impl<'a> MachineBus<'a> {
         }
     }
 
+    /// Re-raise every level-triggered interrupt source that is still
+    /// asserting, independent of ticking.
+    ///
+    /// `tick_exact` raises PORTS/EXTER from `cia_a`/`cia_b.irq_pending()`
+    /// and PORTS from the Graffity card's `irq_pending()` on *every*
+    /// call, which is how the eager path kept re-raising a still-pending
+    /// source the instant after the guest cleared its `INTREQ` bit but
+    /// before the source itself let go (the CIA's `icr_data & icr_mask`
+    /// stays nonzero until its own `ICR` register is read, and Graffity
+    /// re-acknowledges on its own schedule) -- these are level-triggered
+    /// lines, not edge-triggered ones, so `INTREQ` clearing the latch
+    /// once is not the same as the source going away. Under step 4 that
+    /// per-call poll only runs at a flush, which could be a whole
+    /// deadline away, so any write that can either newly enable a
+    /// latched source (an ICR mask write) or clear a bit a live source
+    /// still drives (an `INTREQ`/`INTENA` write, or a card register
+    /// write) must call this itself so the guest observes the
+    /// re-assertion at the same instruction boundary the eager path did,
+    /// not one deadline later.
+    fn reassert_level_irqs(&mut self) {
+        if self.cia_a.irq_pending() {
+            self.chipset.raise_int(chipset::intbit::PORTS);
+        }
+        if self.cia_b.irq_pending() {
+            self.chipset.raise_int(chipset::intbit::EXTER);
+        }
+        if let Some(card) = &self.graphics {
+            if card.irq_pending() {
+                self.chipset.raise_int(chipset::intbit::PORTS);
+            }
+        }
+    }
+
+    /// Test-only entry point to the pre-step-4 behaviour: apply
+    /// `cpu_clocks` immediately, every call, never deferring through
+    /// [`Self::pending_clocks`]. Exists so the differential test can
+    /// drive one bus through this (the old eager path) and another
+    /// through [`Self::tick`] (the new lazy path) with the same
+    /// clock/access sequence and assert they never disagree -- both
+    /// ultimately call the same [`Self::tick_exact`], so this is a
+    /// thin wrapper, not a second implementation to keep in sync.
+    #[cfg(test)]
+    fn tick_eager(&mut self, cpu_clocks: u32) {
+        self.tick_exact(cpu_clocks);
+    }
+
     /// Report a mouse movement to the guest.
     pub fn mouse_delta(&mut self, dx: i8, dy: i8) {
         self.chipset.mouse_delta(dx, dy);
@@ -1021,8 +1184,35 @@ impl<'a> MachineBus<'a> {
     }
 
     /// The 68k interrupt level currently being requested, 0 for none.
+    ///
+    /// Deliberately does *not* flush: `chipset.intena`/`intreq` (what
+    /// this reads) only ever change on their own -- without a register
+    /// write -- at a deadline `next_event_clocks` already tracks (a
+    /// raster line boundary raising VERTB, a CIA timer underflow raising
+    /// PORTS/EXTER through `reassert_level_irqs`) or at a register write
+    /// (`write_cia`/`write_custom_word`, both of which flush and
+    /// re-assert themselves). [`Self::tick`] already flushes the instant
+    /// accumulated clocks reach that deadline, so by the time this is
+    /// called -- always right after `tick` in every caller
+    /// (`machine-hosted`'s `run.rs`, both board `main.rs`) -- the state
+    /// is already current. A flush here would cost nothing in
+    /// correctness but everything in the point of step 4: this is
+    /// called after *every* retired instruction, so flushing
+    /// unconditionally here would flush on every instruction regardless
+    /// of whether `tick` itself needed to, undoing the deferral.
     pub fn pending_irq_level(&self) -> u8 {
         self.chipset.pending_level()
+    }
+
+    /// Frame count since reset. Same non-flushing contract as
+    /// [`Self::pending_irq_level`] and for the same reason: `tick`
+    /// already flushes at the frame-wrapping deadline before this is
+    /// read, and `machine-hosted`'s `run.rs` hook loop and both
+    /// bare-metal boards' `main.rs` read this after every retired
+    /// instruction, so a flush here would run on every instruction
+    /// rather than only the ones that cross a line.
+    pub fn frames(&self) -> u64 {
+        self.chipset.frames
     }
 
     /// Backing storage and within-region offset for a *read* at
@@ -1307,6 +1497,9 @@ impl<'a> MachineBus<'a> {
     }
 
     fn read_cia(&mut self, address: u32) -> u8 {
+        // Every CIA register (timer, TOD, ICR) can change from ticking
+        // alone -- catch up before reading, step 4's whole point.
+        self.flush();
         let (is_cia_a, reg) = Self::cia_select(address);
         if is_cia_a {
             self.cia_a.read(reg)
@@ -1316,6 +1509,12 @@ impl<'a> MachineBus<'a> {
     }
 
     fn write_cia(&mut self, address: u32, value: u8) {
+        // See `read_cia`'s matching comment: flush before the write so
+        // it applies to caught-up state, then recompute the deadline
+        // after (not just when `flush` itself applied clocks -- this
+        // write can retarget a running timer, or start/stop/reload one,
+        // any of which moves `next_event_clocks` on its own).
+        self.flush();
         let (is_cia_a, reg) = Self::cia_select(address);
         if is_cia_a {
             self.cia_a.write(reg, value);
@@ -1334,6 +1533,13 @@ impl<'a> MachineBus<'a> {
                 self.sync_floppy_status();
             }
         }
+        self.recompute_next_event();
+        // An ICR mask write can newly enable a source whose `icr_data`
+        // was already latched (or unmasked and already latched from an
+        // event `tick_exact` fired at some earlier flush) -- reassert
+        // now rather than waiting for the next deadline, the same
+        // reasoning `reassert_level_irqs`'s own doc comment gives.
+        self.reassert_level_irqs();
     }
 
     /// Merge the floppy model's PRA bits (2-5) into CIA-A's input pin
@@ -1345,6 +1551,13 @@ impl<'a> MachineBus<'a> {
     }
 
     fn read_custom_word(&mut self, address: u32) -> u16 {
+        // VPOSR/VHPOSR/INTENAR/INTREQR (among others) are exactly the
+        // beam/interrupt state step 4 defers -- flush first, the same
+        // reason `read_cia` does. Blitter registers don't depend on
+        // ticking, but this is unconditional rather than narrowed to the
+        // non-blitter arm below: a no-op `flush` (the common case) is
+        // one field compare, cheaper than the branch to skip it.
+        self.flush();
         let offset = (address - CUSTOM_BASE) as u16 & 0x1FE;
         if blitter::reg::is_blitter(offset) {
             return self.blitter.read(offset);
@@ -1358,6 +1571,8 @@ impl<'a> MachineBus<'a> {
     }
 
     fn write_custom_word(&mut self, address: u32, value: u16) {
+        // See `read_custom_word`'s matching comment.
+        self.flush();
         let offset = (address - CUSTOM_BASE) as u16 & 0x1FE;
         if blitter::reg::is_blitter(offset) {
             if self.blitter.write(offset, value) {
@@ -1366,6 +1581,15 @@ impl<'a> MachineBus<'a> {
             return;
         }
         self.chipset.write(offset, value);
+        // No chipset register write can move `next_event_clocks`'
+        // sources (vpos/hpos only change through `tick_exact`, never a
+        // register write -- VPOSW/VHPOSW are latched nowhere in
+        // `Chipset::write`), so unlike `write_cia` there is nothing to
+        // recompute here. But an `INTREQ`/`INTENA` write can clear a bit
+        // a still-live level source (a CIA, Graffity) drives, which the
+        // eager path's per-call poll would re-raise on the very next
+        // instruction -- see `reassert_level_irqs`'s doc comment.
+        self.reassert_level_irqs();
     }
 
     /// Run an armed blit to completion and raise the blitter-finished
@@ -1565,6 +1789,13 @@ impl<'a> MachineBus<'a> {
             {
                 if let Some(card) = &mut self.graphics {
                     card.write(board, offset, value);
+                    // Graffity re-acknowledges INT2 on its own schedule
+                    // (module docs), so a register write here can leave
+                    // it still asserting after the guest's own INTREQ
+                    // ack -- see `reassert_level_irqs`'s doc comment for
+                    // why this must reassert now rather than at the next
+                    // deadline.
+                    self.reassert_level_irqs();
                 }
             }
         }
@@ -3783,6 +4014,266 @@ mod tests {
                 read_long_ref(&mut bus, addr),
                 "long at {addr:#010x}"
             );
+        }
+    }
+
+    // ---- Step 4: lazy tick vs. the pre-step-4 eager path -----------
+
+    /// A small, deterministic, dependency-free PRNG (xorshift64*) for the
+    /// differential test below -- this crate is `no_std` and
+    /// dependency-free even in its `std`-using hosted test code, so
+    /// pulling in `rand` for one test is not on the table.
+    struct Xorshift64 {
+        state: u64,
+    }
+
+    impl Xorshift64 {
+        fn new(seed: u64) -> Self {
+            // xorshift64* requires a non-zero seed.
+            Self {
+                state: if seed == 0 {
+                    0xDEAD_BEEF_CAFE_F00D
+                } else {
+                    seed
+                },
+            }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.state = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn next_u32(&mut self) -> u32 {
+            self.next_u64() as u32
+        }
+    }
+
+    /// A CIA register address for [`MachineBus::read_byte`]/`write_byte`,
+    /// the same address decode [`MachineBus::cia_select`] reverses:
+    /// CIA-A on odd addresses, CIA-B on even, register index in bits
+    /// 8-12.
+    fn cia_addr(is_a: bool, reg: u8) -> u32 {
+        CIA_BASE + ((reg as u32) << 8) + if is_a { 1 } else { 0 }
+    }
+
+    /// Drives two identically-configured buses through the same random
+    /// sequence of `tick` clocks and (rare) register accesses -- one
+    /// entirely through [`MachineBus::tick_eager`] (the pre-step-4
+    /// behaviour: every call applies immediately), the other through the
+    /// shipped [`MachineBus::tick`] (accumulate-then-flush-at-a-deadline)
+    /// -- and asserts [`MachineBus::pending_irq_level`] and
+    /// [`MachineBus::frames`] agree after every single step, not just at
+    /// the end. This is the exactness proof `docs/bus-fast-path-plan.md`
+    /// step 4 requires: both paths bottom out in the same
+    /// [`MachineBus::tick_exact`], so disagreement here means the
+    /// deferral itself (the deadline computation, a missing flush on
+    /// some access, or a missing `reassert_level_irqs` call) is wrong,
+    /// not that the underlying tick arithmetic is.
+    ///
+    /// Register accesses are deliberately rare (1 in 64 steps): with one
+    /// on almost every step (an earlier version of this test), every
+    /// access flushes both buses back in step, so the lazy path was
+    /// caught up almost continuously and the test could not have caught
+    /// a broken deadline computation. The long pure-tick stretches this
+    /// produces are the actual point -- once the rare CRA/CRB/latch
+    /// writes start a timer with a small latch, it underflows many times
+    /// across a run of steps with no register access at all, which is
+    /// exactly where `pending_irq_level`/`frames` not flushing (this
+    /// task's fix 1) and `next_event_clocks` both have to be right
+    /// without any access forcing a catch-up.
+    ///
+    /// Exercises timer one-shot and continuous mode (`CRA`/`CRB` writes),
+    /// latch writes (including small latches, so underflows happen often
+    /// across the pure-tick stretches rather than being rare edge
+    /// events), ICR mask writes and reads (which also exercises the
+    /// read-clears-and-acknowledges path), TOD reads, `VPOSR`/`VHPOSR`
+    /// reads, `INTENA` writes, and both `INTREQ` set *and* clear writes
+    /// (the clear is what exercises `reassert_level_irqs`: clearing a
+    /// bit a still-latched CIA/Graffity source drives must reassert it
+    /// at this exact instruction boundary, not at the next deadline).
+    /// Four seeds, 400,000 ticks each: 1,600,000 total.
+    #[test]
+    fn lazy_tick_matches_eager_tick_across_random_sequences() {
+        const TICKS_PER_SEED: usize = 400_000;
+        const SEEDS: [u64; 4] = [
+            0x1234_5678_9ABC_DEF0,
+            0x0BAD_F00D_DEAD_BEEF,
+            0x2545_F491_4F6C_DD1D,
+            0x9E37_79B9_7F4A_7C15,
+        ];
+
+        for seed in SEEDS {
+            let mut rng = Xorshift64::new(seed);
+            let mut ram_lazy = boxed_chip_ram();
+            let mut ram_eager = boxed_chip_ram();
+            let rom = [0u8; ROM_WINDOW_SIZE];
+            let mut lazy = new_bus(&mut ram_lazy, &rom);
+            let mut eager = new_bus(&mut ram_eager, &rom);
+
+            for step in 0..TICKS_PER_SEED {
+                // Plausible per-retired-instruction cycle counts (a real
+                // 68040 instruction is rarely more than a few dozen
+                // cycles at this machine's CPU-clock scale).
+                let clocks = 1 + (rng.next_u32() % 60);
+                lazy.tick(clocks);
+                eager.tick_eager(clocks);
+
+                // A register access on only 1 in 64 steps -- see this
+                // test's own doc comment for why that matters.
+                if rng.next_u32().is_multiple_of(64) {
+                    match rng.next_u32() % 13 {
+                        0 => {
+                            // CRA: START/RUNMODE(one-shot vs continuous)/
+                            // INMODE/SPMODE, every bit random.
+                            let v = rng.next_u32() as u8;
+                            let addr = cia_addr(true, cia::reg::CRA);
+                            lazy.write_byte(addr, v);
+                            eager.write_byte(addr, v);
+                        }
+                        1 => {
+                            let v = rng.next_u32() as u8;
+                            let addr = cia_addr(false, cia::reg::CRB);
+                            lazy.write_byte(addr, v);
+                            eager.write_byte(addr, v);
+                        }
+                        2 => {
+                            // Latch low byte, CIA-A timer A.
+                            let v = rng.next_u32() as u8;
+                            let addr = cia_addr(true, cia::reg::TALO);
+                            lazy.write_byte(addr, v);
+                            eager.write_byte(addr, v);
+                        }
+                        3 => {
+                            // Latch high byte -- masked small so a timer
+                            // started with this latch underflows many
+                            // times across the following pure-tick
+                            // stretch instead of once, right up until
+                            // the next rare register access.
+                            let v = (rng.next_u32() & 0x03) as u8;
+                            let addr = cia_addr(true, cia::reg::TAHI);
+                            lazy.write_byte(addr, v);
+                            eager.write_byte(addr, v);
+                        }
+                        4 => {
+                            let v = rng.next_u32() as u8;
+                            let addr = cia_addr(false, cia::reg::TBLO);
+                            lazy.write_byte(addr, v);
+                            eager.write_byte(addr, v);
+                        }
+                        5 => {
+                            let v = (rng.next_u32() & 0x03) as u8;
+                            let addr = cia_addr(false, cia::reg::TBHI);
+                            lazy.write_byte(addr, v);
+                            eager.write_byte(addr, v);
+                        }
+                        6 => {
+                            // ICR mask write, CIA-A: SETCLR plus TA/TB/
+                            // ALRM/SP/FLG.
+                            let v = (rng.next_u32() & 0x9F) as u8;
+                            let addr = cia_addr(true, cia::reg::ICR);
+                            lazy.write_byte(addr, v);
+                            eager.write_byte(addr, v);
+                        }
+                        7 => {
+                            let v = (rng.next_u32() & 0x9F) as u8;
+                            let addr = cia_addr(false, cia::reg::ICR);
+                            lazy.write_byte(addr, v);
+                            eager.write_byte(addr, v);
+                        }
+                        8 => {
+                            // ICR read: read-clears-and-acknowledges, so
+                            // this also proves the two paths agree about
+                            // *which* sources were pending at this exact
+                            // step.
+                            let addr = cia_addr(true, cia::reg::ICR);
+                            assert_eq!(
+                                lazy.read_byte(addr),
+                                eager.read_byte(addr),
+                                "seed {seed:#x} step {step}: CIA-A ICR read diverged"
+                            );
+                        }
+                        9 => {
+                            let addr = cia_addr(false, cia::reg::ICR);
+                            assert_eq!(
+                                lazy.read_byte(addr),
+                                eager.read_byte(addr),
+                                "seed {seed:#x} step {step}: CIA-B ICR read diverged"
+                            );
+                        }
+                        10 => {
+                            // Full TOD read (TODHI latches, TODLO
+                            // releases), alternating CIAs.
+                            let is_a = rng.next_u32().is_multiple_of(2);
+                            for reg in [cia::reg::TODHI, cia::reg::TODMID, cia::reg::TODLO] {
+                                let addr = cia_addr(is_a, reg);
+                                assert_eq!(
+                                    lazy.read_byte(addr),
+                                    eager.read_byte(addr),
+                                    "seed {seed:#x} step {step}: TOD read diverged (CIA-{})",
+                                    if is_a { 'A' } else { 'B' }
+                                );
+                            }
+                        }
+                        11 => match rng.next_u32() % 3 {
+                            0 => {
+                                let addr = CUSTOM_BASE + chipset::reg::VPOSR as u32;
+                                assert_eq!(
+                                    lazy.read_word(addr),
+                                    eager.read_word(addr),
+                                    "seed {seed:#x} step {step}: VPOSR diverged"
+                                );
+                            }
+                            1 => {
+                                let addr = CUSTOM_BASE + chipset::reg::VHPOSR as u32;
+                                assert_eq!(
+                                    lazy.read_word(addr),
+                                    eager.read_word(addr),
+                                    "seed {seed:#x} step {step}: VHPOSR diverged"
+                                );
+                            }
+                            _ => {
+                                // INTENA write, set semantics (bit 15
+                                // high): can unmask an already-latched
+                                // source.
+                                let v = 0x8000 | (rng.next_u32() as u16 & 0x7FFF);
+                                let addr = CUSTOM_BASE + chipset::reg::INTENA as u32;
+                                lazy.write_word(addr, v);
+                                eager.write_word(addr, v);
+                            }
+                        },
+                        _ => {
+                            // INTREQ: alternate set (bit 15 high) and
+                            // clear (bit 15 low) writes. The clear is
+                            // what exercises `reassert_level_irqs` --
+                            // clearing a bit a still-latched CIA source
+                            // drives must reassert it immediately, not
+                            // at the next deadline several ticks away.
+                            let set = rng.next_u32().is_multiple_of(2);
+                            let bits = (rng.next_u32() as u16) & 0x7FFF;
+                            let v = if set { 0x8000 | bits } else { bits };
+                            let addr = CUSTOM_BASE + chipset::reg::INTREQ as u32;
+                            lazy.write_word(addr, v);
+                            eager.write_word(addr, v);
+                        }
+                    }
+                }
+
+                assert_eq!(
+                    lazy.pending_irq_level(),
+                    eager.pending_irq_level(),
+                    "seed {seed:#x} step {step}: pending_irq_level diverged"
+                );
+                assert_eq!(
+                    lazy.frames(),
+                    eager.frames(),
+                    "seed {seed:#x} step {step}: frames diverged"
+                );
+            }
         }
     }
 }

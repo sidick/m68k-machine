@@ -649,7 +649,7 @@ fn boot_aros() {
                     return CycleBatchControl::Return;
                 }
 
-                let frames = bus.0.chipset.frames;
+                let frames = bus.0.frames();
                 if !overlay_was_cleared && !bus.0.overlay() {
                     overlay_was_cleared = true;
                     print_line(&format!(
@@ -700,7 +700,7 @@ fn boot_aros() {
                     break 'outer BootOutcome::CleanHalt;
                 }
 
-                let frames = bus.0.chipset.frames;
+                let frames = bus.0.frames();
                 if frames >= BOOT_MAX_FRAMES {
                     break 'outer BootOutcome::LimitReached("max-frames");
                 }
@@ -724,7 +724,7 @@ fn boot_aros() {
                 cpu.set_irq(bus.0.pending_irq_level());
                 drain_serial(&mut bus, &mut guest_line);
 
-                let frames = bus.0.chipset.frames;
+                let frames = bus.0.frames();
                 if frames >= last_progress_frame + BOOT_PROGRESS_EVERY_FRAMES {
                     last_progress_frame = frames;
                     print_line(&format!(
@@ -791,7 +791,7 @@ fn boot_aros() {
 
     guest_line.flush();
 
-    let frames = bus.0.chipset.frames;
+    let frames = bus.0.frames();
     let overlay_cleared = !bus.0.overlay();
     let final_pc = cpu.pc;
     let overlay_word = if overlay_cleared {

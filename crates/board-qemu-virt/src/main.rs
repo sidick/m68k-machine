@@ -750,7 +750,7 @@ fn boot_aros(chip_ram: &mut [u8; CHIP_RAM_SIZE]) {
                     return CycleBatchControl::Return;
                 }
 
-                let frames = bus.0.chipset.frames;
+                let frames = bus.0.frames();
                 if !overlay_was_cleared && !bus.0.overlay() {
                     overlay_was_cleared = true;
                     uprintln!(
@@ -801,7 +801,7 @@ fn boot_aros(chip_ram: &mut [u8; CHIP_RAM_SIZE]) {
                     break 'outer BootOutcome::CleanHalt;
                 }
 
-                let frames = bus.0.chipset.frames;
+                let frames = bus.0.frames();
                 if frames >= BOOT_MAX_FRAMES {
                     break 'outer BootOutcome::LimitReached("max-frames");
                 }
@@ -830,7 +830,7 @@ fn boot_aros(chip_ram: &mut [u8; CHIP_RAM_SIZE]) {
                 cpu.set_irq(bus.0.pending_irq_level());
                 drain_serial(&mut bus, &mut guest_line);
 
-                let frames = bus.0.chipset.frames;
+                let frames = bus.0.frames();
                 if frames >= last_progress_frame + BOOT_PROGRESS_EVERY_FRAMES {
                     last_progress_frame = frames;
                     uprintln!(
@@ -897,7 +897,7 @@ fn boot_aros(chip_ram: &mut [u8; CHIP_RAM_SIZE]) {
 
     guest_line.flush();
 
-    let frames = bus.0.chipset.frames;
+    let frames = bus.0.frames();
     let overlay_cleared = !bus.0.overlay();
     let final_pc = cpu.pc;
 

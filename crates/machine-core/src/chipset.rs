@@ -691,6 +691,27 @@ impl Chipset {
         }
         advance
     }
+
+    /// CPU clocks from the current `hpos`/`carry` until the beam would
+    /// next cross a raster line boundary -- the bound `MachineBus`'s
+    /// lazy tick (`docs/bus-fast-path-plan.md` step 4) uses so it never
+    /// defers past a line, since a line crossing is what drives CIA-B's
+    /// TOD, VERTB at frame wrap, Graffity retrace and the once-per-line
+    /// device engines.
+    ///
+    /// Always at least 1 and at most
+    /// `PAL_COLOUR_CLOCKS_PER_LINE * cpu_clocks_per_colour_clock`: `hpos`
+    /// is always strictly less than `PAL_COLOUR_CLOCKS_PER_LINE` on
+    /// return from `tick` (the `while` loop above never leaves it
+    /// otherwise), so at least one more colour clock is always needed,
+    /// and `carry` is always strictly less than
+    /// `cpu_clocks_per_colour_clock` (same reason), so the subtraction
+    /// below never underflows.
+    pub(crate) fn clocks_until_line_boundary(&self, cpu_clocks_per_colour_clock: u32) -> u32 {
+        let needed_colour_clocks = (PAL_COLOUR_CLOCKS_PER_LINE - self.hpos) as u64;
+        let ccpc = cpu_clocks_per_colour_clock as u64;
+        (needed_colour_clocks * ccpc - self.carry as u64) as u32
+    }
 }
 
 /// Latch the high 16 bits of a 32-bit pointer register, keeping the low
