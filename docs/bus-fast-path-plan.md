@@ -797,22 +797,74 @@ kernels (`reg_mix`, `bitfield_ops`) show the widest gap, consistent
 with per-instruction dispatch/hook overhead mattering more when there
 is little memory-access cost to amortize it against.
 
-### Copperline 68060 reference (optional deliverable)
+### Copperline 68040 and 68060 references
 
-Copperline (GPL, run but never copied) supports both a 68060 CPU model
-and a specific clock speed (`--cpu 68060`, `--cpu-clock MHZ`, default
-50 MHz for that model) -- confirmed via its own configuration docs, so
-the capability this step asked about exists. `CPUBench` was retried
-there (`copperline --model A1200 --cpu 68060 --fast 8M --run
-m68k/cpubench/CPUBench --noaudio --serial stdout --benchmark-until
-90`, against the bundled AROS): the program boots and stages, but no
-`CPUBENCH` line appeared within 90 emulated seconds, and this was not
-investigated further given the time this pass had left after the
-dispatch-bug fix (AROS API compatibility for `timer.device`/`Forbid`/
-`AllocMem`, or something else in that boot path, are all still open
-questions). Per this deliverable's own instruction ("if it can't, say
-so and stop there"), that is where this stopped -- no 68060 reference
-ratio is recorded.
+Measured 2026-09-27 by the supervisor, after the step's own attempt
+(against Copperline's bundled AROS) printed nothing. Copperline is GPL
+and is run as an oracle, never copied. Both references are A1200s with
+8 MB fast RAM booting the same Kickstart 3.2.2 ROM, from a scratch copy
+of `m68k-machine.hdf` on Copperline's A1200 IDE port with `C:CPUBench`
+added, `--serial stdout` capturing `CPUBench`'s `SER:` output. Every
+run's CoreMark CRCs validated. Copperline's core is cycle-exact and
+deterministic, so these are single runs.
+
+| kernel | 68040 @ 25 MHz | 68060 @ 50 MHz (scalar, see below) | ours, in-machine interp (avg, above) | ours / 060 |
+|---|---|---|---|---|
+| reg_addq_bra | 22.2 | 37.1 | 62.0 | 1.7x |
+| reg_tst_bne | 22.2 | 37.1 | 44.7 | 1.2x |
+| reg_mix | 22.2 | 37.1 | 52.0 | 1.4x |
+| cmp_branchy | 22.2 | 37.1 | 51.8 | 1.4x |
+| mem_fill | 3.8 | 42.2 | 34.5 | 0.8x |
+| struct_walk | 23.0 | 40.5 | 32.0 | 0.8x |
+| bitfield_ops | 8.8 | 15.5 | 39.7 | 2.6x |
+| jsr_rts_chain | 5.4 | 11.5 | 50.3 | 4.4x |
+| mem_copy | 3.9 | 3.9 | 37.9 | 9.7x |
+| movem_saverestore | 0.8 | 1.6 | 25.0 | 16x |
+| muldiv_mix | 1.2 | 2.8 | 54.2 | 20x |
+| **CoreMark (iterations/s)** | **29.6** | **74.4** | **132** | **1.8x** |
+
+(M instr/s unless stated.)
+
+How the two references were taken, and what limits them:
+
+- **68040** (`--model A1200 --cpu 68040`, default 25 MHz): the image's
+  Startup-Sequence runs `SetPatch` first, then `CPUBench >SER:`, so
+  `68040.library` is loaded as on a real system. An earlier run through
+  Copperline's `--run` minimal boot volume, with no `SetPatch`,
+  understated the memory kernels two to three times (`struct_walk` 8.7
+  against 23.0) while leaving the register kernels at 22.2; the full
+  boot is the one recorded here. `--run` also needs `LIBS:` supplied for
+  `mathieeedoubbas`/`mathieeedoubtrans`, which libnix auto-opens for
+  CoreMark.
+- **68060** (`--model A1200 --cpu 68060`, default 50 MHz,
+  `[cpu] unimplemented = "native"`): run on `m68k-machine-cpubench.hdf`
+  as built by `scripts/patch-cpubench-hdf.sh`, where `CPUBench` runs
+  *before* `SetPatch`. That makes it a **scalar 060 without its branch
+  cache**: `68060.library`, which enables superscalar dispatch (PCR.ESS)
+  and the branch cache, is never loaded. A real 060 would be well ahead
+  of this column on the register and call kernels.
+- **Why not after `SetPatch`:** Copperline's 68060 currently
+  black-screens once `SetPatch` loads `68060.library`. On the
+  pre-`SetPatch` image the machine completes one full `CPUBench` pass,
+  then reboots by itself; on the second boot the same kernels pass but
+  CoreMark (built with hard-FPU code) dies with error `#8000000B`, a
+  Line-F trap, as if the FPU were disabled. That points at state
+  `68060.library` sets up (PCR, for instance) surviving the reset or
+  being mishandled. It is a Copperline issue, recorded here so the 060
+  column's limits are clear; it is being investigated separately.
+- `mem_copy` runs at the same rate on both CPUs, so it is bound by
+  Copperline's A1200 memory path rather than the CPU. Treat it, and the
+  multiply/divide, `MOVEM` and call kernels where real silicon spends
+  many clocks per instruction, as flattering to us rather than as
+  speed.
+
+What it says for the "at least twice a 68060" floor: on CoreMark we are
+about 1.8x a *scalar* 060 and on simple register code 1.2-1.7x. Against
+a real, superscalar 060 that is roughly parity on register code, and
+we lose outright on the memory-access-heavy kernels (`mem_fill`,
+`struct_walk`), which is the machine overhead measured above. The floor
+is not met, consistent with the ratio table's conclusion that the
+remaining gap is the interpreter plus the machine's memory path.
 
 ### Gates run for this step
 
