@@ -53,8 +53,23 @@ fn trace_serial(enabled: bool, kind: &str, address: u32, value: u16) {
 /// comment on gating). `.2` is whether `SERIAL_REG_TRACE` was set at
 /// construction time (`docs/bus-fast-path-plan.md` §3.5) -- `trace_serial`
 /// takes it as its first, cheapest-to-check argument rather than looking
-/// it up itself.
-pub struct Bus<'a>(pub MachineBus<'a>, pub Option<BlitterTrace>, pub bool);
+/// it up itself. `.3` is whether `--cpu-speed max` is active
+/// (`docs/adr-0006-cycle-budgeted-and-wall-clock-paced-timing.md`) --
+/// [`AddressBus::take_boundary_request`] only ever delegates to
+/// [`MachineBus::take_boundary_request`] when this is set, so cycle mode
+/// (the default, `.3 == false`) is byte-for-byte unaffected by
+/// `machine-core` now tracking that flag at all: `run_for_cycles_with_hook`
+/// never calls `take_boundary_request` on cycle mode's own run loop
+/// (`run_guest`'s hook drives everything explicitly instead), but a
+/// future caller of the plain hook-free `run_for_cycles` on this same
+/// `Bus` in cycle mode must still see `false` unconditionally, exactly
+/// today's behaviour.
+pub struct Bus<'a>(
+    pub MachineBus<'a>,
+    pub Option<BlitterTrace>,
+    pub bool,
+    pub bool,
+);
 
 impl Bus<'_> {
     /// Whether `SERIAL_REG_TRACE` was set at construction (`.2`, read
@@ -70,6 +85,17 @@ impl Bus<'_> {
 }
 
 impl AddressBus for Bus<'_> {
+    fn take_boundary_request(&mut self) -> bool {
+        // `.3`'s own doc comment: only max mode ever asks `MachineBus`,
+        // so cycle mode gets the trait default (`false`) unconditionally
+        // regardless of whether a device write set the flag underneath.
+        if self.3 {
+            self.0.take_boundary_request()
+        } else {
+            false
+        }
+    }
+
     fn read_byte(&mut self, address: u32) -> u8 {
         let value = self.0.read_byte(address);
         trace_serial(self.2, "Rb", address, value as u16);

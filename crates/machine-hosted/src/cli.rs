@@ -74,6 +74,22 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub trace: bool,
 
+    /// Timing model: `cycle` (default) budgets the CPU against the beam
+    /// at 14.19 MHz-equivalent clocks, deterministic and reproducible --
+    /// every test, real-ROM gate and screenshot baseline runs here.
+    /// `max` runs the CPU unbudgeted and paces device time to the wall
+    /// clock instead (WinUAE's "fastest possible"): the guest gets as
+    /// many instructions as the host can deliver between device events.
+    /// See `docs/adr-0006-cycle-budgeted-and-wall-clock-paced-timing.md`
+    /// for the timing model `max` implements and what it gives up
+    /// (cycle fidelity, CPU-speed-tuned delay loops, reproducibility).
+    /// Incompatible with `--trace` and any other per-instruction
+    /// diagnostic (refused at startup): `max` moves the per-instruction
+    /// hook's duties to chunk boundaries, so there is no per-instruction
+    /// point left to hang a trace off.
+    #[arg(long, default_value = "cycle")]
+    pub cpu_speed: CpuSpeed,
+
     /// Tee the serial console (guest output plus runner diagnostics) to
     /// this file in addition to stdout.
     #[arg(long)]
@@ -445,6 +461,16 @@ impl From<FloppyArg> for machine_core::cia::FloppyPresence {
             FloppyArg::Empty => machine_core::cia::FloppyPresence::Empty,
         }
     }
+}
+
+/// `--cpu-speed`'s two timing models -- see that flag's own doc comment
+/// and `docs/adr-0006-cycle-budgeted-and-wall-clock-paced-timing.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum CpuSpeed {
+    /// Cycle-budgeted, deterministic, today's behaviour -- the default.
+    Cycle,
+    /// Wall-clock-paced, unbudgeted CPU, "fastest possible".
+    Max,
 }
 
 /// The CPU models this runner knows how to select. A thin wrapper around

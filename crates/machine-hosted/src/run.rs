@@ -44,11 +44,12 @@
 //! and resumes, which is what unmodified hardware would do.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use m68k::{CpuCore, CycleBatchControl, CycleBatchExit};
 
 use machine_core::block::BlockDevice;
-use machine_core::{pci, MachineBus, CHIP_RAM_SIZE};
+use machine_core::{pci, MachineBus, CHIP_RAM_SIZE, CPU_CLOCKS_PER_ECLOCK};
 
 use crate::bus::Bus;
 use crate::cli::Args;
@@ -66,6 +67,53 @@ use crate::serial_tcp::SerialTcpBridge;
 /// per-instruction hook, which is where the real per-instruction work
 /// (tick, IRQ sync, trace, wedge detection) happens.
 const RUN_BATCH_CYCLES: i32 = 2_000_000;
+
+/// `--cpu-speed max` (`docs/adr-0006-cycle-budgeted-and-wall-clock-paced-timing.md`,
+/// `run_guest_max`): the adaptive chunk size's real-time target. Bounds
+/// the worst-case lateness of the IPL being set after a device event or a
+/// guest interrupt-raising write that didn't itself request a boundary --
+/// well under one raster line's real time (~64 µs at PAL's line rate).
+const MAX_MODE_CHUNK_TARGET_US: f64 = 50.0;
+
+/// `run_guest_max`'s adaptive chunk size never goes below this many CPU
+/// cycles, however slow the host measures itself to be -- a floor against
+/// a chunk size of zero (which would spin `run_for_cycles` uselessly) and
+/// against a single pathologically slow measurement collapsing the chunk
+/// size to nothing.
+const MAX_MODE_MIN_CHUNK_CYCLES: i32 = 256;
+
+/// `run_guest_max`'s adaptive chunk size never exceeds this many CPU
+/// cycles, however fast the host measures itself to be -- a ceiling that
+/// keeps a single chunk from running long enough to blow well past
+/// `MAX_MODE_CHUNK_TARGET_US`'s latency bound if the rate estimate is
+/// ever wrong (e.g. right after a STOP-path resync, before a fresh
+/// measurement corrects it).
+const MAX_MODE_MAX_CHUNK_CYCLES: i32 = 400_000;
+
+/// `run_guest_max`'s backlog cap (ADR 0006, "When the host can't keep
+/// up"): device time is never allowed to fall more than this far behind
+/// the wall clock. Beyond it, the excess is discarded (device time jumps
+/// forward to wall clock minus this cap) rather than being replayed as a
+/// burst of back-to-back interrupts. A tuning constant, not measured
+/// against real hardware -- 100 ms is ADR 0006's own starting figure.
+const MAX_MODE_BACKLOG_CAP: Duration = Duration::from_millis(100);
+
+/// `run_guest_max`'s STOP-path sleep granularity: the CPU is parked
+/// (real-time-idle, not busy-spinning) between checks of the next
+/// device deadline and any host input source, in slices no longer than
+/// this.
+const MAX_MODE_STOP_SLEEP_SLICE: Duration = Duration::from_millis(1);
+
+/// `run_guest_max`'s wedge threshold: the same PC sampled at every chunk
+/// boundary for this many seconds of *wall clock*, with the CPU not
+/// stopped, is called a wedge. Real Kickstart's idle dispatcher always
+/// STOPs rather than spinning, so any non-STOP loop that holds one PC
+/// this long is not a legitimate wait -- chosen generously above what
+/// any real boot-time busy-wait in this codebase's own tests takes, since
+/// max mode has no fixed instructions-per-second to size a count-based
+/// threshold from (cycle mode's `TIGHT_LOOP_THRESHOLD`, which this
+/// replaces for `--cpu-speed max`).
+const MAX_MODE_WEDGE_SECONDS: f64 = 15.0;
 
 /// Report progress roughly once a second of guest (PAL) time.
 const PROGRESS_EVERY_FRAMES: u64 = 50;
@@ -536,7 +584,29 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     // Read once here rather than on every bus access -- see `bus.rs`'s
     // `Bus.2` doc comment and `docs/bus-fast-path-plan.md` §3.5.
     let serial_trace_enabled = std::env::var_os("SERIAL_REG_TRACE").is_some();
-    let mut bus = Bus(machine_bus, blitter_trace, serial_trace_enabled);
+    let cpu_speed_max = args.cpu_speed == crate::cli::CpuSpeed::Max;
+    let mut bus = Bus(
+        machine_bus,
+        blitter_trace,
+        serial_trace_enabled,
+        cpu_speed_max,
+    );
+
+    // `--trace` (and `TRACE_WATCH_PCS`, gated on it) is a per-instruction
+    // diagnostic driven from `run_guest`'s `run_for_cycles_with_hook`
+    // closure -- ADR 0006's whole point in max mode is running the CPU
+    // in hook-free `run_for_cycles` chunks instead, so there is no
+    // per-instruction point left to hang a trace off. Refused here,
+    // before any ROM or device work, rather than silently ignored.
+    if cpu_speed_max && args.trace {
+        return setup_error(
+            console,
+            "--trace is incompatible with --cpu-speed max: max mode runs the CPU in hook-free \
+             batches with no per-instruction point to trace from (see run.rs's module docs and \
+             docs/adr-0006-cycle-budgeted-and-wall-clock-paced-timing.md)"
+                .to_string(),
+        );
+    }
 
     // Refused rather than silently prioritised: see `--serial-tcp`'s doc
     // comment on `Args` for why picking a winner between "a live client"
@@ -608,16 +678,29 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         if bus.0.overlay() { "mapped" } else { "clear" }
     ));
 
-    let report = run_guest(
-        args,
-        console,
-        &mut cpu,
-        &mut bus,
-        serial_script.as_mut(),
-        input_script.as_mut(),
-        serial_tcp.as_ref(),
-        &guest_frames,
-    );
+    let report = if cpu_speed_max {
+        run_guest_max(
+            args,
+            console,
+            &mut cpu,
+            &mut bus,
+            serial_script.as_mut(),
+            input_script.as_mut(),
+            serial_tcp.as_ref(),
+            &guest_frames,
+        )
+    } else {
+        run_guest(
+            args,
+            console,
+            &mut cpu,
+            &mut bus,
+            serial_script.as_mut(),
+            input_script.as_mut(),
+            serial_tcp.as_ref(),
+            &guest_frames,
+        )
+    };
 
     if let Some(script) = &serial_script {
         console.diag(&format!(
@@ -1044,6 +1127,449 @@ fn run_guest(
         final_pc: cpu.pc,
         overlay_cleared: !bus.0.overlay(),
     }
+}
+
+/// Guest clocks per real second: the same 14.19 MHz-equivalent rate every
+/// device's arithmetic already runs on (`CPU_CLOCKS_PER_COLOUR_CLOCK`'s
+/// own doc comment), derived rather than hardcoded so it can never drift
+/// out of step with `machine-core`'s own constants -- the PAL E-clock
+/// (`machine_core::cia::E_CLOCK_HZ`, 709.379 kHz) times
+/// `CPU_CLOCKS_PER_ECLOCK` (20) is exactly 14,187,580 Hz.
+fn max_mode_clock_hz() -> f64 {
+    machine_core::cia::E_CLOCK_HZ as f64 * CPU_CLOCKS_PER_ECLOCK as f64
+}
+
+/// Convert a clock count in `MachineBus`'s CPU-clock-equivalent units
+/// into the real-time [`Duration`] it represents under
+/// [`max_mode_clock_hz`].
+fn duration_from_clocks(clocks: u32, clock_hz: f64) -> Duration {
+    Duration::from_secs_f64(clocks as f64 / clock_hz)
+}
+
+/// `--cpu-speed max`'s run loop: ADR 0006's wall-clock-paced timing model
+/// (`docs/adr-0006-cycle-budgeted-and-wall-clock-paced-timing.md`).
+/// Device time follows the wall clock one event at a time instead of
+/// retired-instruction cycles, and the CPU runs unbudgeted in hook-free
+/// [`CpuCore::run_for_cycles`] chunks between device deadlines --
+/// `run_guest`'s hook-driven cycle-mode loop is untouched by any of this
+/// (this is a separate function, per the plan's own step 7.1).
+///
+/// The per-instruction hook's duties move to chunk boundaries
+/// (`max_chunk_boundary`): serial/input scripts, screenshots, progress,
+/// and the `--max-instructions`/`--max-frames` limits are all checked
+/// once per chunk rather than once per instruction. Wedge detection
+/// becomes wall-clock-based (`MAX_MODE_WEDGE_SECONDS`) rather than
+/// instruction-count-based, since max mode has no fixed instructions per
+/// second to size a count against. STOP sleeps the host rather than
+/// ticking device time in slices (cycle mode's `CycleBatchExit::Stopped`
+/// arm), and a host that falls behind real time slips device time rather
+/// than bursting through the backlog (`MAX_MODE_BACKLOG_CAP`).
+#[allow(clippy::too_many_arguments)]
+fn run_guest_max(
+    args: &Args,
+    console: &mut Console,
+    cpu: &mut CpuCore,
+    bus: &mut Bus,
+    mut serial_script: Option<&mut SerialScript>,
+    mut input_script: Option<&mut InputScript>,
+    serial_tcp: Option<&SerialTcpBridge>,
+    guest_frames: &std::cell::Cell<u64>,
+) -> Report {
+    let mut total_instructions: u64 = 0;
+    let mut overlay_was_cleared = false;
+    let mut overlay_cleared_frame: Option<u64> = None;
+    let mut last_serviced_frame: Option<u64> = None;
+    let mut illegal_triggered = false;
+
+    let mut last_exception: Option<(&'static str, u32)> = None;
+    let mut exception_streak: u64 = 0;
+
+    let mut wedge_pc: u32 = cpu.pc;
+    let mut wedge_since = Instant::now();
+
+    let mut screenshot_job = args.screenshot.as_ref().map(|path| {
+        crate::screenshot::ScreenshotJob::new(
+            path.clone(),
+            args.screenshot_frame,
+            args.screenshot_every,
+        )
+    });
+    let mut screenshot_last_frame: Option<u64> = None;
+    let mut last_progress_real = Instant::now();
+
+    let clock_hz = max_mode_clock_hz();
+    // The wall-clock instant device time is caught up to. Advanced by
+    // exactly one event's worth of real time per iteration (ADR 0006
+    // step 3), never reset to `Instant::now()` except by the backlog cap
+    // below -- resetting it every iteration would be "catch up", which
+    // the ADR explicitly rejects in favour of slipping.
+    let mut anchor = Instant::now();
+    // Adaptive chunk size in CPU cycles, corrected from the previous
+    // chunk's measured rate every iteration -- seeded low (a fast host's
+    // first chunk undershoots `MAX_MODE_CHUNK_TARGET_US`, which only
+    // costs one extra `run_for_cycles` call before the estimate catches
+    // up) rather than high (which could blow the latency bound on a slow
+    // host's very first chunk).
+    let mut chunk_cycles: i32 = 4_000;
+
+    let outcome = 'outer: loop {
+        let deadline = bus.0.next_event_deadline_clocks();
+        let t_event = anchor + duration_from_clocks(deadline, clock_hz);
+
+        let mut hook_wedge: Option<String> = None;
+        let mut hook_limit: Option<&'static str> = None;
+        let mut stopped_exit = false;
+
+        // Run the CPU in adaptive chunks until the host clock reaches
+        // `t_event`, the CPU stops, or a boundary request ends a chunk
+        // early (ADR 0006 step 2). The first chunk always runs regardless
+        // of whether `t_event` has already passed -- the "minimum CPU
+        // share between events" guarantee (ADR 0006, "When the host
+        // can't keep up") falls out of this being a do/while rather than
+        // a while loop.
+        loop {
+            let chunk_start = Instant::now();
+            let budget = chunk_cycles.clamp(MAX_MODE_MIN_CHUNK_CYCLES, MAX_MODE_MAX_CHUNK_CYCLES);
+            let result = cpu.run_for_cycles(bus, budget);
+            let chunk_elapsed = chunk_start.elapsed();
+
+            total_instructions += result.instructions as u64;
+
+            // Correct the chunk-size estimate from this chunk's actual
+            // rate -- skipped when nothing ran (e.g. an already-stopped
+            // CPU's zero-cycle exit), which would corrupt the estimate
+            // rather than refine it.
+            if result.cycles > 0 && chunk_elapsed > Duration::ZERO {
+                let cycles_per_us = result.cycles as f64 / chunk_elapsed.as_secs_f64() / 1e6;
+                let target = (cycles_per_us * MAX_MODE_CHUNK_TARGET_US).round();
+                if target.is_finite() {
+                    chunk_cycles = (target as i64).clamp(
+                        MAX_MODE_MIN_CHUNK_CYCLES as i64,
+                        MAX_MODE_MAX_CHUNK_CYCLES as i64,
+                    ) as i32;
+                }
+            }
+
+            // The IPL must be current before the next fetch regardless of
+            // why this chunk ended -- there is no per-instruction hook to
+            // do this after every retired instruction the way cycle
+            // mode's does, so it happens once per chunk instead (the
+            // "check interval" bound on interrupt latency, ADR 0006).
+            cpu.set_irq(bus.0.pending_irq_level());
+            drain_serial(bus, console, serial_tcp);
+
+            if cpu.pc == wedge_pc {
+                let stuck_for = wedge_since.elapsed();
+                if stuck_for.as_secs_f64() >= MAX_MODE_WEDGE_SECONDS {
+                    hook_wedge = Some(format!(
+                        "tight loop at PC {:#010x} ({:.1}s wall clock with no progress)",
+                        cpu.pc,
+                        stuck_for.as_secs_f64()
+                    ));
+                }
+            } else {
+                wedge_pc = cpu.pc;
+                wedge_since = Instant::now();
+            }
+
+            let frames = max_chunk_boundary(
+                args,
+                console,
+                cpu,
+                bus,
+                serial_script.as_deref_mut(),
+                input_script.as_deref_mut(),
+                serial_tcp,
+                guest_frames,
+                &mut screenshot_job,
+                &mut overlay_was_cleared,
+                &mut overlay_cleared_frame,
+                &mut last_serviced_frame,
+                &mut illegal_triggered,
+                &mut screenshot_last_frame,
+                &mut last_progress_real,
+                total_instructions,
+            );
+
+            if hook_wedge.is_none() {
+                if args.max_instructions != 0 && total_instructions >= args.max_instructions {
+                    hook_limit = Some("max-instructions");
+                } else if args.max_frames != 0 && frames >= args.max_frames {
+                    hook_limit = Some("max-frames");
+                }
+            }
+
+            if hook_wedge.is_some() || hook_limit.is_some() {
+                break;
+            }
+
+            match result.exit {
+                CycleBatchExit::BudgetExhausted => {
+                    if Instant::now() >= t_event {
+                        break;
+                    }
+                }
+                CycleBatchExit::BoundaryRequested => break,
+                CycleBatchExit::Stopped => {
+                    stopped_exit = true;
+                    break;
+                }
+                CycleBatchExit::AlineTrap { opcode } => {
+                    if track_exception(
+                        "A-line",
+                        cpu.ppc,
+                        &mut last_exception,
+                        &mut exception_streak,
+                    ) {
+                        hook_wedge = Some(format!(
+                            "exception storm: A-line trap {opcode:#06x} at PC {:#010x} repeated {exception_streak} times",
+                            cpu.ppc
+                        ));
+                        break;
+                    }
+                    cpu.take_aline_exception(bus);
+                    if Instant::now() >= t_event {
+                        break;
+                    }
+                }
+                CycleBatchExit::FlineTrap { opcode } => {
+                    if track_exception(
+                        "F-line",
+                        cpu.ppc,
+                        &mut last_exception,
+                        &mut exception_streak,
+                    ) {
+                        hook_wedge = Some(format!(
+                            "exception storm: F-line trap {opcode:#06x} at PC {:#010x} repeated {exception_streak} times",
+                            cpu.ppc
+                        ));
+                        break;
+                    }
+                    cpu.take_fline_exception(bus);
+                    if Instant::now() >= t_event {
+                        break;
+                    }
+                }
+                CycleBatchExit::TrapInstruction { trap_num } => {
+                    if track_exception("TRAP", cpu.ppc, &mut last_exception, &mut exception_streak)
+                    {
+                        hook_wedge = Some(format!(
+                            "exception storm: TRAP #{trap_num} at PC {:#010x} repeated {exception_streak} times",
+                            cpu.ppc
+                        ));
+                        break;
+                    }
+                    cpu.take_trap_exception(bus, trap_num);
+                    if Instant::now() >= t_event {
+                        break;
+                    }
+                }
+                CycleBatchExit::Breakpoint { bp_num } => {
+                    if track_exception("BKPT", cpu.ppc, &mut last_exception, &mut exception_streak)
+                    {
+                        hook_wedge = Some(format!(
+                            "exception storm: BKPT #{bp_num} at PC {:#010x} repeated {exception_streak} times",
+                            cpu.ppc
+                        ));
+                        break;
+                    }
+                    cpu.take_bkpt_exception(bus);
+                    if Instant::now() >= t_event {
+                        break;
+                    }
+                }
+                CycleBatchExit::IllegalInstruction { opcode } => {
+                    if track_exception(
+                        "illegal",
+                        cpu.ppc,
+                        &mut last_exception,
+                        &mut exception_streak,
+                    ) {
+                        hook_wedge = Some(format!(
+                            "exception storm: illegal opcode {opcode:#06x} at PC {:#010x} repeated {exception_streak} times",
+                            cpu.ppc
+                        ));
+                        break;
+                    }
+                    cpu.take_illegal_exception(bus);
+                    if Instant::now() >= t_event {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(reason) = hook_wedge {
+            break 'outer Outcome::Wedged(reason);
+        }
+        if let Some(which) = hook_limit {
+            break 'outer Outcome::LimitReached(which);
+        }
+
+        if stopped_exit {
+            // See `run_guest`'s matching `CycleBatchExit::Stopped` arm for
+            // why SR mask 7 (and only that) is a real clean halt.
+            if cpu.int_mask & 0x0700 == 0x0700 {
+                break 'outer Outcome::CleanHalt;
+            }
+            if args.max_frames != 0 && bus.0.frames() >= args.max_frames {
+                break 'outer Outcome::LimitReached("max-frames");
+            }
+
+            // STOP sleeps rather than busy-ticking: park the host until
+            // this event's deadline or host input, whichever is first, in
+            // slices no longer than `MAX_MODE_STOP_SLEEP_SLICE` (ADR
+            // 0006's STOP sleep). A delivered serial-tcp byte both raises
+            // RBF (waking STOP the moment device time catches up to it)
+            // and is queued for the guest to read once resumed -- fed
+            // here rather than only from `service_host_serial`'s own
+            // running-CPU path, since nothing else drains the bridge
+            // while stopped.
+            loop {
+                let now = Instant::now();
+                if now >= t_event {
+                    break;
+                }
+                if let Some(bridge) = serial_tcp {
+                    if bus.0.chipset.serial_in_has_room() {
+                        if let Some(byte) = bridge.try_recv_host_byte() {
+                            bus.0.chipset.push_serial_in_byte(byte);
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep((t_event - now).min(MAX_MODE_STOP_SLEEP_SLICE));
+            }
+
+            // Advance device time event by event up to the real now, the
+            // same one-event-at-a-time discipline the running path uses
+            // above (never several events in one gulp -- this module's
+            // doc comment on why cycle mode's own STOP resync learned
+            // that the hard way), capped by the same backlog limit.
+            if let Some(behind) = Instant::now().checked_duration_since(anchor) {
+                if behind > MAX_MODE_BACKLOG_CAP {
+                    anchor = Instant::now() - MAX_MODE_BACKLOG_CAP;
+                }
+            }
+            loop {
+                let d = bus.0.next_event_deadline_clocks();
+                let this_t_event = anchor + duration_from_clocks(d, clock_hz);
+                if this_t_event > Instant::now() {
+                    break;
+                }
+                bus.0.tick(d);
+                anchor = this_t_event;
+                if bus.0.pending_irq_level() != 0 {
+                    break;
+                }
+            }
+            cpu.set_irq(bus.0.pending_irq_level());
+            drain_serial(bus, console, serial_tcp);
+            continue 'outer;
+        }
+
+        // Advance device time by exactly this event's deadline (ADR 0006
+        // step 3) regardless of which reason above ended the chunk loop --
+        // `deadline` was fixed before the chunk loop ran, so a chunk that
+        // ended early (a boundary request, or an exception mid-event)
+        // still advances device time the same amount a chunk that ran to
+        // `t_event` would have.
+        bus.0.tick(deadline);
+        anchor += duration_from_clocks(deadline, clock_hz);
+        // Backlog cap (ADR 0006, "When the host can't keep up"): never
+        // let device time fall more than `MAX_MODE_BACKLOG_CAP` behind
+        // the wall clock. Discards the excess rather than replaying it.
+        if let Some(behind) = Instant::now().checked_duration_since(anchor) {
+            if behind > MAX_MODE_BACKLOG_CAP {
+                anchor = Instant::now() - MAX_MODE_BACKLOG_CAP;
+            }
+        }
+        cpu.set_irq(bus.0.pending_irq_level());
+    };
+
+    Report {
+        outcome,
+        instructions: total_instructions,
+        frames: bus.0.frames(),
+        final_pc: cpu.pc,
+        overlay_cleared: !bus.0.overlay(),
+    }
+}
+
+/// `run_guest_max`'s chunk-boundary duties: the per-instruction hook's
+/// work (serial/input scripts, screenshots, the overlay-cleared marker,
+/// progress output), run once per chunk instead. Returns the current
+/// frame count, which the caller already needs for its own limit check
+/// right after calling this.
+#[allow(clippy::too_many_arguments)]
+fn max_chunk_boundary(
+    args: &Args,
+    console: &mut Console,
+    cpu: &mut CpuCore,
+    bus: &mut Bus,
+    serial_script: Option<&mut SerialScript>,
+    input_script: Option<&mut InputScript>,
+    serial_tcp: Option<&SerialTcpBridge>,
+    guest_frames: &std::cell::Cell<u64>,
+    screenshot_job: &mut Option<crate::screenshot::ScreenshotJob>,
+    overlay_was_cleared: &mut bool,
+    overlay_cleared_frame: &mut Option<u64>,
+    last_serviced_frame: &mut Option<u64>,
+    illegal_triggered: &mut bool,
+    screenshot_last_frame: &mut Option<u64>,
+    last_progress_real: &mut Instant,
+    total_instructions: u64,
+) -> u64 {
+    let frames = bus.0.frames();
+
+    if *last_serviced_frame != Some(frames) {
+        service_host_serial(
+            args,
+            cpu,
+            bus,
+            console,
+            serial_script,
+            input_script,
+            serial_tcp,
+            overlay_cleared_frame,
+            last_serviced_frame,
+            illegal_triggered,
+        );
+    }
+
+    if !*overlay_was_cleared && !bus.0.overlay() {
+        *overlay_was_cleared = true;
+        console.diag(&format!(
+            "PHASE1 HOSTED: reached overlay-cleared (frame {frames}, instr {total_instructions}, PC {:#010x})",
+            cpu.pc
+        ));
+    }
+
+    if *screenshot_last_frame != Some(frames) {
+        *screenshot_last_frame = Some(frames);
+        guest_frames.set(frames);
+        if let Some(job) = screenshot_job.as_mut() {
+            job.maybe_capture(frames, args.max_frames, &mut bus.0, console);
+        }
+    }
+
+    // Progress is guest-frame-paced in cycle mode (`PROGRESS_EVERY_FRAMES`)
+    // because guest time there has no fixed relationship to the wall
+    // clock; in max mode guest and wall time are the same thing by
+    // design, so pacing progress by real seconds elapsed is the direct
+    // equivalent.
+    if last_progress_real.elapsed() >= Duration::from_secs(1) {
+        *last_progress_real = Instant::now();
+        console.diag(&format!(
+            "progress (max): frame {frames}, PC {:#010x}, overlay {}, INTENA {:#06x}, INTREQ {:#06x}",
+            cpu.pc,
+            if bus.0.overlay() { "mapped" } else { "clear" },
+            bus.0.chipset.intena,
+            bus.0.chipset.intreq,
+        ));
+    }
+
+    frames
 }
 
 /// Drain any bytes the guest has written to `SERDAT` since the last call
