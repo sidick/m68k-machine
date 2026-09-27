@@ -10,6 +10,18 @@ publish = false
 name = "machine-hosted"
 path = "src/main.rs"
 
+[features]
+# Compile `m68k`'s hot `run_batch` traces to native code with Cranelift
+# (`--cpu-backend batch`, plan step 7.2 part 4). Off by default: enables
+# `m68k/jit` on this crate's own dependency only, never on machine-core's
+# or either board's -- neither depends on machine-hosted, and a workspace
+# feature only unifies across the packages selected by one `cargo`
+# invocation, so `cargo build -p board-qemu-virt --target
+# aarch64-unknown-none` (this project's own required invocation shape,
+# CLAUDE.md) never sees this feature at all. Verified with `cargo tree -e
+# features` against both board targets.
+jit = ["m68k/jit"]
+
 [dependencies]
 machine-core = { path = "../machine-core" }
 
