@@ -2,9 +2,14 @@
 
 **Status:** accepted, 2026-09-27, for the split into two modes and for
 the paced mode's timing model below. The CPU back end the paced mode
-ends up on (hook-free interpreter, `run_batch` over a `FastMem` window,
-or the Cranelift trace JIT) is **open**, pending the measurements in
-`docs/bus-fast-path-plan.md` step 5.
+defaults to is **decided: the hook-free interpreter stays the default**,
+per the measurements in `docs/bus-fast-path-plan.md` step 7.2 -- `batch`
+(`run_batch` over a `FastMem` window, with or without the `jit` feature)
+is available as an explicit opt-in (`--cpu-backend batch`) with two
+measured, open costs (a `Wait 5` timer-latency regression, and a
+host-side workaround for a `run_batch` STOP-wake gap the fork itself
+does not close); see that section for the numbers. This status line
+records what was measured, not a re-opened decision.
 
 **Context:** `docs/bus-fast-path-plan.md` (steps 1–4: the host-side
 speed work this ADR changes the target of); ADR 0001 (bare metal versus
@@ -167,29 +172,70 @@ set from measurement, not guessed here.
   instruction and frame limits are checked per chunk, and serial/input
   scripts and screenshots are serviced on frame changes.
 
-## The CPU back end is a separate, measured decision
+## The CPU back end: measured (plan step 7.2)
 
 Max mode is useful on day one with the hook-free interpreter, because
 the hook plus per-instruction tick was about 35% of the last profile.
-Two further steps are available in the pinned fork and are measured
-before either is relied on (plan step 5):
+Two further steps are available in the pinned fork and were measured
+(plan step 7.2, "Numbers"), on an Apple M3 Pro, one real Kickstart
+3.2.2 A1200 boot/HDF pair, `--label interp`/`batch`/`batch+jit`:
 
-- **`run_batch` over a `FastMem` window.** The core accesses one
-  side-effect-free RAM window through a raw pointer, with no bus call.
-  It gets one window only. Fast RAM is the natural choice, but Kickstart
-  runs from ROM and chip RAM goes through the bus, so the win depends on
-  how much of a Workbench workload stays in the window. A shadow copy of
-  ROM in fast RAM may be needed. There is no window while the 040 MMU
-  is enabled, and no boundary requests (above).
-- **The trace JIT** (`jit` feature, Cranelift). Compiled traces keep a
-  copy of the exact code bytes they were compiled from and compare them
-  on entry, and trace stores into their own code range bail. Code that
-  hostblk or pktport DMA writes into fast RAM (every LoadSeg) is
-  therefore caught on the next entry, **provided device DMA only ever
-  runs between CPU batches**, which is true of this design (the engines
-  run inside `tick`, never mid-batch) and must stay true. A regression
-  test loads and runs a program over memory that previously held other
-  code.
+- **`run_batch` over a `FastMem` window.** Implemented
+  (`--cpu-backend batch`; `MachineBus::fast_ram_window_mut`, never a
+  constant). Window coverage, measured with `BUS_COVERAGE=1` over a boot
+  plus Shell-open-and-`LIST` activity: **64.1% of instruction fetches
+  land in fast RAM, 35.7% in ROM** (data accesses: 93.6%/1.2%). One
+  window over fast RAM alone is *not* enough on its own to make this
+  workload's hot path mostly in-window -- a third of fetches are
+  Kickstart's own ROM-resident code, called constantly by anything
+  running from fast RAM. **A ROM shadow in fast RAM is called for by
+  this number and was not built** (plan step 7.2's own gate: report,
+  don't build, unless the numbers say so -- they do, but building it was
+  out of this pass's scope).
+
+  `run_batch` also could not wake a stopped CPU on its own -- a real
+  hang, not a latency bound, traced to `run_batch_inner`'s stopped check
+  never calling `check_and_service_interrupts` the way `run_for_cycles`/
+  `execute` do before their own. Fixed on the host side (a minimal
+  `run_for_cycles(bus, 4)` probe after every device-time advance while
+  stopped); see the plan's Results for the before/after evidence. What
+  the fix does *not* close: the `Wait 5` timer gap is 5.739s under batch
+  versus interp's 5.088s (tolerance is ±0.5s around 5s) -- **`run_batch`
+  ignoring boundary requests has a measured cost, not just a theoretical
+  one**, and closing it further would need either fork support for
+  boundary requests inside `run_batch`, or a shorter cycle-aware chunk
+  bound than this pass implemented.
+
+  Busy MIPS: batch beat interp (4.15 vs interp's 2.2-2.7 range) on a
+  fast-RAM-heavy interactive script, but lost to it (2.00 vs 2.67) on a
+  plain, mostly-idle boot -- consistent with the ROM-residency number
+  above. No window exists while the 040 MMU is enabled (not exercised
+  here; this machine does not yet enable it).
+
+- **The trace JIT** (`jit` feature, Cranelift). Added as an
+  off-by-default `machine-hosted` Cargo feature (`m68k/jit` on this
+  crate's own dependency only; confirmed inert on both boards via
+  `cargo tree -e features`). Compiled traces keep a copy of the exact
+  code bytes they were compiled from and compare them on entry, and
+  trace stores into their own code range bail. Code that hostblk or
+  pktport DMA writes into fast RAM (every LoadSeg) is therefore caught
+  on the next entry, **provided device DMA only ever runs between CPU
+  batches**, which is true of this design (the engines run inside
+  `tick`, never mid-batch) and must stay true. The regression test
+  (`crates/machine-hosted/tests/jit_trace_regression.rs`) loads and runs
+  a hand-assembled program over fast RAM that previously held a
+  different one and confirms the second run executes the new code, not
+  a stale compiled trace -- passes. Measured effect on top of batch: a
+  small (~4%) busy-MIPS gain on the plain-boot workload (2.08 vs batch's
+  2.00), no change to the `Wait 5` gap (5.738s). Not yet measured on the
+  fast-RAM-heavy interactive workload where batch showed its best
+  number.
+
+**Decision: `interp` stays the default.** It has no correctness caveat
+and wins or ties every plain-boot number above. `batch`/`batch+jit`
+are available opt-in (`--cpu-backend batch`) for workloads that spend
+more time in fast-RAM-resident code, with the two open costs above
+disclosed rather than hidden.
 
 ## Interaction with ADR 0001
 
@@ -216,7 +262,7 @@ grows the timer and idle support above.
 
 ## Evidence required before max mode is called working
 
-- All 17 real-ROM tests, the pktport proofs and both QEMU boards still
+- All 18 real-ROM tests, the pktport proofs and both QEMU boards still
   pass, in cycle mode, unchanged.
 - A max-mode boot to Workbench with scripted input and serial markers.
 - timer.device keeps real time: a serial script echoes a marker, runs

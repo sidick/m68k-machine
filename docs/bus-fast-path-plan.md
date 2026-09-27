@@ -422,3 +422,152 @@ called working"):
       above).
 - [x] Benchmarks: wall clock to a fixed frame count and guest MIPS, cycle
       vs max, above.
+
+### 7.2 results
+
+Machine and load: Apple M3 Pro, 11 logical cores, arm64 macOS. Not
+perfectly idle -- some measurements below ran back-to-back or briefly
+overlapped a build, noted where it happened; treat single-run figures as
+indicative, not noise-free (ADR 0006's own non-reproducibility point
+applies doubly here).
+
+**Baseline metrics (part 1).** `run_guest_max`'s end-of-run report now
+splits wall time into slept (STOP-path parking) and busy
+(instructions/busy-seconds), fixing 7.1's gap (its one MIPS figure
+averaged in sleep time). `scripts/bench-boot-max.sh` prints this line and
+a new wall-clock-to-`WBREADY` serial-marker measurement (Shell open three
+double-clicks deep, `ECHO WBREADY >SER:`, timestamped like the `Wait 5`
+test's `MARK1`/`MARK2` -- chosen because stock Kickstart otherwise
+narrates nothing over serial to time against). `--label interp`, this
+tree, one run each:
+
+| | wall (4400f) | slept | busy | busy MIPS | idle busy MIPS (1000f) | WBREADY cycle | WBREADY max |
+|---|---|---|---|---|---|---|---|
+| cycle | 1.661s | -- | -- | 25.2 | -- | 6.073s | -- |
+| max, interp | 87.859s | 53.812s | 34.047s | **2.67** | **2.20** | -- | 109.614s |
+
+Idle host CPU (interp, `/usr/bin/time -l` over the 1000-frame idle
+window): user 3.47s + sys 2.87s over 19.980s real, ~32% of one core.
+
+**Window coverage (part 2).** `BUS_COVERAGE=1` on a cycle-mode run
+(faster and deterministic for this purpose; the guest executes the same
+code path either timing mode, so the access-pattern conclusion is
+mode-independent) of a full boot plus the same three-double-click Shell
+open plus `LIST SYS: ALL`, 5300 frames:
+
+| | fast RAM | chip RAM | ROM | other |
+|---|---|---|---|---|
+| instruction fetches | 64.1% | 0.0% | **35.7%** | 0.2% |
+| data accesses | 93.6% | 1.6% | 1.2% | 3.6% |
+
+**This calls for a ROM shadow, per the plan's own gate** -- reported
+here, not built: over a third of instruction fetches are ROM-resident
+(Kickstart's own code -- Exec, dos.library, the Shell, disk.resource --
+called constantly by anything running from fast RAM), so a single
+`FastMem` window over fast RAM alone leaves that entire share on the slow
+bus path every time. A ROM shadow copy in fast RAM (or a second `FastMem`
+window over the ROM range) is the natural next step, not attempted in
+this pass.
+
+**`run_batch` + `FastMem` (part 3).** `--cpu-backend batch` initially
+**hung**, not merely ran slower: a scripted boot-and-click run parked at
+Kickstart's idle `STOP` by frame ~3650 of 6500 and never advanced again
+(final PC frozen, busy MIPS collapsed to ~0.1, `WBREADY`/`MARK1`/`MARK2`
+never seen). Root cause, found by reading the fork rather than guessing:
+`run_batch_inner`'s stopped check (`execute.rs`) is `if self.stopped != 0
+{ return Stopped }`, with no call to `check_and_service_interrupts`
+first -- unlike `run_for_cycles`/`execute`, which call that check
+*before* their own stopped branch, which is what lets a stopped CPU
+notice a newly serviceable interrupt and clear `stopped`
+(`stopped_supervisor_check`). `run_batch` has no equivalent, so once
+stopped it can never wake itself no matter how many times the host calls
+`cpu.set_irq()` and retries it.
+
+Fixed entirely on the host side, no fork change: after every device-time
+advance in the `Stopped` branch, when the batch back end is active,
+probe with a minimal `cpu.run_for_cycles(bus, 4)` call. Costs nothing
+when the interrupt still isn't serviceable and does real work -- letting
+the core's own wake logic run -- exactly when a wake is due. After the
+fix, the same run reaches both markers and "input-script: completed".
+
+Numbers after the fix, `--label batch`, same machine, same script:
+
+| | wall (4400f) | slept | busy | busy MIPS | idle busy MIPS (1000f) | WBREADY cycle | WBREADY max |
+|---|---|---|---|---|---|---|---|
+| max, batch (plain boot, no script) | 87.859s | 54.385s | 33.474s | 2.00 | 1.74 | 2.017s | 109.436s |
+
+Idle host CPU (batch): user 2.19s + sys 3.59s over 19.973s real, ~29%.
+
+Under the *scripted, interactive* boot-and-click-and-type workload
+(`--input-script`, the same one `WBREADY`/`Wait 5` use), batch's busy
+MIPS was **4.15** -- higher than any interp figure measured -- while the
+plain, no-interaction boot above (mostly idle-`STOP`-waiting, dominated
+by ROM-resident code per the coverage numbers) is *slower* than interp
+(2.00 vs 2.67). Batch's win, where it exists, tracks how much of the
+workload's hot code sits in fast RAM (Workbench/Shell/loaded-command
+code) rather than ROM (Kickstart's own idle/boot loops) -- consistent
+with the coverage measurement above.
+
+**Interrupt-latency cost, measured, not just bounded.** The `Wait 5` gap
+(`MARK1`→`MARK2`, same script as the real-ROM test) under batch: **5.739s**,
+measured twice, both **outside** the real-ROM test's ±0.5s tolerance (interp:
+5.088s, matching the existing test's own 5.093s within noise). The
+adaptive chunk-size estimate (instructions per real µs, never reading
+`cycles_remaining`, which `run_batch` clobbers) keeps chunks reasonably
+short, but the wake-probe and `run_batch`'s coarser (instruction-, not
+cycle-) budgeting together cost more interrupt latency than interp's
+cycle-budgeted chunking does. **This is the answer to "does `run_batch`
+need the fork to honour boundary requests to be viable": partially --
+the STOP-wake gap was fixable on the host side, but the timer-latency
+regression above was not chased further and would need either boundary-
+request support in the fork or a shorter, cycle-aware chunk bound to
+close.**
+
+**JIT (part 4).** `machine-hosted` gained an off-by-default `jit`
+feature (`m68k/jit` on this crate's dependency only); `cargo tree -e
+features` against both board targets shows `m68k`'s only feature
+reaching either is `default` -- confirmed inert for the boards. The
+regression test ADR 0006 requires
+(`crates/machine-hosted/tests/jit_trace_regression.rs`, `--features
+jit`-only) loads a ten-iteration hand-assembled program into fast RAM,
+runs it hot enough to JIT-compile (`TRACE_HOT_THRESHOLD` is 2
+backward-branch hits in the pinned fork), overwrites the exact same
+address range with a different program, and asserts the second run
+executes the *new* code -- it does. This is the closest honest
+substitute for a real-ROM two-executables-from-disk test (which would
+need a booted Kickstart just to `LoadSeg` twice into the same address,
+a much larger surface for the same narrow, address-level property); see
+that file's own module doc comment for the full reasoning.
+
+`--label batch+jit`, same script and machine:
+
+| | wall (4400f) | slept | busy | busy MIPS | idle busy MIPS (1000f) | WBREADY cycle | WBREADY max |
+|---|---|---|---|---|---|---|---|
+| max, batch+jit (plain boot, no script) | 87.859s | 54.111s | 33.748s | 2.08 | 1.84 | 1.972s | 109.420s |
+
+Idle host CPU (batch+jit): user 2.33s + sys 3.74s over 19.961s real,
+~5.6%. `Wait 5` gap under batch+jit: 5.738s -- essentially unchanged
+from plain batch (5.739s). JIT gives a small (~4%) busy-MIPS improvement
+over plain batch on this plain-boot workload, still short of interp's
+2.67 -- expected, given the coverage numbers: most of this particular
+workload's hot code is ROM-resident (never JIT-compiled, since `FastMem`
+and the trace cache only ever see fast RAM) or runs cold (boot-time
+init code executed once, never hot enough to trace). JIT was not
+re-measured against the interactive script (where plain batch already
+showed its best result) given the time this pass had left; that
+comparison is the natural next measurement.
+
+**Recommendation.** Keep `interp` the default, exactly as shipped: it is
+the only back end with no correctness caveat (no STOP-wake dependency,
+no measured timer-latency regression) and it wins or ties on every
+plain-boot number measured here. `batch` (with or without `jit`) is
+useful as an explicit opt-in for fast-RAM-heavy interactive workloads
+(its 4.15 busy-MIPS figure under the scripted click-and-type script,
+against interp's 2.2-2.7 range elsewhere), but ships two open costs: the
+measured `Wait 5` regression (+0.65s over interp, outside the existing
+test's tolerance) and dependence on a host-side STOP-wake probe that
+substitutes for something the fork itself doesn't do. Before drawing a
+final verdict, the coverage numbers say the highest-leverage next step
+is a ROM shadow in fast RAM, not more back-end tuning: at 35.7% of
+fetches, ROM residency is the largest single item neither `batch` nor
+`jit` can do anything about today.
