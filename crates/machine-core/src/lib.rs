@@ -410,6 +410,22 @@ pub struct MachineBus<'a> {
     /// `pending_irq_level` after each, and a slice that size can never
     /// undershoot this deadline.
     next_event_clocks: u32,
+
+    /// Set whenever a bus access (device write, or a device read whose
+    /// side effect can raise an interrupt) changes
+    /// [`Self::pending_irq_level`]'s answer, cleared by
+    /// [`Self::take_boundary_request`]. `--cpu-speed max`'s only consumer
+    /// (`docs/adr-0006-cycle-budgeted-and-wall-clock-paced-timing.md`,
+    /// "Guest writes that raise or unmask an interrupt"): cycle mode never
+    /// reads this at all (`machine-hosted`'s `Bus::take_boundary_request`
+    /// returns `false` unconditionally there), so setting it costs cycle
+    /// mode nothing beyond the field write itself. Deliberately *not*
+    /// checked by the RAM fast paths (`fast_region`/`fast_region_mut`'s
+    /// callers in `read_byte`/`write_byte`/`write_word`/`write_long`) --
+    /// chip/fast RAM writes can never move `pending_irq_level()`, so
+    /// instrumenting them would cost every guest memory write a
+    /// `pending_level()` call for no observable benefit.
+    boundary_request: bool,
 }
 
 /// The address range the ROM overlay covers while OVL is asserted:
@@ -501,6 +517,7 @@ impl<'a> MachineBus<'a> {
             // boundary, computed the same way any later one is rather
             // than duplicated here.
             next_event_clocks: 1,
+            boundary_request: false,
         };
         bus.recompute_next_event();
         bus
@@ -939,6 +956,38 @@ impl<'a> MachineBus<'a> {
         }
     }
 
+    /// Clocks remaining, from right now, until the next event that can
+    /// change guest-visible interrupt state on its own -- the next raster
+    /// line boundary, either CIA's next timer underflow, or the next
+    /// keyboard handshake step. `--cpu-speed max`'s whole timing model
+    /// (`docs/adr-0006-cycle-budgeted-and-wall-clock-paced-timing.md`)
+    /// is built on this: it never advances device time past this many
+    /// clocks in one [`Self::tick`] call, converting it to a real-time
+    /// target via the same [`CPU_CLOCKS_PER_COLOUR_CLOCK`]-derived clock
+    /// rate every device's arithmetic already uses.
+    ///
+    /// `next_event_clocks` is the deadline measured from the state as of
+    /// the last flush; `pending_clocks` is how much of that has already
+    /// accumulated (possibly more, if a single large `tick` overshot --
+    /// see `tick`'s own doc comment), so the distance from *now* is the
+    /// difference, saturating at zero rather than going negative when
+    /// `tick`'s overshoot has already passed the deadline (the caller's
+    /// very next `tick` call will flush and recompute it).
+    pub fn next_event_deadline_clocks(&self) -> u32 {
+        self.next_event_clocks
+            .saturating_sub(self.pending_clocks)
+            .max(1)
+    }
+
+    /// Take and clear the boundary-request flag a device write (or a
+    /// device read whose side effect can raise an interrupt) set by
+    /// changing [`Self::pending_irq_level`]'s answer since the last call.
+    /// See [`Self::boundary_request`]'s own doc comment for the contract
+    /// and why this costs cycle mode nothing.
+    pub fn take_boundary_request(&mut self) -> bool {
+        core::mem::replace(&mut self.boundary_request, false)
+    }
+
     /// Apply every clock accumulated by [`Self::tick`] since the last
     /// flush, through the exact per-call path ([`Self::tick_exact`]), and
     /// recompute [`Self::next_event_clocks`] from the state that leaves.
@@ -1311,21 +1360,43 @@ impl<'a> MachineBus<'a> {
         } else if (ROM_BASE..ROM_END).contains(&address) && !self.rom.is_empty() {
             rom::read_mirrored(self.rom, ROM_BASE, address)
         } else if let Some(idx) = self.autoconfig.board_at(address) {
-            // One scan of the chain for every device below, rather than
-            // each of the seven arms this used to be (up to seven scans
-            // per access, `docs/bus-fast-path-plan.md` §0) calling its
-            // own `*_target` helper. `board_at` narrows to at most one
-            // candidate index -- boards never overlap -- so which arm
-            // matches it in is a lookup, not a race; only Graffity needs
-            // more than a plain field comparison, since it can own more
-            // than one chain index (`Self::graphics_boards`'s own doc
-            // comment).
-            //
-            // `board_at` only ever returns an index it has actually
-            // placed, so `placement` is always `Some` here; the `else`
-            // still fails closed to open bus rather than assuming that
-            // and indexing unchecked, per the hostile-input rule every
-            // guest address is read under.
+            // A device read can raise an interrupt as a side effect
+            // (MIRAGE, `input` -- see the arms below), which must set the
+            // boundary request the same way a write does
+            // (`Self::boundary_request`'s doc comment): one before/after
+            // compare around the whole board match, rather than
+            // duplicating it at each `raise_int` call site.
+            let level_before = self.chipset.pending_level();
+            let value = self.read_byte_board(idx, address);
+            if self.chipset.pending_level() != level_before {
+                self.boundary_request = true;
+            }
+            value
+        } else {
+            OPEN_BUS_BYTE
+        }
+    }
+
+    /// The AUTOCONFIG board match arm of [`Self::read_byte`], split out
+    /// only so that function can wrap it in one boundary-request compare
+    /// -- see that call site's comment.
+    fn read_byte_board(&mut self, idx: usize, address: u32) -> u8 {
+        // One scan of the chain for every device below, rather than
+        // each of the seven arms this used to be (up to seven scans
+        // per access, `docs/bus-fast-path-plan.md` §0) calling its
+        // own `*_target` helper. `board_at` narrows to at most one
+        // candidate index -- boards never overlap -- so which arm
+        // matches it in is a lookup, not a race; only Graffity needs
+        // more than a plain field comparison, since it can own more
+        // than one chain index (`Self::graphics_boards`'s own doc
+        // comment).
+        //
+        // `board_at` only ever returns an index it has actually
+        // placed, so `placement` is always `Some` here; the `else`
+        // still fails closed to open bus rather than assuming that
+        // and indexing unchecked, per the hostile-input rule every
+        // guest address is read under.
+        {
             let Some(base) = self.autoconfig.placement(idx).map(|p| p.base) else {
                 return OPEN_BUS_BYTE;
             };
@@ -1437,8 +1508,6 @@ impl<'a> MachineBus<'a> {
             } else {
                 OPEN_BUS_BYTE
             }
-        } else {
-            OPEN_BUS_BYTE
         }
     }
 
@@ -1571,6 +1640,21 @@ impl<'a> MachineBus<'a> {
     }
 
     fn write_custom_word(&mut self, address: u32, value: u16) {
+        // Wrapped in its own boundary-request compare (not just relying
+        // on `write_byte`'s wrap of its merge arm) because `write_word`
+        // also calls this directly, bypassing `write_byte` entirely --
+        // `Self::boundary_request`'s doc comment. Double-wrapping when
+        // reached via `write_byte`'s CUSTOM_BASE arm is harmless: both
+        // compares agree, and this one is one field read against
+        // `write_custom_word`'s own already-mandatory `flush()` below.
+        let level_before = self.chipset.pending_level();
+        self.write_custom_word_inner(address, value);
+        if self.chipset.pending_level() != level_before {
+            self.boundary_request = true;
+        }
+    }
+
+    fn write_custom_word_inner(&mut self, address: u32, value: u16) {
         // See `read_custom_word`'s matching comment.
         self.flush();
         let offset = (address - CUSTOM_BASE) as u16 & 0x1FE;
@@ -1679,7 +1763,27 @@ impl<'a> MachineBus<'a> {
         // table at $000000 before clearing OVL.
         if (CHIP_RAM_BASE..CHIP_RAM_END).contains(&address) {
             self.ram.chip_ram[(address - CHIP_RAM_BASE) as usize] = value;
-        } else if AutoConfig::responds_to(address) {
+            return;
+        }
+
+        // Everything from here down is a device write that can change
+        // `pending_irq_level()`'s answer (CIA, custom chip registers,
+        // AUTOCONFIG boards) -- one before/after compare around the whole
+        // slow path, rather than one at each of the several `raise_int`
+        // call sites below, per `Self::boundary_request`'s doc comment.
+        let level_before = self.chipset.pending_level();
+        self.write_byte_slow(address, value);
+        if self.chipset.pending_level() != level_before {
+            self.boundary_request = true;
+        }
+    }
+
+    /// The non-RAM body of [`Self::write_byte`], split out only so
+    /// [`Self::write_byte`] can wrap it in one boundary-request compare
+    /// without an early `return` inside the wrapped span fooling that
+    /// compare into being skipped.
+    fn write_byte_slow(&mut self, address: u32, value: u8) {
+        if AutoConfig::responds_to(address) {
             self.autoconfig.write(address, value);
             // The one AUTOCONFIG mutation site `docs/bus-fast-path-plan.md`
             // §3.1 doesn't cover via a builder: a base-address write here
@@ -1834,7 +1938,11 @@ impl<'a> MachineBus<'a> {
                 // whose BAR-mapped registers *do* affect its INTx line
                 // must not require remembering to add this back in.
                 if dev.irq_pending() {
+                    let level_before = self.chipset.pending_level();
                     self.chipset.raise_int(chipset::intbit::PORTS);
+                    if self.chipset.pending_level() != level_before {
+                        self.boundary_request = true;
+                    }
                 }
                 return;
             }
@@ -1861,7 +1969,11 @@ impl<'a> MachineBus<'a> {
                 // See `write_word`'s matching arm: future-proofing only,
                 // nothing behind a BAR can change INTx state yet.
                 if dev.irq_pending() {
+                    let level_before = self.chipset.pending_level();
                     self.chipset.raise_int(chipset::intbit::PORTS);
+                    if self.chipset.pending_level() != level_before {
+                        self.boundary_request = true;
+                    }
                 }
                 return;
             }
@@ -4275,5 +4387,112 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `--cpu-speed max`'s whole timing model
+    /// (`docs/adr-0006-cycle-budgeted-and-wall-clock-paced-timing.md`)
+    /// depends on `next_event_deadline_clocks()` being exact: one clock
+    /// short of it must never cross the next raster line boundary, and
+    /// the deadline clock itself must always cross it. A fresh bus's
+    /// first event is the first line boundary, `ONE_LINE_CLOCKS` away
+    /// (position 0 out of reset) -- the same deadline `recompute_next_event`
+    /// computes for every later line, just directly checkable here since
+    /// there is no CIA timer armed yet to compete with it.
+    #[test]
+    fn next_event_deadline_matches_actual_line_boundary() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom);
+
+        let deadline = bus.next_event_deadline_clocks();
+        assert_eq!(
+            deadline, ONE_LINE_CLOCKS,
+            "fresh bus: next event is the first line boundary"
+        );
+
+        let vhposr =
+            |bus: &mut MachineBus| bus.read_word(CUSTOM_BASE + chipset::reg::VHPOSR as u32);
+        let vpos_of = |word: u16| word >> 8;
+
+        let before = vhposr(&mut bus);
+
+        // One clock short of the deadline: must still be on the same line.
+        bus.tick(deadline - 1);
+        let mid = vhposr(&mut bus);
+        assert_eq!(
+            vpos_of(mid),
+            vpos_of(before),
+            "one clock short of the deadline crossed the line boundary early"
+        );
+
+        // The deadline's last clock: now it must have crossed.
+        bus.tick(1);
+        let after = vhposr(&mut bus);
+        assert_ne!(
+            vpos_of(after),
+            vpos_of(before),
+            "the deadline clock itself did not cross the line boundary"
+        );
+    }
+
+    /// A write that changes `pending_irq_level()` (here, unmasking an
+    /// already-latched `INTREQ` bit through `INTENA`) must set the
+    /// boundary request -- max mode's chunk loop ends a `run_for_cycles`
+    /// batch on exactly this (ADR 0006, "Guest writes that raise or
+    /// unmask an interrupt").
+    #[test]
+    fn write_that_changes_pending_level_sets_boundary_request() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom);
+
+        // Latch VERTB in INTREQ first, with the master enable still
+        // clear -- `pending_level()` is 0 until INTENA turns it on, so
+        // this write alone must not set the boundary request.
+        bus.write_word(
+            CUSTOM_BASE + chipset::reg::INTREQ as u32,
+            0x8000 | (1 << chipset::intbit::VERTB),
+        );
+        assert_eq!(bus.pending_irq_level(), 0, "master enable still clear");
+        assert!(
+            !bus.take_boundary_request(),
+            "latching INTREQ alone (level still 0) must not request a boundary"
+        );
+
+        // Now enable it: `pending_level()` goes from 0 to VERTB's level,
+        // and this write must be the one that sets the flag.
+        bus.write_word(
+            CUSTOM_BASE + chipset::reg::INTENA as u32,
+            0x8000 | (1 << chipset::intbit::INTEN) | (1 << chipset::intbit::VERTB),
+        );
+        assert_ne!(bus.pending_irq_level(), 0, "VERTB now unmasked");
+        assert!(
+            bus.take_boundary_request(),
+            "unmasking a latched interrupt must request a boundary"
+        );
+        // Consumed by the call above.
+        assert!(!bus.take_boundary_request(), "flag was not cleared by take");
+    }
+
+    /// The RAM fast paths (`fast_region`/`fast_region_mut`, reached by
+    /// `read_byte`/`write_byte`/`write_word`/`write_long` before any of
+    /// the device slow paths this module's other boundary-request tests
+    /// exercise) must stay untouched: a plain chip-RAM write can never
+    /// move `pending_irq_level()`, and must never set the boundary
+    /// request either.
+    #[test]
+    fn ram_write_never_sets_boundary_request() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom);
+
+        bus.write_byte(CHIP_RAM_BASE, 0x42);
+        bus.write_word(CHIP_RAM_BASE + 2, 0x1234);
+        bus.write_long(CHIP_RAM_BASE + 4, 0xDEAD_BEEF);
+
+        assert!(
+            !bus.take_boundary_request(),
+            "chip RAM writes must never request a boundary"
+        );
     }
 }
