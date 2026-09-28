@@ -3,6 +3,7 @@
 **Working title:** `m68k-vp` (virtual processor) — name deferred
 **Status:** Draft, September 2026. Not accepted: the ADR changes in §12 are what acceptance would require, and none of them has been made.
 **Relates to:** m68k-machine-proposal.md, combined-roadmap.md, bus-fast-path-plan.md, ADR 0001, ADR 0006
+**Evidence:** `docs/cpu-core-c0-profile.md` (C0's profile and go/no-go), `docs/cpu-core-poc-results.md` (a C2-shaped prototype of §4.1–§4.4, measured against m68k-rs). Corrections made to this document on 2026-09-28 from those two are marked inline with that date. The status line above is unchanged: prototype evidence is not acceptance.
 
 ## 1. Summary
 
@@ -20,6 +21,10 @@ The intent is a core that is (a) materially faster than any interpreter, (b) nat
 ### 2.1 Speed is the whole budget here
 
 In a chipset emulator the CPU shares the host's time with Denise, Agnus, Paula and the Copper. In this machine there is no chipset: RTG display, no bitplane DMA, idle Zorro cards. CPU emulation *is* the workload, so core speed maps almost directly onto perceived speed. A 3× faster core is roughly a 3× faster machine — not the 1.3× it would be in Copperline.
+
+*Measured, and qualified (2026-09-28, `docs/cpu-core-c0-profile.md`).* C0's profile confirms the premise on the denominator that matters: m68k-rs is **65.7–68.3%** of CPU-busy host time booting and **80.6–80.9%** running a CPU-bound in-guest workload. The claim above is therefore sound **for sustained CPU-bound work**, and the C0 exit below is satisfied.
+
+It does **not** hold for boot time, and the sentence above should not be read as promising that it does. Boot-to-Workbench under ADR 0006's max mode is dominated by wall-clock-paced sleep — 96% of that run's wall clock — because the machine is waiting on real time and on guest frames, not on instruction throughput. A 3–7× core (`docs/cpu-core-poc-results.md`) buys close to nothing there. The user-visible win from this proposal is in sustained foreground work; boot latency is a separate problem whose fix is removing real-time waits at source, not a faster CPU.
 
 *Where the bus stands.* The byte-composed `MachineBus` path that was the likelier bottleneck at the start of this proposal has been replaced: the width-native fast path, LTO, per-line device engines, the lazy CIA/beam tick and ADR 0006's wall-clock-paced max mode are on `main`, with before-and-after numbers in `docs/bus-fast-path-plan.md`. Whether the CPU core is now the majority of host time is the C0 exit question (§8), answered by a max-mode profile, not assumed here.
 
@@ -77,8 +82,11 @@ Representative ops:
 - `ld{8,16,32} tN ← [An + disp]`, `st{8,16,32}`, with big-endian semantics explicit.
 - `add/sub/and/or/eor/neg/not/asl/asr/lsl/lsr/rol/ror/roxl/roxr {8,16,32}` with a **flags-wanted mask** (X N Z V C) attached by the liveness pass.
 - `cmp`, `tst`, `btst/bset/bclr/bchg`.
-- `mul/div` in 16- and 32-bit forms (call-out permitted).
+- **Bitfield range ops** — `bfextu/bfexts/bfins/bftst/bfchg/bfclr/bfset/bfffo` (68020+). These need an op shape of their own: `{ op, base, reg, offset, width }`. They fit none of the shapes above — not the dyadic ALU form (no meaningful `src1`/`src2`), not a sized load/store (the value is a sub-byte-aligned range spanning a byte range, not a width-aligned access), and not the single-bit ops they sit next to. Added 2026-09-28 after the C2 prototype (`docs/cpu-core-poc-results.md`) hit them in real encodings and found no shape here that would take them.
+- `mul/div` in 16- and 32-bit forms (call-out permitted). **`DIVU`/`DIVS` need conditional writeback:** on quotient overflow the 68k leaves the destination register *unmodified* and sets only V. No other op in this IR has a "computed a result and then did not write it" semantic, so the op format must carry it explicitly rather than leaving it to the emitter. Same provenance as the bitfield note above; the prototype's differential gate never exercised this path (its dividends are all zero), so it is specified here and owed a test at C2, not assumed working.
 - `br`, `bcc cond`, `dbcc`, `jsr/rts`, `trap/trapv/chk`, `rte`, `stop`, `movem` (expanded), `cas/tas`.
+
+  *`movem`'s expansion has a measured cost (2026-09-28).* Expanding it to one transfer per register is kept — the passes need to see individual transfers to act on them, and folding the loop inside one op hides the cost rather than removing it — but the prototype measured what it costs an interpreter tier: 11 retired instructions become 46 IR dispatches, and `movem_saverestore` is the one kernel where the prototype loses to m68k-rs's own `run_batch` path (0.63×). The interpreter tier should therefore carry a fast path for the common shape (a small fixed register list, decoded once, executed as a tight loop rather than N generic dispatches). Recorded as a known cost with a named mitigation, not left to be rediscovered at C2.
 - `sync_pc`, `checkirq`, `callout id` for anything not worth inlining (FPU, cache control, privileged CR access).
 
 Per-op metadata: source PC, byte length (for exception PC reporting), flags-defined, flags-used.
@@ -97,13 +105,15 @@ Explicitly *not* done now: no non-68k ops (fused rotate-and-mask, condition-regi
 ### 4.3 Passes (the only ones)
 
 1. **Flag liveness** — backward scan marking which of XNZVC each op must actually produce. This is where most of the "dead flag" saving comes from and it is far simpler on IR than on raw opcodes.
-2. **Peepholes** — `MOVE`+`TST` fusion, constant folding on immediate address arithmetic, `LEA`/`PEA` simplification.
+2. **Peepholes** — `MOVE`+`TST` fusion, constant folding on immediate address arithmetic, `LEA`/`PEA` simplification. *Unvalidated as of 2026-09-28:* none of these three occurs anywhere in the C2 prototype's kernel set, so there is no evidence either way that they earn their decode-time cost. They stay as candidates, not commitments, until measured against a corpus closer to real Kickstart/AROS instruction mixes. The flag-liveness pass above is in the opposite position — measured, and the largest single contributor to the prototype's win.
 
 Nothing else. If a third pass ever seems necessary, that is the signal to measure first.
 
 ### 4.4 IR interpreter
 
 Straightforward threaded interpreter over the IR with lazy flag evaluation. Two jobs:
+
+*"Lazy" here means liveness-gated, not deferred-operand (clarified 2026-09-28).* The flags an op computes are decided at decode time by §4.3's backward scan, and the interpreter simply skips the rest. The other scheme commonly called "lazy flags" — storing the last operation's operands and computing flags only when a later op reads them, deferred past decode time — is **not** what is specified here and not what the prototype measured. The distinction matters because the liveness pass accounts for most of the prototype's measured speedup, so a reader must not assume the stronger scheme is the one behind those numbers.
 
 - Runs cold code and everything before a block gets hot (heat counter, threshold tunable; start at "translate on second execution").
 - Serves as the on-target reference tier. On bare-metal, where m68k-rs is unavailable, JIT correctness is checked by running suspect blocks through the interpreter and comparing state. This is the same lockstep idea as the m68k-rs oracle, but self-contained.
@@ -164,6 +174,8 @@ Correctness is what makes a second core affordable.
 ### 5.1 Layers
 
 1. **Instruction-level suites** — the SingleStepTests 68000 set, run against the IR interpreter and each JIT emitter. *Open item:* confirm whether a 68020+ set exists. If it does not, the 020+ addressing modes and instructions (scaled index, memory-indirect, bitfields, `CAS`, 32-bit `MUL`/`DIV`) rest on lockstep alone, and a small hand-written 020+ vector set generated from m68k-rs becomes a C2 task.
+
+  *This open item got more pressing on 2026-09-28, not less.* The prototype's own differential gate compared registers, PC and all of guest RAM, but **not SR** — so its flag formulas are unverified by anything — and its kernels never reach the `DIVU`/`DIVS` overflow path specified in §4.2. Those are precisely the two classes this layer exists to catch, and both are invisible to a lockstep run over ordinary code that happens not to exercise them. Resolving whether a 68020+ suite exists is therefore on the critical path to C2, not a footnote to it.
 2. **Record/replay lockstep vs m68k-rs** — see §5.3.
 3. **Lockstep vs the IR interpreter** — on every target including bare-metal, so emitter bugs are caught where m68k-rs cannot run. Interpreter and JIT share the same core and the same replay log, so this is the same mechanism with a different reference.
 4. **Acceptance gates** — Kickstart 3.2 (private runners) and AROS 68k (public CI) boot to Workbench on each backend, in the deterministic mode of §5.2.
