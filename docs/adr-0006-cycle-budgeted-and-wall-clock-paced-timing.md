@@ -1,7 +1,17 @@
-# ADR 0006 — Two timing models: cycle-budgeted by default, wall-clock-paced for users
+# ADR 0006 — Three timing models: cycle-budgeted, wall-clock-paced for users, fixed-instructions-per-line for gates
 
 **Status:** accepted, 2026-09-27, for the split into two modes and for
-the paced mode's timing model below. The CPU back end the paced mode
+the paced mode's timing model below.
+
+**Amended 2026-09-28** to add a third mode, `--cpu-speed fixed`
+(fixed-instructions-per-line), and to change what "deterministic" means
+in this project. This is the amendment `docs/cpu-core-proposal.md` §12
+names as an acceptance-level change; it is made here at the owner's
+instruction. Evidence: `docs/deterministic-mode.md` (the mode, the
+measured `N`, the gate results and the bug found on the way), commit
+`525dc1a`. What changed and what did not is set out under "The
+reproducible mode" below. The user-facing default is untouched by this
+amendment. The CPU back end the paced mode
 defaults to is **decided: the hook-free interpreter stays the default**,
 per the measurements in `docs/bus-fast-path-plan.md` step 7.2 -- `batch`
 (`run_batch` over a `FastMem` window, with or without the `jit` feature)
@@ -51,11 +61,21 @@ Two modes, selected per run, same machine core:
 
 - **Cycle-budgeted** (`--cpu-speed cycle`, the default). Today's
   behaviour, unchanged: the CPU is charged cycles per instruction,
-  device time is those cycles, runs are bit-reproducible. All tests,
-  real-ROM gates, screenshot baselines and the QEMU boards stay here.
+  device time is those cycles, runs are bit-reproducible. *Amended
+  2026-09-28:* this mode is still supported and still bit-reproducible
+  for m68k-rs, but it is no longer the project's definition of
+  "deterministic" — see "The reproducible mode" below. Gates are
+  migrating to `fixed`; the QEMU boards stay here for now.
 - **Wall-clock-paced, fastest possible** (`--cpu-speed max`, hosted
   runner first). Device time advances by real elapsed host time; the
   CPU is not charged cycles against the beam at all.
+- **Fixed-instructions-per-line** (`--cpu-speed fixed`, added
+  2026-09-28). The run loop retires exactly `N` instructions per raster
+  line, then advances the beam, both CIAs and the per-line device
+  engines by one line period; while the CPU is stopped, lines advance
+  and nothing retires, exactly as cycle mode's STOP already does. No
+  cycle accounting of any kind is involved. **This is the project's
+  reproducible mode** — see below.
 
 The machine core does not grow a second timing model. Device time stays
 in the same units it has now (14.19 MHz CPU-clock equivalents, so every
@@ -63,6 +83,86 @@ device keeps its existing arithmetic) and `MachineBus::tick(clocks)`
 stays the only way it advances. The two modes differ only in where the
 `clocks` argument comes from: retired-instruction cycles in cycle mode,
 real elapsed time × 14.19 MHz in max mode.
+
+## The reproducible mode (amended 2026-09-28)
+
+Before this amendment, "deterministic" in this project meant
+cycle-budgeted: the same run retires the same instructions because every
+instruction is charged the same cycles. That definition is only
+available to a core that *has* cycle tables. `docs/cpu-core-proposal.md`
+proposes replacing m68k-rs with a core that deliberately has none, so
+the definition had to move or the gates could never be shared between
+the two cores.
+
+**`fixed` is now the definition of reproducible for tests and gates.**
+`cycle` mode remains supported, unchanged, and remains bit-reproducible
+for m68k-rs — it simply stops being what the word means.
+
+Precisely what each offers, because the two are not the same guarantee:
+
+- **`fixed`** is reproducible *across `GuestCpu` implementations*,
+  including cycle-table-free ones. Any core that can retire a counted
+  number of instructions and report the count can implement it and reach
+  the same machine state.
+- **`cycle`** is reproducible *for a core with m68k-rs's cycle tables*,
+  and additionally models real per-instruction cost. `fixed` does not
+  offer that and does not claim to; a delay loop calibrated against real
+  instruction timing is not what this mode preserves.
+
+**`N` is measured, not chosen.** Its default is 424, from what cycle
+mode actually retires per non-stopped raster line on the
+boot-to-Workbench-ready reference workload (424.27 at 4400 frames,
+424.96 at 6000, 0.16% apart). Choosing it this way is what lets existing
+frame-count budgets carry over instead of being re-baselined from
+scratch. `N` is **workload-dependent** — a CPUBench-heavy run measures
+527 — so 424 is anchored to that reference workload, not a universal
+constant, and is overridable with `--instructions-per-line`.
+
+**Migration status, stated honestly.** 13 of ~27 real-ROM gate
+categories have been verified under `fixed` at their existing
+`--max-frames`, several matching their `cycle`-mode reference pixel
+counts byte for byte. Four combination gates are unverified, and
+CPUBench stays `max`-only by design because it self-calibrates against
+the wall clock. So this amendment sets the direction and the definition;
+it does not claim the migration is finished.
+
+The strongest evidence that the mode is sound is a convergence rather
+than a passing test: the reference boot reaches the *identical* final PC
+under `fixed` and under `cycle`, at 41,871,237 instructions against
+41,894,978 — 0.06% apart, by two timing models sharing no mechanism.
+
+### Named hazard: never advance device time in whole-period lumps
+
+The first implementation of this mode ticked `MachineBus` once per line,
+by exactly one line period. That is an exact multiple of the modulus the
+beam's horizontal position wraps on, so `hpos` returned to the same
+value after every tick and never appeared to move. Kickstart's `VHPOSR`
+delay loop polled 870 million times for a threshold it could not
+observe, and the boot stopped progressing at frame 1950 while still
+retiring instructions and tripping no wedge detector. It was determinis-
+tic and wrong, and its own determinism checks passed throughout.
+
+**The general rule, which applies to any future mode or any second
+implementation of this one:** device time must not advance in lump sums
+equal to a periodic boundary in the device model. Any register whose
+period divides the quantum freezes, not just `VHPOSR`. The fix here
+distributes a line's clocks across that line's instructions by exact
+integer rasterization from the instruction's index within the line —
+never from which opcode retired, so it stays cycle-table-free — summing
+to exactly one line period per line.
+
+This is recorded as a hazard in the ADR, not only in
+`docs/deterministic-mode.md`, because the natural implementation of a
+faster batch-oriented `fixed` mode would reintroduce it.
+
+### What this mode does not change
+
+It does not, by itself, resolve max mode's mid-batch IPL-injection gap
+for the C2 replay log (`docs/cpu-core-trait.md`). `fixed` mode injects
+at an exact retired-instruction index because it runs on the *hooked*
+path, not because a raster line is a natural batch-sizing unit. Max
+mode's unhooked batches are unaffected, and the C2 replay design still
+has to address them.
 
 ## The paced mode's timing model
 

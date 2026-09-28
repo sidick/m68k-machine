@@ -11,8 +11,14 @@ mapping / the page-type table (§4.6), the signal-fault cost measurement,
 anything in `crates/m68k-vp`, and any edit to `docs/cpu-core-proposal.md`
 or ADR 0006's own text. §12 of the proposal treats amending ADR 0006 to
 declare fixed mode *the* reproducible mode as an **acceptance** decision;
-this document ends with a recommendation for what that amendment would
-need to say, not the amendment itself. The owner-recorded preference
+this document ended with a recommendation for what that amendment would
+need to say, rather than the amendment itself. **That amendment has
+since been made** (2026-09-28, at the owner's instruction): ADR 0006 now
+carries a "The reproducible mode" section defining `fixed` as the
+project's reproducible mode, the measured `N`, the honest migration
+status, and the whole-period-lump hazard as a named hazard. The
+recommendation section at the end of this document is kept as the record
+of what was proposed and why. The owner-recorded preference
 outside this repo (max mode stays the user-facing default) is unaffected
 by any of this -- `fixed` is a third `--cpu-speed` choice, not a change to
 the default (`cycle` still is).
