@@ -85,6 +85,22 @@
 //! `--trace` (and anything else built on the per-instruction hook) has no
 //! equivalent in `run_guest_max` and is refused together with
 //! `--cpu-speed max` in `run`, before either run loop is reached.
+//!
+//! # Wedge detection catches a small loop, not just one PC
+//!
+//! The freeze `docs/wedge-detection.md` documents (commit `525dc1a`, a
+//! `--cpu-speed fixed` bug since fixed) sat in a three-instruction
+//! `VHPOSR` poll -- `MOVE.W (A4),D1 / CMP.B <ea>,D1 / BLS` -- for 870
+//! million iterations, still retiring instructions, making no progress.
+//! The wedge detector at the time counted *consecutive identical* PCs;
+//! a three-instruction loop never repeats a PC consecutively, so the
+//! streak reset on every instruction and never fired. [`LoopWindow`]
+//! replaces that: it tracks the smallest PC span containing every
+//! recently retired PC, and counts a streak of instructions that stayed
+//! inside a tiny span (see [`LOOP_WINDOW_SPAN_BYTES`]) rather than at one
+//! address. See `docs/wedge-detection.md` for the full design, the
+//! false-positive analysis (why an idle Workbench in `STOP` never trips
+//! this), and the both-directions evidence.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -198,25 +214,103 @@ const MAX_MODE_BACKLOG_CAP: Duration = Duration::from_millis(100);
 /// this.
 const MAX_MODE_STOP_SLEEP_SLICE: Duration = Duration::from_millis(1);
 
-/// `run_guest_max`'s wedge threshold: the same PC sampled at every chunk
-/// boundary for this many seconds of *wall clock*, with the CPU not
-/// stopped, is called a wedge. Real Kickstart's idle dispatcher always
-/// STOPs rather than spinning, so any non-STOP loop that holds one PC
-/// this long is not a legitimate wait -- chosen generously above what
-/// any real boot-time busy-wait in this codebase's own tests takes, since
-/// max mode has no fixed instructions-per-second to size a count-based
-/// threshold from (cycle mode's `TIGHT_LOOP_THRESHOLD`, which this
-/// replaces for `--cpu-speed max`).
+/// `run_guest_max`'s wedge threshold: the PC, sampled at every chunk
+/// boundary, staying confined to one [`LoopWindow`] for this many seconds
+/// of *wall clock*, with the CPU not stopped, is called a wedge. Real
+/// Kickstart's idle dispatcher always STOPs rather than spinning, so any
+/// non-STOP loop that holds a tiny PC range this long is not a legitimate
+/// wait -- chosen generously above what any real boot-time busy-wait in
+/// this codebase's own tests takes, since max mode has no fixed
+/// instructions-per-second to size a count-based threshold from (cycle
+/// mode's `TIGHT_LOOP_THRESHOLD`, which this replaces for `--cpu-speed
+/// max`).
 const MAX_MODE_WEDGE_SECONDS: f64 = 15.0;
 
 /// Report progress roughly once a second of guest (PAL) time.
 const PROGRESS_EVERY_FRAMES: u64 = 50;
 
-/// Instructions retired at an unchanging PC before this is called a
-/// wedge rather than a legitimate busy-wait (real idle loops in Kickstart
-/// *do* spin on one PC waiting for VERTB -- this threshold is well above
-/// one frame's instruction count so it does not fire on that).
+/// Instructions retired with the PC confined to a [`LoopWindow`] no wider
+/// than [`LOOP_WINDOW_SPAN_BYTES`] before this is called a wedge rather
+/// than a legitimate busy-wait (real idle loops in Kickstart *do* spin
+/// inside a handful of instructions waiting for VERTB or a device flag --
+/// this threshold is well above one frame's instruction count so it does
+/// not fire on that; see `docs/wedge-detection.md` for the measurement
+/// this is checked against across all 32 real-ROM gates, and why STOP,
+/// not a bounded spin, is how every legitimate wait in this codebase's
+/// tests actually idles).
 const TIGHT_LOOP_THRESHOLD: u64 = 20_000_000;
+
+/// [`LoopWindow`]'s span cap, in bytes of PC address space: the window
+/// may grow to cover this much code before it's judged "not a tight
+/// loop" and reset. Sized generously above the freeze this replaces (a
+/// 3-instruction poll spanning well under 16 bytes) while staying much
+/// smaller than any real subroutine or basic block in this codebase's
+/// ROMs -- `docs/wedge-detection.md` records the reasoning and the
+/// alternative sizes considered.
+const LOOP_WINDOW_SPAN_BYTES: u32 = 64;
+
+/// Tracks the smallest contiguous PC range containing every recently
+/// retired instruction's PC, and how many instructions in a row have
+/// landed inside it -- the generalisation of a same-PC streak that
+/// catches a small *loop* (several instructions, several addresses), not
+/// only a single instruction spinning on itself. See this module's own
+/// "Wedge detection catches a small loop, not just one PC" doc section
+/// and `docs/wedge-detection.md`.
+///
+/// [`Self::extend`] is the only way the window changes: a PC that keeps
+/// the window's span within [`LOOP_WINDOW_SPAN_BYTES`] widens it (or
+/// leaves it alone) and extends the streak; a PC that would need a wider
+/// window resets to that PC alone, streak back to 1. Cycle/fixed mode
+/// read [`Self::streak`] (an exact instruction count, since their hook
+/// runs once per retired instruction); max mode instead uses `extend`'s
+/// `bool` return to decide whether to keep or reset its own *wall-clock*
+/// timer, since it only samples the PC once per chunk (see
+/// `run_guest_max`'s own doc comment on why wedge detection "changes
+/// shape entirely" there).
+struct LoopWindow {
+    lo: u32,
+    hi: u32,
+    streak: u64,
+}
+
+impl LoopWindow {
+    fn new(pc: u32) -> Self {
+        LoopWindow {
+            lo: pc,
+            hi: pc,
+            streak: 1,
+        }
+    }
+
+    /// Reset the window to `pc` alone, streak back to 1 -- used wherever
+    /// a genuine "wait is over" signal is available (a STOP exit, an
+    /// exception taken) even though `pc` itself might coincidentally
+    /// match the window's current span.
+    fn reset(&mut self, pc: u32) {
+        self.lo = pc;
+        self.hi = pc;
+        self.streak = 1;
+    }
+
+    /// Fold one more retired (or chunk-boundary-sampled) PC into the
+    /// window. Returns `true` if `pc` fit within [`LOOP_WINDOW_SPAN_BYTES`]
+    /// of the window's existing span (the window was widened, or left
+    /// alone, and the streak extended); `false` if `pc` was far enough
+    /// away that the window was reset to `pc` alone instead.
+    fn extend(&mut self, pc: u32) -> bool {
+        let lo = self.lo.min(pc);
+        let hi = self.hi.max(pc);
+        if hi - lo <= LOOP_WINDOW_SPAN_BYTES {
+            self.lo = lo;
+            self.hi = hi;
+            self.streak += 1;
+            true
+        } else {
+            self.reset(pc);
+            false
+        }
+    }
+}
 
 /// Identical CPU exceptions taken back-to-back at the same faulting PC
 /// before this is called an exception storm.
@@ -994,9 +1088,9 @@ fn run_guest<C: GuestCpu>(
 
     // Tight-loop detector state, shared across hook invocations within one
     // outer-loop batch (recreated each batch since a fresh closure borrows
-    // it fresh, but the values themselves persist across batches).
-    let mut last_pc: u32 = cpu.pc();
-    let mut same_pc_streak: u64 = 0;
+    // it fresh, but the values themselves persist across batches). See
+    // `LoopWindow`'s own doc comment.
+    let mut loop_window = LoopWindow::new(cpu.pc());
 
     let mut last_exception: Option<(&'static str, u32)> = None;
     let mut exception_streak: u64 = 0;
@@ -1113,15 +1207,11 @@ fn run_guest<C: GuestCpu>(
                 }
             }
 
-            if pc == last_pc {
-                same_pc_streak += 1;
-            } else {
-                last_pc = pc;
-                same_pc_streak = 1;
-            }
-            if same_pc_streak >= TIGHT_LOOP_THRESHOLD {
+            loop_window.extend(pc);
+            if loop_window.streak >= TIGHT_LOOP_THRESHOLD {
                 hook_wedge = Some(format!(
-                    "tight loop at PC {pc:#010x} ({same_pc_streak} instructions with no progress)"
+                    "tight loop in PC range {:#010x}-{:#010x} ({} instructions with no progress)",
+                    loop_window.lo, loop_window.hi, loop_window.streak
                 ));
                 return HookControl::Return;
             }
@@ -1427,7 +1517,13 @@ fn run_guest_max<C: GuestCpu>(
     let mut last_exception: Option<(&'static str, u32)> = None;
     let mut exception_streak: u64 = 0;
 
-    let mut wedge_pc: u32 = cpu.pc();
+    // Same `LoopWindow` cycle/fixed mode use, but sampled once per chunk
+    // boundary (`cpu.pc()` after each chunk, not every retired
+    // instruction -- max mode has no per-instruction hook to sample
+    // from) and checked against wall-clock time rather than an
+    // instruction count, since max mode has no fixed instructions per
+    // second to size a count-based threshold from.
+    let mut loop_window = LoopWindow::new(cpu.pc());
     let mut wedge_since = Instant::now();
 
     let mut screenshot_job = args.screenshot.as_ref().map(|path| {
@@ -1569,19 +1665,19 @@ fn run_guest_max<C: GuestCpu>(
             // `MAX_MODE_WEDGE_SECONDS` is the expected, healthy case this
             // detector must never fire on.
             if result.exit == GuestExit::Stopped {
-                wedge_pc = cpu.pc();
+                loop_window.reset(cpu.pc());
                 wedge_since = Instant::now();
-            } else if cpu.pc() == wedge_pc {
+            } else if loop_window.extend(cpu.pc()) {
                 let stuck_for = wedge_since.elapsed();
                 if stuck_for.as_secs_f64() >= MAX_MODE_WEDGE_SECONDS {
                     hook_wedge = Some(format!(
-                        "tight loop at PC {:#010x} ({:.1}s wall clock with no progress)",
-                        cpu.pc(),
+                        "tight loop in PC range {:#010x}-{:#010x} ({:.1}s wall clock with no progress)",
+                        loop_window.lo,
+                        loop_window.hi,
                         stuck_for.as_secs_f64()
                     ));
                 }
             } else {
-                wedge_pc = cpu.pc();
                 wedge_since = Instant::now();
             }
 
@@ -1904,7 +2000,7 @@ fn run_guest_max<C: GuestCpu>(
 ///
 /// `instr_this_line` is declared outside the `'outer` loop and carried
 /// across iterations exactly the way `run_guest`'s own `total_instructions`/
-/// `last_pc`/`same_pc_streak` are: a fresh closure borrows it by
+/// `loop_window` are: a fresh closure borrows it by
 /// reference every iteration, but the count itself persists. It is only
 /// reset to zero when a line is actually advanced (quota met, or a STOP
 /// tick) -- an exception taken mid-line (A-line/F-line/TRAP/BKPT/
@@ -1935,12 +2031,11 @@ fn run_guest_fixed<C: GuestCpu>(
     let mut illegal_triggered = false;
 
     // Tight-loop detector: same contract as `run_guest`'s own
-    // `last_pc`/`same_pc_streak` -- a real idle wait always STOPs rather
-    // than spinning at a fixed PC (`docs/phase0-findings.md`), so a long
-    // streak at one PC with the CPU actively retiring instructions is a
-    // wedge here exactly as it is in cycle mode.
-    let mut last_pc: u32 = cpu.pc();
-    let mut same_pc_streak: u64 = 0;
+    // `loop_window` -- a real idle wait always STOPs rather than
+    // spinning in a small PC range (`docs/phase0-findings.md`), so a long
+    // streak confined to a tiny range with the CPU actively retiring
+    // instructions is a wedge here exactly as it is in cycle mode.
+    let mut loop_window = LoopWindow::new(cpu.pc());
 
     let mut last_exception: Option<(&'static str, u32)> = None;
     let mut exception_streak: u64 = 0;
@@ -2050,15 +2145,11 @@ fn run_guest_fixed<C: GuestCpu>(
                     }
                 }
 
-                if pc == last_pc {
-                    same_pc_streak += 1;
-                } else {
-                    last_pc = pc;
-                    same_pc_streak = 1;
-                }
-                if same_pc_streak >= TIGHT_LOOP_THRESHOLD {
+                loop_window.extend(pc);
+                if loop_window.streak >= TIGHT_LOOP_THRESHOLD {
                     hook_wedge = Some(format!(
-                        "tight loop at PC {pc:#010x} ({same_pc_streak} instructions with no progress)"
+                        "tight loop in PC range {:#010x}-{:#010x} ({} instructions with no progress)",
+                        loop_window.lo, loop_window.hi, loop_window.streak
                     ));
                     return HookControl::Return;
                 }
