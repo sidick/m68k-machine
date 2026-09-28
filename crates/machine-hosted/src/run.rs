@@ -110,6 +110,43 @@ use crate::serial_tcp::SerialTcpBridge;
 /// (tick, IRQ sync, trace, wedge detection) happens.
 const RUN_BATCH_CYCLES: i32 = 2_000_000;
 
+/// One raster line's worth of guest clocks, in the same CPU-clock-
+/// equivalent unit [`MachineBus::tick`] takes -- shared by cycle mode's
+/// STOP-path resync (which already ticks in exactly this slice; see
+/// `run_guest`'s own comment on why) and `--cpu-speed fixed`'s per-line
+/// advance (`run_guest_fixed`, `docs/deterministic-mode.md`). Computed
+/// from the same constants every device's arithmetic already uses, never
+/// hardcoded, so it can't drift out of step with `machine-core`.
+const ONE_LINE_CLOCKS: u32 =
+    machine_core::chipset::PAL_COLOUR_CLOCKS_PER_LINE * machine_core::CPU_CLOCKS_PER_COLOUR_CLOCK;
+
+/// `--cpu-speed fixed`'s default `--instructions-per-line` (`docs/cpu-
+/// core-proposal.md` §5.2's `N`): the measured average number of
+/// instructions `cycle` mode retires per raster line while the CPU is
+/// not stopped. Measured on a real Kickstart 3.2 boot to Workbench-ready
+/// (the same ROM/HDF pair `scripts/bench-boot-max.sh` uses) -- see
+/// `docs/deterministic-mode.md` for the method and the raw numbers.
+/// Chosen this way, rather than a round number, so the existing frame-
+/// count gates carry over with the least re-baselining (§5.2's own
+/// stated reason).
+pub const DEFAULT_INSTRUCTIONS_PER_LINE: u32 = 424;
+
+/// `--cpu-speed fixed`'s per-line cycle budget passed to
+/// `run_for_cycles_with_hook` -- deliberately huge and, unlike
+/// [`RUN_BATCH_CYCLES`], never meant to be reached: the hook alone
+/// decides when a line's `--instructions-per-line` quota is met and
+/// returns [`HookControl::Return`], so this budget only exists as an
+/// `i32` a core's `run_for_cycles_with_hook` signature requires, never
+/// consulted by fixed mode's own logic (a cycle-table-free core is free
+/// to ignore it entirely, or treat the `cycles` value handed to the hook
+/// as always `0`/undefined -- fixed mode never reads it). Large enough
+/// that no real instruction mix at any sane `--instructions-per-line`
+/// value should ever exhaust it first; if one somehow does, the outer
+/// loop just calls `run_for_cycles_with_hook` again without ticking a
+/// line (see `run_guest_fixed`'s own handling of that case) rather than
+/// mis-advancing device time.
+const FIXED_MODE_BATCH_CYCLES: i32 = 200_000_000;
+
 /// `--cpu-speed max` (`docs/adr-0006-cycle-budgeted-and-wall-clock-paced-timing.md`,
 /// `run_guest_max`): the adaptive chunk size's real-time target. Bounds
 /// the worst-case lateness of the IPL being set after a device event or a
@@ -831,6 +868,17 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
             serial_tcp.as_ref(),
             &guest_frames,
         )
+    } else if args.cpu_speed == crate::cli::CpuSpeed::Fixed {
+        run_guest_fixed(
+            args,
+            console,
+            &mut cpu,
+            &mut bus,
+            serial_script.as_mut(),
+            input_script.as_mut(),
+            serial_tcp.as_ref(),
+            &guest_frames,
+        )
     } else {
         run_guest(
             args,
@@ -929,6 +977,21 @@ fn run_guest<C: GuestCpu>(
     let mut last_serviced_frame: Option<u64> = None;
     let mut illegal_triggered = false;
 
+    // `MEASURE_INSTR_PER_LINE` (`docs/deterministic-mode.md`'s
+    // measurement method): sums every cycle actually charged to
+    // `MachineBus::tick` from *this* hook -- i.e. only while the CPU is
+    // actively retiring instructions, never the `Stopped` arm's own
+    // catch-up ticks below -- so `active_clocks / ONE_LINE_CLOCKS` is
+    // exactly "raster lines' worth of guest time spent not stopped",
+    // and `total_instructions / that` is `--cpu-speed fixed`'s `N`
+    // (`docs/cpu-core-proposal.md` §5.2's own definition). Gated behind
+    // an env var read once, same posture as `SERIAL_REG_TRACE`/
+    // `BUS_COVERAGE` (`docs/bus-fast-path-plan.md` §3.5): a plain cycle-
+    // mode run pays one extra `u64` add per retired instruction only
+    // when this is set.
+    let measure_instr_per_line = std::env::var_os("MEASURE_INSTR_PER_LINE").is_some();
+    let mut active_clocks: u64 = 0;
+
     // Tight-loop detector state, shared across hook invocations within one
     // outer-loop batch (recreated each batch since a fresh closure borrows
     // it fresh, but the values themselves persist across batches).
@@ -972,7 +1035,11 @@ fn run_guest<C: GuestCpu>(
 
         let hook_instructions_before = total_instructions;
         let result = cpu.run_for_cycles_with_hook(bus, RUN_BATCH_CYCLES, |cpu, bus, cycles| {
-            bus.0.tick(cycles.max(0) as u32);
+            let clocks = cycles.max(0) as u32;
+            bus.0.tick(clocks);
+            if measure_instr_per_line {
+                active_clocks += clocks as u64;
+            }
             cpu.set_irq(bus.0.pending_irq_level());
             drain_serial(bus, console, serial_tcp);
 
@@ -1178,12 +1245,10 @@ fn run_guest<C: GuestCpu>(
                 // underflows into one ICR event, and let a freshly raised
                 // VERTB shadow a lower-level CIA interrupt at every
                 // resync point.
-                const STOP_TICK_SLICE: u32 = machine_core::chipset::PAL_COLOUR_CLOCKS_PER_LINE
-                    * machine_core::CPU_CLOCKS_PER_COLOUR_CLOCK;
                 let mut budget = RUN_BATCH_CYCLES as u32;
                 while budget > 0 {
-                    bus.0.tick(STOP_TICK_SLICE.min(budget));
-                    budget = budget.saturating_sub(STOP_TICK_SLICE);
+                    bus.0.tick(ONE_LINE_CLOCKS.min(budget));
+                    budget = budget.saturating_sub(ONE_LINE_CLOCKS);
                     if bus.0.pending_irq_level() != 0 {
                         break;
                     }
@@ -1283,6 +1348,19 @@ fn run_guest<C: GuestCpu>(
             }
         }
     };
+
+    if measure_instr_per_line {
+        let active_lines = active_clocks as f64 / ONE_LINE_CLOCKS as f64;
+        let instr_per_line = if active_lines > 0.0 {
+            total_instructions as f64 / active_lines
+        } else {
+            0.0
+        };
+        console.diag(&format!(
+            "MEASURE_INSTR_PER_LINE: {total_instructions} instructions / {active_lines:.3} \
+             active lines (not-stopped) = {instr_per_line:.4} instructions/line"
+        ));
+    }
 
     Report {
         outcome,
@@ -1777,6 +1855,415 @@ fn run_guest_max<C: GuestCpu>(
             wall: wall_start.elapsed(),
             slept,
         }),
+    }
+}
+
+/// `--cpu-speed fixed`'s run loop (`docs/cpu-core-proposal.md` §5.2,
+/// `docs/deterministic-mode.md`): retire exactly `args.instructions_per_line`
+/// instructions per raster line, advancing the beam, both CIAs and the
+/// per-line device engines by exactly one line's worth of clocks
+/// ([`ONE_LINE_CLOCKS`]) in total over that line -- never in one lump
+/// sum at the line's end. While the CPU is stopped, lines advance with
+/// no instructions retired -- the same shape `run_guest`'s own
+/// `GuestExit::Stopped` arm already uses for its STOP-path resync (both
+/// tick a whole line in one call there, since nothing is executing to
+/// observe the intermediate state).
+///
+/// Structurally this is `run_guest` with one change: the per-instruction
+/// hook never calls [`MachineBus::tick`] with a real per-instruction
+/// cycle cost (the `cycles` value `run_for_cycles_with_hook` hands the
+/// hook is not read at all here). Instead it ticks a *fixed,
+/// position-in-line* quantum every instruction -- `ONE_LINE_CLOCKS`
+/// split across the line's `instructions_per_line` instructions by
+/// exact integer rasterization (the hook's own comment has the
+/// arithmetic), so the quantum depends only on which instruction *index*
+/// within the line just retired, never on which opcode it was. That is
+/// what makes this mode reproducible on a core with no cycle tables:
+/// nothing in this function, or in the hook it installs, ever consults
+/// an instruction's timing cost.
+///
+/// **Why not tick once at line end (the first version of this
+/// function):** it hangs. Ticking `ONE_LINE_CLOCKS` in a single call
+/// after the line's last instruction is an exact multiple of the line
+/// period, so the beam's horizontal position (`hpos`, read back via
+/// custom chip registers like `VHPOSR`) returns to *exactly* the same
+/// value after every such tick -- it can never be observed to move by
+/// guest code executing between ticks. Confirmed empirically, not just
+/// derived: a real Kickstart 3.2.2 A1200 boot hung at a `MOVE.W
+/// (A4),D1` / `CMP.B` / `BLS` beam-position poll (`A4 = $DFF006`,
+/// `VHPOSR`) for over 870 million loop iterations with the polled
+/// value's low byte pinned at `$00` throughout -- a real, hardware-
+/// timing-calibrated delay loop, not a synthetic edge case. Ticking
+/// incrementally, spread across the line, gives `hpos` genuine
+/// intra-line movement for exactly this kind of code to observe, while
+/// still summing to exactly `ONE_LINE_CLOCKS` per line and never reading
+/// a per-instruction cycle cost. With this fix, the same boot reaches
+/// the same idle `STOP` at the same final PC (`0x00f8131c`) cycle mode
+/// reaches, at nearly the same instruction count (`docs/
+/// deterministic-mode.md` has the full before/after).
+///
+/// `instr_this_line` is declared outside the `'outer` loop and carried
+/// across iterations exactly the way `run_guest`'s own `total_instructions`/
+/// `last_pc`/`same_pc_streak` are: a fresh closure borrows it by
+/// reference every iteration, but the count itself persists. It is only
+/// reset to zero when a line is actually advanced (quota met, or a STOP
+/// tick) -- an exception taken mid-line (A-line/F-line/TRAP/BKPT/
+/// illegal) does not reset it, so instructions retired before the trap
+/// still count toward that same line's quota once execution resumes;
+/// device time for whatever instructions did retire before the trap has
+/// already been ticked, instruction by instruction, by the hook above.
+#[allow(clippy::too_many_arguments)]
+fn run_guest_fixed<C: GuestCpu>(
+    args: &Args,
+    console: &mut Console,
+    cpu: &mut C,
+    bus: &mut Bus,
+    mut serial_script: Option<&mut SerialScript>,
+    mut input_script: Option<&mut InputScript>,
+    serial_tcp: Option<&SerialTcpBridge>,
+    guest_frames: &std::cell::Cell<u64>,
+) -> Report {
+    let instructions_per_line = args.instructions_per_line.max(1);
+    let n64 = instructions_per_line as u64;
+
+    let mut total_instructions: u64 = 0;
+    let mut instr_this_line: u32 = 0;
+    let mut last_progress_frame: u64 = 0;
+    let mut overlay_was_cleared = false;
+    let mut overlay_cleared_frame: Option<u64> = None;
+    let mut last_serviced_frame: Option<u64> = None;
+    let mut illegal_triggered = false;
+
+    // Tight-loop detector: same contract as `run_guest`'s own
+    // `last_pc`/`same_pc_streak` -- a real idle wait always STOPs rather
+    // than spinning at a fixed PC (`docs/phase0-findings.md`), so a long
+    // streak at one PC with the CPU actively retiring instructions is a
+    // wedge here exactly as it is in cycle mode.
+    let mut last_pc: u32 = cpu.pc();
+    let mut same_pc_streak: u64 = 0;
+
+    let mut last_exception: Option<(&'static str, u32)> = None;
+    let mut exception_streak: u64 = 0;
+
+    let mut screenshot_job = args.screenshot.as_ref().map(|path| {
+        crate::screenshot::ScreenshotJob::new(
+            path.clone(),
+            args.screenshot_frame,
+            args.screenshot_every,
+        )
+    });
+    let mut screenshot_last_frame: Option<u64> = None;
+
+    // Ad hoc debugging aid (not present in `run_guest`'s own hook,
+    // `TRACE_WATCH_PCS` there is gated on `--trace`): parsed once,
+    // independent of `--trace`, so a specific PC's registers can be
+    // dumped the first few times it's hit without paying the
+    // disassembler's cost on every instruction of a long run.
+    let watch_pcs: Option<Vec<u32>> = std::env::var("TRACE_WATCH_PCS").ok().map(|watch| {
+        watch
+            .split(',')
+            .filter_map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .collect()
+    });
+
+    let outcome = 'outer: loop {
+        let trace = args.trace;
+        let cpu_type: m68k::CpuType = args.cpu.into();
+        let mut hook_wedge: Option<String> = None;
+        let mut hook_limit: Option<&'static str> = None;
+        let mut hook_line_done = false;
+
+        let hook_instructions_before = total_instructions;
+        let result = cpu.run_for_cycles_with_hook(
+            bus,
+            FIXED_MODE_BATCH_CYCLES,
+            |cpu, bus, _cycles| {
+                // Deliberately not reading `_cycles`: see this function's
+                // own doc comment on why fixed mode never consults a
+                // per-instruction timing cost.
+                //
+                // Advance device time by a *fixed, position-in-line*
+                // quantum -- never a per-instruction cycle cost --
+                // spread evenly across the line's `instructions_per_line`
+                // instructions rather than ticked in one lump sum after
+                // the last one. This is load-bearing, not cosmetic: see
+                // this function's own doc comment's "why not tick once
+                // at line end" section for the bug this replaced (ticking
+                // exactly `ONE_LINE_CLOCKS` in one call every time made
+                // the beam's horizontal position mathematically
+                // invariant -- an exact multiple of the line period
+                // always returns `hpos` to the same value -- which hangs
+                // any guest code polling `VHPOSR` for a threshold, a real
+                // Kickstart delay-loop pattern, not a synthetic one).
+                // `cumulative_before`/`cumulative_after` is exact
+                // integer rasterization (a Bresenham-style split): the
+                // per-instruction amount depends only on the
+                // instruction's *position* within the line (`i`), so a
+                // core with no cycle tables can compute it identically,
+                // and the sum across exactly `instructions_per_line`
+                // calls is exactly `ONE_LINE_CLOCKS` by construction
+                // (the telescoping sum collapses to
+                // `cumulative(N) - cumulative(0) = ONE_LINE_CLOCKS`).
+                instr_this_line += 1;
+                let i = instr_this_line as u64;
+                let cumulative_before = (ONE_LINE_CLOCKS as u64 * (i - 1)) / n64;
+                let cumulative_after = (ONE_LINE_CLOCKS as u64 * i) / n64;
+                let amount = (cumulative_after - cumulative_before) as u32;
+                bus.0.tick(amount);
+                cpu.set_irq(bus.0.pending_irq_level());
+                drain_serial(bus, console, serial_tcp);
+
+                let frames = bus.0.frames();
+                if last_serviced_frame != Some(frames) {
+                    service_host_serial(
+                        args,
+                        cpu,
+                        bus,
+                        console,
+                        serial_script.as_deref_mut(),
+                        input_script.as_deref_mut(),
+                        serial_tcp,
+                        &mut overlay_cleared_frame,
+                        &mut last_serviced_frame,
+                        &mut illegal_triggered,
+                    );
+                }
+
+                total_instructions += 1;
+                let pc = cpu.ppc();
+                if bus.serial_trace_on() {
+                    crate::bus::LAST_PC.store(cpu.pc(), std::sync::atomic::Ordering::Relaxed);
+                }
+
+                if trace {
+                    let opcode = bus.0.read_word(pc);
+                    let (mnemonic, _) = m68k::dasm::disassemble(pc, opcode, cpu_type);
+                    console.diag(&format!("{pc:#010x}: {opcode:#06x}  {mnemonic}"));
+                }
+                if let Some(watch) = watch_pcs.as_ref() {
+                    if watch.contains(&pc) {
+                        console.diag(&format!(
+                            "  WATCH {pc:#010x}: D0={:#010x} D1={:#010x} D2={:#010x} A0={:#010x} A1={:#010x} A2={:#010x} A6={:#010x} SP={:#010x}",
+                            cpu.dar(0), cpu.dar(1), cpu.dar(2),
+                            cpu.dar(8), cpu.dar(9), cpu.dar(10), cpu.dar(14), cpu.dar(15),
+                        ));
+                    }
+                }
+
+                if pc == last_pc {
+                    same_pc_streak += 1;
+                } else {
+                    last_pc = pc;
+                    same_pc_streak = 1;
+                }
+                if same_pc_streak >= TIGHT_LOOP_THRESHOLD {
+                    hook_wedge = Some(format!(
+                        "tight loop at PC {pc:#010x} ({same_pc_streak} instructions with no progress)"
+                    ));
+                    return HookControl::Return;
+                }
+
+                if frames >= last_progress_frame + PROGRESS_EVERY_FRAMES {
+                    last_progress_frame = frames;
+                    console.diag(&format!(
+                        "progress: frame {frames}, PC {:#010x}, overlay {}, INTENA {:#06x}, INTREQ {:#06x}",
+                        cpu.pc(),
+                        if bus.0.overlay() { "mapped" } else { "clear" },
+                        bus.0.chipset.intena,
+                        bus.0.chipset.intreq,
+                    ));
+                }
+
+                if screenshot_last_frame != Some(frames) {
+                    screenshot_last_frame = Some(frames);
+                    guest_frames.set(frames);
+                    if let Some(job) = screenshot_job.as_mut() {
+                        job.maybe_capture(frames, args.max_frames, &mut bus.0, console);
+                    }
+                }
+
+                if args.max_instructions != 0 && total_instructions >= args.max_instructions {
+                    hook_limit = Some("max-instructions");
+                    return HookControl::Return;
+                }
+                if args.max_frames != 0 && frames >= args.max_frames {
+                    hook_limit = Some("max-frames");
+                    return HookControl::Return;
+                }
+
+                if instr_this_line >= instructions_per_line {
+                    hook_line_done = true;
+                    return HookControl::Return;
+                }
+
+                HookControl::Continue
+            },
+        );
+
+        if total_instructions < hook_instructions_before + result.instructions as u64 {
+            total_instructions = hook_instructions_before + result.instructions as u64;
+        }
+
+        if !overlay_was_cleared && !bus.0.overlay() {
+            overlay_was_cleared = true;
+            console.diag(&format!(
+                "PHASE1 HOSTED: reached overlay-cleared (frame {}, instr {total_instructions}, PC {:#010x})",
+                bus.0.frames(), cpu.pc()
+            ));
+        }
+
+        if let Some(reason) = hook_wedge {
+            break 'outer Outcome::Wedged(reason);
+        }
+        if let Some(which) = hook_limit {
+            break 'outer Outcome::LimitReached(which);
+        }
+
+        if hook_line_done {
+            // The line's instruction quota was met. Device time has
+            // *already* been advanced by exactly `ONE_LINE_CLOCKS` in
+            // total -- spread across the line's instructions by the
+            // hook's own per-instruction tick above, not applied here in
+            // one lump sum (see the hook's own comment on why that
+            // matters). Nothing left to do but reset the per-line
+            // counter and start the next line.
+            instr_this_line = 0;
+            continue 'outer;
+        }
+
+        match result.exit {
+            GuestExit::BudgetExhausted | GuestExit::BoundaryRequested => {
+                // The line's quota was not yet met (`hook_line_done` is
+                // `false`); this hooked batch simply returned early for
+                // some other reason (the generous `FIXED_MODE_BATCH_CYCLES`
+                // budget, in practice never reached -- see its own doc
+                // comment). Keep accumulating toward this same line's
+                // quota -- device time for whatever instructions did
+                // retire in this batch has already been ticked by the
+                // hook itself, instruction by instruction.
+                continue 'outer;
+            }
+            GuestExit::Stopped => {
+                if cpu.int_mask() & 0x0700 == 0x0700 {
+                    break 'outer Outcome::CleanHalt;
+                }
+
+                let frames = bus.0.frames();
+                if args.max_frames != 0 && frames >= args.max_frames {
+                    break 'outer Outcome::LimitReached("max-frames");
+                }
+
+                // No instructions retired this line (`instr_this_line`
+                // is already whatever it was before the CPU stopped --
+                // 0 on a fresh line, since STOP only ever exits a hooked
+                // batch with nothing retired at all per
+                // `run_for_cycles_with_hook`'s own contract). Advance
+                // exactly one line anyway, matching §5.2's "while
+                // stopped, lines advance with no instructions retired".
+                bus.0.tick(ONE_LINE_CLOCKS);
+                cpu.set_irq(bus.0.pending_irq_level());
+                drain_serial(bus, console, serial_tcp);
+
+                let frames = bus.0.frames();
+                if screenshot_last_frame != Some(frames) {
+                    screenshot_last_frame = Some(frames);
+                    guest_frames.set(frames);
+                    if let Some(job) = screenshot_job.as_mut() {
+                        job.maybe_capture(frames, args.max_frames, &mut bus.0, console);
+                    }
+                }
+                if frames >= last_progress_frame + PROGRESS_EVERY_FRAMES {
+                    last_progress_frame = frames;
+                    console.diag(&format!(
+                        "progress: frame {frames}, PC {:#010x} (stopped), overlay {}, INTENA {:#06x}, INTREQ {:#06x}",
+                        cpu.pc(),
+                        if bus.0.overlay() { "mapped" } else { "clear" },
+                        bus.0.chipset.intena,
+                        bus.0.chipset.intreq,
+                    ));
+                }
+                continue 'outer;
+            }
+            GuestExit::AlineTrap { opcode } => {
+                if track_exception(
+                    "A-line",
+                    cpu.ppc(),
+                    &mut last_exception,
+                    &mut exception_streak,
+                ) {
+                    break 'outer Outcome::Wedged(format!(
+                        "exception storm: A-line trap {opcode:#06x} at PC {:#010x} repeated {exception_streak} times",
+                        cpu.ppc()
+                    ));
+                }
+                cpu.take_aline_exception(bus);
+            }
+            GuestExit::FlineTrap { opcode } => {
+                if track_exception(
+                    "F-line",
+                    cpu.ppc(),
+                    &mut last_exception,
+                    &mut exception_streak,
+                ) {
+                    break 'outer Outcome::Wedged(format!(
+                        "exception storm: F-line trap {opcode:#06x} at PC {:#010x} repeated {exception_streak} times",
+                        cpu.ppc()
+                    ));
+                }
+                cpu.take_fline_exception(bus);
+            }
+            GuestExit::TrapInstruction { trap_num } => {
+                if track_exception(
+                    "TRAP",
+                    cpu.ppc(),
+                    &mut last_exception,
+                    &mut exception_streak,
+                ) {
+                    break 'outer Outcome::Wedged(format!(
+                        "exception storm: TRAP #{trap_num} at PC {:#010x} repeated {exception_streak} times",
+                        cpu.ppc()
+                    ));
+                }
+                cpu.take_trap_exception(bus, trap_num);
+            }
+            GuestExit::Breakpoint { bp_num } => {
+                if track_exception(
+                    "BKPT",
+                    cpu.ppc(),
+                    &mut last_exception,
+                    &mut exception_streak,
+                ) {
+                    break 'outer Outcome::Wedged(format!(
+                        "exception storm: BKPT #{bp_num} at PC {:#010x} repeated {exception_streak} times",
+                        cpu.ppc()
+                    ));
+                }
+                cpu.take_bkpt_exception(bus);
+            }
+            GuestExit::IllegalInstruction { opcode } => {
+                if track_exception(
+                    "illegal",
+                    cpu.ppc(),
+                    &mut last_exception,
+                    &mut exception_streak,
+                ) {
+                    break 'outer Outcome::Wedged(format!(
+                        "exception storm: illegal opcode {opcode:#06x} at PC {:#010x} repeated {exception_streak} times",
+                        cpu.ppc()
+                    ));
+                }
+                cpu.take_illegal_exception(bus);
+            }
+        }
+    };
+
+    Report {
+        outcome,
+        instructions: total_instructions,
+        frames: bus.0.frames(),
+        final_pc: cpu.pc(),
+        overlay_cleared: !bus.0.overlay(),
+        max_mode_timing: None,
     }
 }
 

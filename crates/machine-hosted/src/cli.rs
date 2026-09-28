@@ -87,8 +87,33 @@ pub struct Args {
     /// diagnostic (refused at startup): `max` moves the per-instruction
     /// hook's duties to chunk boundaries, so there is no per-instruction
     /// point left to hang a trace off.
+    ///
+    /// `fixed` is `docs/cpu-core-proposal.md` §5.2's deterministic mode
+    /// without cycle tables: the run loop retires exactly
+    /// `--instructions-per-line` instructions, then advances the beam,
+    /// both CIAs and the per-line device engines by one raster line's
+    /// worth of clocks, and repeats -- never consulting any per-
+    /// instruction cycle cost. While the CPU is stopped, lines advance
+    /// with no instructions retired, exactly as `cycle` mode's own STOP
+    /// resync already does. Reproducible on any [`crate::cpu::GuestCpu`]
+    /// implementation, including one with no cycle accounting at all --
+    /// see `docs/deterministic-mode.md` for the measured default and
+    /// what a cycle-table-free core must provide. `--trace` works under
+    /// `fixed` the same way it does under `cycle` (both drive a real
+    /// per-instruction hook); only `max` forecloses it.
     #[arg(long, default_value = "cycle")]
     pub cpu_speed: CpuSpeed,
+
+    /// `--cpu-speed fixed`'s instructions-per-raster-line count (`N` in
+    /// `docs/cpu-core-proposal.md` §5.2). Ignored under `cycle`/`max`.
+    /// Default is the measured average number of instructions `cycle`
+    /// mode retires per raster line while the CPU is not stopped --
+    /// see `docs/deterministic-mode.md` for the measurement method and
+    /// why that choice, rather than a round number, is what lets
+    /// existing frame-count budgets carry over with the least
+    /// re-baselining.
+    #[arg(long, default_value_t = crate::run::DEFAULT_INSTRUCTIONS_PER_LINE)]
+    pub instructions_per_line: u32,
 
     /// `--cpu-speed max`'s CPU back end (plan step 7.2): `interp` (the
     /// default) runs `m68k::CpuCore::run_for_cycles`, exactly as before
@@ -487,6 +512,10 @@ pub enum CpuSpeed {
     Cycle,
     /// Wall-clock-paced, unbudgeted CPU, "fastest possible".
     Max,
+    /// Fixed instructions retired per raster line, deterministic without
+    /// any per-instruction cycle accounting (`docs/cpu-core-proposal.md`
+    /// §5.2, `docs/deterministic-mode.md`).
+    Fixed,
 }
 
 /// `--cpu-backend`'s two `--cpu-speed max` back ends -- see that flag's

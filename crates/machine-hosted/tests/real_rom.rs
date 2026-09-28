@@ -2725,3 +2725,791 @@ fn kickstart_3_2_2_a1200_cpubench_reports_every_kernel_under_max_speed() {
         "never saw the final \"CPUBENCH DONE\" marker -- serial log:\n{serial_log}"
     );
 }
+
+/// `--cpu-speed fixed` (`docs/cpu-core-proposal.md` §5.2, `docs/
+/// deterministic-mode.md`): the re-baselined gates for milestone C1's
+/// second slice. This section is deliberately a small, additive set of
+/// `fixed`-mode siblings to a handful of the *early-boot, frame-indexed*
+/// gates above -- not a wholesale port of every `--max-frames` test in
+/// this file. `docs/deterministic-mode.md`'s own "which gates were
+/// re-baselined" section explains why: early-boot markers, `--inspect`
+/// snapshots, and `--serial-script`/`--trigger-illegal-after-frames`
+/// timing are all indexed by chipset *frame* number, which `fixed` mode
+/// advances identically to `cycle` mode (both call `service_host_serial`
+/// once per changed frame) -- so these pass at the *same* `--max-frames`
+/// values, unchanged. Deep Workbench-desktop and disk-I/O-bound gates
+/// depend on real per-instruction cycle cost (disk completion polling
+/// loops, hardware-calibrated delay loops), which `fixed` mode does not
+/// preserve -- `docs/deterministic-mode.md` documents that divergence
+/// with measurements rather than attempting to force those gates through
+/// on a guessed larger frame budget.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_fixed_mode() {
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
+        return;
+    }
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--cpu-speed",
+        "fixed",
+        "--max-frames",
+        "200",
+        "--max-instructions",
+        "50000000",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+    assert!(
+        stdout.contains("PHASE1 HOSTED:"),
+        "expected a final status line regardless of how far boot got"
+    );
+}
+
+/// `fixed`-mode sibling of `kickstart_3_2_2_a1200_introspection_finds_a_healthy_exec_base`,
+/// same `--max-frames 200` -- see this section's own doc comment for why
+/// no re-baselining was needed for this one.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_introspection_finds_a_healthy_exec_base_fixed_mode() {
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
+        return;
+    }
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--cpu-speed",
+        "fixed",
+        "--max-frames",
+        "200",
+        "--max-instructions",
+        "50000000",
+        "--inspect",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+    assert!(
+        stdout.contains("introspect: ExecBase at"),
+        "expected a well-formed ExecBase to be found on a real Kickstart boot"
+    );
+    assert!(
+        !stdout.contains("no plausible ExecBase"),
+        "exec should have finished initialising by frame 200"
+    );
+    assert!(
+        stdout.contains("resident modules initialised:"),
+        "expected the resident-module count line"
+    );
+}
+
+/// `fixed`-mode sibling of `kickstart_3_2_2_a1200_configures_the_pcibridge_board`,
+/// same `--max-frames 200` -- see this section's own doc comment.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_configures_the_pcibridge_board_fixed_mode() {
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
+        return;
+    }
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--cpu-speed",
+        "fixed",
+        "--max-frames",
+        "200",
+        "--max-instructions",
+        "50000000",
+        "--inspect",
+        "--pcibridge",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+    assert!(
+        stdout.contains("introspect: ExecBase at"),
+        "expected a well-formed ExecBase to be found on a real Kickstart boot"
+    );
+    assert!(
+        !stdout.contains("no plausible ExecBase"),
+        "exec should have finished initialising by frame 200"
+    );
+    let placed_line = stdout
+        .lines()
+        .find(|line| line.contains("pcibridge state: AUTOCONFIG placed the board at"))
+        .unwrap_or_else(|| {
+            panic!("expected a pcibridge AUTOCONFIG-placed line; full output:\n{stdout}")
+        });
+    let base_str = placed_line
+        .rsplit("at ")
+        .next()
+        .expect("line contains 'at '");
+    let base = u32::from_str_radix(base_str.trim_start_matches("0x"), 16)
+        .unwrap_or_else(|e| panic!("parsing base address from {base_str:?}: {e}"));
+    assert!(
+        base >= 0x1000_0000,
+        "AUTOCONFIG should place a Zorro III board at a plausible Zorro III address, got \
+         {base:#010x}"
+    );
+    assert!(
+        stdout.contains("ConfigDev found at"),
+        "expected the ConfigDev-found line -- evidence Kickstart's expansion.library adopted \
+         the pcibridge board; full output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("no ConfigDev matched this board's manufacturer/product/address"),
+        "a ConfigDev-not-matched line would mean Kickstart did NOT adopt the board; full \
+         output:\n{stdout}"
+    );
+}
+
+/// `fixed`-mode sibling of `kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger`,
+/// same `--max-frames 400` -- the break-in poll and `--serial-script`'s
+/// `SEND` pacing are both frame-indexed (`service_host_serial` runs once
+/// per changed frame in `fixed` mode exactly as it does in `cycle` mode),
+/// so this needed no re-baselining either. Positive evidence that fixed
+/// mode's per-instruction hook -- not just its line-quantized device
+/// tick -- reaches parity with cycle mode's for host->guest serial
+/// timing and the forced-exception path.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger_fixed_mode() {
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
+        return;
+    }
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/serial-scripts/romwack-break-in.txt"
+    );
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--cpu-speed",
+        "fixed",
+        "--trigger-illegal-after-frames",
+        "20",
+        "--serial-script",
+        script,
+        "--max-frames",
+        "400",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+    assert!(
+        stdout.contains("GUEST | rom-wack"),
+        "expected the ROM's own rom-wack debugger banner"
+    );
+    assert!(
+        stdout.contains("XCPT: 8000002F"),
+        "expected a register dump for the forced illegal-instruction exception"
+    );
+}
+
+/// `fixed`-mode sibling of `aros_68k_pair` -- AROS assets are vendored
+/// in-repo (`assets/aros/PROVENANCE.md`), so unlike the Kickstart tests
+/// above this runs unconditionally in CI, not gated on `--ignored`.
+#[test]
+fn aros_68k_pair_fixed_mode() {
+    if !Path::new(AROS_MAIN).exists() || !Path::new(AROS_EXT).exists() {
+        eprintln!("SKIP: AROS ROM pair not present");
+        return;
+    }
+    let (status, stdout) = run(&[
+        "--rom",
+        AROS_MAIN,
+        "--ext-rom",
+        AROS_EXT,
+        "--cpu-speed",
+        "fixed",
+        "--max-frames",
+        "200",
+        "--max-instructions",
+        "50000000",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+    assert!(
+        stdout.contains("PHASE1 HOSTED:"),
+        "expected a final status line regardless of how far boot got"
+    );
+}
+
+/// Determinism, demonstrated rather than assumed (CLAUDE.md: "verify
+/// positively; never read absence of a complaint as success"). Runs the
+/// same `fixed`-mode boot three times and asserts every one produces
+/// byte-identical stdout -- not just the same final instruction/frame
+/// counts, the same serial narration throughout. `fixed` mode's whole
+/// reason to exist is reproducibility on a core with no cycle tables
+/// (`docs/cpu-core-proposal.md` §5.2); this is the test that would fail
+/// first if that claim were false (e.g. if anything in `run_guest_fixed`
+/// depended on host timing, iteration order over a `HashMap`, or some
+/// other source of nondeterminism `cycle` mode's own equivalent gates
+/// never exercise since they never run more than once here).
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
+fn fixed_mode_boot_is_deterministic_across_repeated_runs() {
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
+        return;
+    }
+    let args = [
+        "--rom",
+        rom.as_str(),
+        "--cpu-speed",
+        "fixed",
+        "--max-frames",
+        "500",
+        "--max-instructions",
+        "0",
+    ];
+    let (_, first) = run(&args).unwrap();
+    for attempt in 2..=3 {
+        let (_, output) = run(&args).unwrap();
+        assert_eq!(
+            output, first,
+            "fixed-mode run {attempt} diverged from run 1's stdout -- fixed mode is supposed \
+             to be byte-for-byte reproducible"
+        );
+    }
+    assert!(
+        first.contains("PHASE1 HOSTED:"),
+        "expected a final status line"
+    );
+}
+
+/// `fixed`-mode sibling of `kickstart_3_2_2_a1200_screenshot_shows_the_boot_screen`,
+/// same `--max-frames 2600`/`--screenshot-frame 2500` -- added after a
+/// real bug in `run_guest_fixed`'s first version was found and fixed
+/// (`docs/deterministic-mode.md`'s "why not tick once at line end"):
+/// once device time advances smoothly within a line instead of in one
+/// lump sum, this boot-screen capture reaches the *same* pixel content
+/// cycle mode's own test documents, at the *same* frame count.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_screenshot_shows_the_boot_screen_fixed_mode() {
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
+        return;
+    }
+    let path = screenshot_path("kickstart-fixed-mode");
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--cpu-speed",
+        "fixed",
+        "--max-frames",
+        "2600",
+        "--max-instructions",
+        "400000000",
+        "--screenshot",
+        path.to_str().unwrap(),
+        "--screenshot-frame",
+        "2500",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+    assert!(
+        stdout.contains("screenshot: frame 2500"),
+        "expected the capture to actually fire by frame 2500"
+    );
+
+    let (width, height, rgba) = decode_png(&path);
+    assert_eq!(
+        (width, height),
+        (
+            machine_core::display::MAX_WIDTH as u32,
+            machine_core::display::MAX_HEIGHT as u32
+        ),
+        "screenshots are always the renderer's full worst-case canvas"
+    );
+
+    let background = dominant_pixel(&rgba);
+    let non_background = rgba.chunks(4).filter(|px| *px != background).count();
+    assert!(
+        non_background > 2000,
+        "expected Kickstart's boot picture to be drawn, got {non_background} \
+         non-background pixels"
+    );
+
+    let mut colours: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    for px in rgba.chunks(4) {
+        colours.insert(px);
+    }
+    assert!(
+        colours.len() >= 4,
+        "expected a multi-colour picture from a 4-plane screen, got {} distinct colours",
+        colours.len()
+    );
+}
+
+/// `fixed`-mode sibling of `kickstart_3_2_2_a1200_boots_from_hd_to_the_workbench_desktop`,
+/// same `--max-frames 4500`/`--screenshot-frame 4000`. Measured directly:
+/// this capture's non-background pixel count under `fixed` mode is
+/// **13507** -- the exact figure the `cycle`-mode original's own doc
+/// comment records for a healthy desktop, not merely "close".
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_boots_from_hd_to_the_workbench_desktop_fixed_mode() {
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
+        return;
+    }
+    let hd = hd_image();
+    if !have_fixtures(&[&hd]) {
+        return;
+    }
+    let path = screenshot_path("kickstart-hd-fixed-mode");
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--cpu-speed",
+        "fixed",
+        "--max-frames",
+        "4500",
+        "--max-instructions",
+        "300000000",
+        "--screenshot",
+        path.to_str().unwrap(),
+        "--screenshot-frame",
+        "4000",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    assert!(
+        stdout.contains("hostblk:") && stdout.contains("read-only"),
+        "expected the runner to report attaching the image read-only by default"
+    );
+    assert!(
+        stdout.contains("screenshot: frame 4000"),
+        "expected the capture to actually fire by frame 4000"
+    );
+
+    let (width, height, rgba) = decode_png(&path);
+    assert_eq!(
+        (width, height),
+        (
+            machine_core::display::MAX_WIDTH as u32,
+            machine_core::display::MAX_HEIGHT as u32
+        ),
+        "screenshots are always the renderer's full worst-case canvas"
+    );
+
+    let background = dominant_pixel(&rgba);
+    let non_background = rgba.chunks(4).filter(|px| *px != background).count();
+    assert!(
+        non_background > 8_000,
+        "expected a drawn Workbench desktop -- title bar, window and the \
+         RAM Disk and SYS icons -- got {non_background} non-background pixels"
+    );
+
+    let mut colours: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    for px in rgba.chunks(4) {
+        colours.insert(px);
+    }
+    assert!(
+        colours.len() >= 4,
+        "expected several distinct colours over the Workbench grey, got {} \
+         distinct colours",
+        colours.len()
+    );
+}
+
+/// `fixed`-mode sibling of `scripted_double_click_on_the_sys_icon_opens_its_drawer`,
+/// same `--max-frames 4650`/`--screenshot-frame 4510` and input script.
+/// Measured: **15241** non-background pixels, matching the `cycle`-mode
+/// original's documented "opened drawer" figure exactly -- direct
+/// evidence that `service_host_serial`/`InputScript::tick`'s frame-gated
+/// scheduling (unchanged by `fixed` mode) drives the same click sequence
+/// to the same visible result once device time within a line no longer
+/// masks it (`docs/deterministic-mode.md`).
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
+fn scripted_double_click_on_the_sys_icon_opens_its_drawer_fixed_mode() {
+    let rom = kickstart_a1200();
+    let hd = hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+
+    let script_path = std::env::temp_dir().join(format!(
+        "machine-hosted-click-fixed-{}.input",
+        std::process::id()
+    ));
+    std::fs::write(
+        &script_path,
+        "SLEEP 4200\nMOVE 42 73\nSLEEP 10\nBUTTONDOWN LEFT\nBUTTONUP LEFT\n\
+         SLEEP 5\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 300\n",
+    )
+    .expect("write input script");
+
+    let path = screenshot_path("sys-drawer-fixed-mode");
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--cpu-speed",
+        "fixed",
+        "--input-script",
+        script_path.to_str().unwrap(),
+        "--screenshot",
+        path.to_str().unwrap(),
+        "--screenshot-frame",
+        "4510",
+        "--max-frames",
+        "4650",
+        "--max-instructions",
+        "600000000",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    let (width, height, rgba) = decode_png(&path);
+    assert_eq!(
+        (width, height),
+        (
+            machine_core::display::MAX_WIDTH as u32,
+            machine_core::display::MAX_HEIGHT as u32
+        )
+    );
+
+    let background = dominant_pixel(&rgba);
+    let non_background = rgba.chunks(4).filter(|px| *px != background).count();
+    assert!(
+        non_background > 14_500,
+        "expected the SYS drawer window opened by a scripted double-click, \
+         got {non_background} non-background pixels"
+    );
+
+    let _ = std::fs::remove_file(&script_path);
+}
+
+/// `fixed`-mode sibling of
+/// `scripted_typing_in_a_shell_opened_three_double_clicks_deep_is_echoed`,
+/// same `--max-frames 5800`/`--screenshot-frame 5700` and input script.
+/// Measured: **14073** non-background pixels, matching the `cycle`-mode
+/// original's documented "typed" figure exactly.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
+fn scripted_typing_in_a_shell_opened_three_double_clicks_deep_is_echoed_fixed_mode() {
+    let rom = kickstart_a1200();
+    let hd = hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+
+    let script_path = std::env::temp_dir().join(format!(
+        "machine-hosted-type-fixed-{}.input",
+        std::process::id()
+    ));
+    std::fs::write(
+        &script_path,
+        "SLEEP 4200\n\
+         MOVE 42 73\nSLEEP 10\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 5\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 300\n\
+         MOVE 170 84\nSLEEP 10\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 5\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 300\n\
+         MOVE 192 108\nSLEEP 10\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 5\nBUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 600\n\
+         TYPE \"ECHO Hi\"\nSLEEP 30\nKEYDOWN 0x44\nSLEEP 2\nKEYUP 0x44\nSLEEP 300\n",
+    )
+    .expect("write input script");
+
+    let path = screenshot_path("shell-type-fixed-mode");
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--cpu-speed",
+        "fixed",
+        "--input-script",
+        script_path.to_str().unwrap(),
+        "--screenshot",
+        path.to_str().unwrap(),
+        "--screenshot-frame",
+        "5700",
+        "--max-frames",
+        "5800",
+        "--max-instructions",
+        "900000000",
+        "--inspect",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    assert!(
+        stdout.contains("EVENT_COUNT 0  EVENT_OVERFLOW 0"),
+        "expected the input card's queue fully drained with no drops by the end of the run: {stdout}"
+    );
+
+    let (width, height, rgba) = decode_png(&path);
+    assert_eq!(
+        (width, height),
+        (
+            machine_core::display::MAX_WIDTH as u32,
+            machine_core::display::MAX_HEIGHT as u32
+        )
+    );
+
+    let background = dominant_pixel(&rgba);
+    let non_background = rgba.chunks(4).filter(|px| *px != background).count();
+    assert!(
+        non_background > 14_000,
+        "expected 'ECHO Hi' typed, run, and its 'Hi' echoed in the opened Shell window, \
+         got {non_background} non-background pixels"
+    );
+
+    let _ = std::fs::remove_file(&script_path);
+}
+
+/// `fixed`-mode sibling of `kickstart_3_2_2_a1200_pciprobe_proves_the_prometheus_library_api`,
+/// same `--max-frames 3000`.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and the patched pciprobe HDF on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_pciprobe_proves_the_prometheus_library_api_fixed_mode() {
+    let rom = kickstart_a1200();
+    let hd = pciprobe_hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+
+    let serial_log_path = std::env::temp_dir().join(format!(
+        "machine-hosted-kickstart-pciprobe-fixed-{}.serial.log",
+        std::process::id()
+    ));
+
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--cpu-speed",
+        "fixed",
+        "--pcibridge",
+        "--max-frames",
+        "3000",
+        "--max-instructions",
+        "2000000000",
+        "--serial-log",
+        serial_log_path.to_str().unwrap(),
+        "--inspect",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    let serial_log = std::fs::read_to_string(&serial_log_path)
+        .unwrap_or_else(|e| panic!("read serial log {serial_log_path:?}: {e}"));
+
+    for marker in [
+        "prometheus.library: LibInit: board at ",
+        "PCIB_VERSION 2 confirmed",
+        "prometheus.library: found 1AF4:1041 at 00:01.0",
+        "prometheus.library: 00:01.0 BAR0 -> PCI $20000000 size $004000",
+        "prometheus.library: LibInit complete",
+        "PCIPROBE openlibrary: PASS",
+    ] {
+        assert!(
+            serial_log.contains(marker),
+            "expected the serial narration to contain {marker:?} -- serial log:\n{serial_log}"
+        );
+    }
+    assert!(
+        !serial_log.contains("FAIL"),
+        "expected no individual check to print FAIL -- serial log:\n{serial_log}"
+    );
+}
+
+/// `fixed`-mode sibling of `kickstart_3_2_2_a1200_virtionet_first_packet_round_trip`,
+/// same `--max-frames 3000`.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and the patched virtionet HDF on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_virtionet_first_packet_round_trip_fixed_mode() {
+    let rom = kickstart_a1200();
+    let hd = virtionet_hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+
+    let serial_log_path = std::env::temp_dir().join(format!(
+        "machine-hosted-kickstart-virtionet-fixed-{}.serial.log",
+        std::process::id()
+    ));
+
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--cpu-speed",
+        "fixed",
+        "--pcibridge",
+        "--max-frames",
+        "3000",
+        "--max-instructions",
+        "2000000000",
+        "--serial-log",
+        serial_log_path.to_str().unwrap(),
+        "--inspect",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    let serial_log = std::fs::read_to_string(&serial_log_path)
+        .unwrap_or_else(|e| panic!("read serial log {serial_log_path:?}: {e}"));
+
+    for marker in [
+        "VNETDEV: DevInit entry",
+        "VNETDEV: DevInit complete, DRIVER_OK set",
+        "VNETTEST opendevice: PASS",
+        "VNETDEV: isr: first queue interrupt observed (device INTx via INT2)",
+        "VNETTEST result: ALL PASS",
+    ] {
+        assert!(
+            serial_log.contains(marker),
+            "expected the serial narration to contain {marker:?} -- serial log:\n{serial_log}"
+        );
+    }
+    assert!(
+        !serial_log.contains("FAIL"),
+        "expected no individual check to print FAIL -- serial log:\n{serial_log}"
+    );
+}
+
+/// `fixed`-mode sibling of `kickstart_3_2_2_a1200_sanaconform_gates_virtionet_device`,
+/// same `--max-frames 4000`.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and the patched sanaconform HDF on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_sanaconform_gates_virtionet_device_fixed_mode() {
+    let rom = kickstart_a1200();
+    let hd_fixture = sanaconform_hd_image();
+    if !have_fixtures(&[&rom, &hd_fixture]) {
+        return;
+    }
+
+    let hd = std::env::temp_dir().join(format!(
+        "machine-hosted-sanaconform-fixed-{}.hdf",
+        std::process::id()
+    ));
+    std::fs::copy(&hd_fixture, &hd).unwrap_or_else(|e| panic!("copy {hd_fixture} -> {hd:?}: {e}"));
+    let hd = hd.to_str().unwrap().to_string();
+
+    let serial_log_path = std::env::temp_dir().join(format!(
+        "machine-hosted-kickstart-sanaconform-fixed-{}.serial.log",
+        std::process::id()
+    ));
+
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--hostblk-writable",
+        "--cpu-speed",
+        "fixed",
+        "--pcibridge",
+        "--max-frames",
+        "4000",
+        "--max-instructions",
+        "2500000000",
+        "--serial-log",
+        serial_log_path.to_str().unwrap(),
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    let log = xdftool_read(&hd, "sanaconform.log");
+    eprintln!("SYS:sanaconform.log:\n{log}");
+
+    for marker in [
+        "SanaConform: probing virtionet.device unit 0",
+        "OpenDevice: OK (Rev 2/3/7 buffer/DMA hooks all accepted without error --",
+        "CONFIG: configured with the driver's own factory address",
+        "S2_ONLINE: OK",
+        "S2_DEVICEQUERY: MTU=1512 BPS=1000000000 HardwareType=1",
+        "Station address: 02:6d:36:4b:00:01",
+    ] {
+        assert!(
+            log.contains(marker),
+            "expected SYS:sanaconform.log to contain {marker:?} -- log:\n{log}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&hd);
+}
+
+/// `fixed`-mode sibling of `kickstart_3_2_2_a1200_rtg_workbench_desktop_is_grey_not_blank_or_corrupt`,
+/// same `--max-frames 5200`/`--screenshot-frame 5000`.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_rtg_workbench_desktop_is_grey_not_blank_or_corrupt_fixed_mode() {
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
+        return;
+    }
+    let hd = hd_image();
+    if !have_fixtures(&[&hd]) {
+        return;
+    }
+    let path = screenshot_path("kickstart-rtg-fixed-mode");
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--cpu-speed",
+        "fixed",
+        "--graphics",
+        "--max-frames",
+        "5200",
+        "--max-instructions",
+        "3000000000",
+        "--screenshot",
+        path.to_str().unwrap(),
+        "--screenshot-frame",
+        "5000",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    assert!(
+        stdout.contains("screenshot: frame 5000"),
+        "expected the capture to actually fire by frame 5000"
+    );
+
+    let (width, height, rgba) = decode_png(&path);
+    assert_eq!(
+        (width, height),
+        (640, 480),
+        "an RTG screenshot's dimensions come from the driver-programmed mode"
+    );
+
+    let background = dominant_pixel(&rgba);
+    assert_eq!(
+        (background[0], background[1]),
+        (background[1], background[2]),
+        "expected a neutral grey background (equal R/G/B), got {background:?}"
+    );
+
+    let non_background = rgba.chunks(4).filter(|px| *px != background).count();
+    assert!(
+        non_background > 8_000,
+        "expected a drawn RTG Workbench desktop, got {non_background} non-background pixels"
+    );
+}

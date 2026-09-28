@@ -1,10 +1,14 @@
 # The `GuestCpu` trait (C1)
 
-**Status:** Implemented, first slice of milestone C1 (`docs/cpu-core-proposal.md`
-§8). Scope: the swappable CPU trait and §5.3's replay hooks only. Fixed-
-instructions-per-line deterministic mode, direct address-space mapping,
-and the signal-fault cost measurement (the rest of C1) are **not** part of
-this change and are not started.
+**Status:** First slice implemented (`docs/cpu-core-proposal.md` §8):
+the swappable CPU trait and §5.3's replay hooks. §5.2's fixed-
+instructions-per-line deterministic mode is now implemented too, as C1's
+second slice -- see `docs/deterministic-mode.md` for that mode itself
+(the run loop, the measured default, the re-baselined gates) and the
+note inline below on what it settled about this document's own
+speculation. Direct address-space mapping and the signal-fault cost
+measurement (the rest of C1) are still **not** part of either change and
+are not started.
 
 **Where:** `crates/machine-hosted/src/cpu.rs`.
 
@@ -173,10 +177,32 @@ and an I/O callback both cores route through."
   `run_batch_instructions`'s `max_instructions` parameter, or shrinking
   `run_for_cycles`'s cycle budget to an estimate and iterating). This is
   a real design question for whoever builds C2's replay player, not
-  something this milestone resolves -- §5.2's fixed-instructions-per-line
-  mode (explicitly out of this slice's scope) may make it moot anyway,
-  since a deterministic run with a fixed retirement count per line has a
-  natural batch-sizing unit to inject at.
+  something this milestone resolves.
+
+  **Tested at C1's second slice (`docs/deterministic-mode.md`):** the
+  speculation above -- that §5.2's fixed-instructions-per-line mode "may
+  make it moot anyway" -- turned out to be true, but not for the reason
+  it gives. `run_guest_fixed` does not close this gap by sizing an
+  *unhooked* batch to end at a line boundary; it simply never needs an
+  unhooked batch at all. Each line's `--instructions-per-line` quota is
+  enforced by the same hooked `run_for_cycles_with_hook` path cycle mode
+  already uses, so `queue_ipl_injection` gets the same exact,
+  instruction-granular application in fixed mode that it already had in
+  cycle mode (`queued_ipl_injection_applies_at_the_target_index`, this
+  crate's own unit test, exercises the mechanism `M68kRsCore` wraps
+  around *any* hooked caller, not one specific to a run loop). The
+  max-mode gap this bullet describes is specific to `run_for_cycles`'s
+  *unhooked* batches, which fixed mode's hooked design never uses in the
+  first place -- so this gap is unaffected by fixed mode's existence one
+  way or the other. It would only become relevant if a future
+  performance-motivated fixed-mode implementation switched to
+  `run_batch_instructions` (sized to end exactly at
+  `--instructions-per-line`) to avoid the hook's per-instruction
+  overhead; even then, exact mid-batch injection at an arbitrary
+  retired-instruction index would still require the batch to also end at
+  that index, not merely at the next line boundary, so the gap would
+  still not be closed in general -- only line-aligned injection targets
+  would benefit.
 
 - **Inject an IPL change at an index** -- `GuestCpu::queue_ipl_injection`.
   Implemented and unit-tested on `M68kRsCore`
@@ -314,9 +340,11 @@ both cycle mode and max mode's `interp` backend.
 
 - No log recording or replaying -- see "How §5.3's replay log maps onto
   the trait" above.
-- No fixed-instructions-per-line deterministic mode (§5.2) and no
-  re-baselined gates under it -- a separate C1 sub-slice per the
-  milestone brief, changes observable frame-count behaviour.
+- Fixed-instructions-per-line deterministic mode (§5.2) is no longer
+  missing -- see `docs/deterministic-mode.md`. It needed no changes to
+  this trait: `run_guest_fixed` is built entirely on the same
+  `run_for_cycles_with_hook`/`retired_instructions`/`queue_ipl_injection`
+  surface this slice already shipped.
 - No direct address-space mapping / page-type table (§4.6) -- likewise a
   separate sub-slice, and orthogonal to this trait: direct mapping is a
   `Bus`-side optimization (how `Bus` resolves an address), not a
