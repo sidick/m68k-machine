@@ -691,21 +691,40 @@ that file's own module doc comment for the full reasoning.
 |---|---|---|---|---|---|---|---|
 | max, batch+jit (plain boot, no script) | 87.859s | 54.111s | 33.748s | ~~2.08~~ (wrong, see below) | ~~1.84~~ | 1.972s | 109.420s |
 
-> **Not independently re-measured 2026-09-28** (this backend needs its
-> own `--features jit` release build, and the pass that fixed and
-> re-baselined the other two tables above did not extend to it given
-> time budget). The 2.08/1.84 figures above carry the same
-> `slept`-accounting bug as the interp and batch tables and should be
-> read as understated by a similar order of magnitude, **not** as this
-> backend's real throughput. The best available corrected estimate is
-> the fixed backends' own numbers plus the already-established
-> same-backends-within-~4%-of-each-other finding (2026-09-27's 200-frame
-> table: batch+jit 31.32/31.06 against batch's 30.04/30.07) -- i.e.
-> batch+jit's true corrected busy MIPS on this workload is expected to
-> land close to corrected batch's 43.16 (see above), not far below
-> corrected interp's 31.65 the way the uncorrected 2.08-vs-2.67 numbers
-> implied. Re-measuring this row directly is the natural next step for
-> whoever revisits this table.
+> **Re-measured 2026-09-28**, same host, own `--features jit` release
+> build (the JIT is a build-time feature, not a runtime switch, so this
+> backend needs its own binary), `--label batch-jit-fixed`, run with
+> nothing else executing:
+>
+> | | wall (4400f) | slept | busy | busy MIPS | idle busy MIPS (1000f) | WBREADY cycle | WBREADY max |
+> |---|---|---|---|---|---|---|---|
+> | max, batch+jit (corrected) | 87.859s | 86.187s | 1.672s | **46.04** | **42.34** | 2.333s | 109.420s |
+>
+> The ~~2.08~~/~~1.84~~ figures above are the pre-fix, broken-accounting
+> values, kept visible rather than deleted. This row completes the
+> re-baselining begun on the interp and batch tables above; all three
+> backends now carry corrected whole-run figures.
+>
+> **This complicates step 7.2's "all three back ends within ~4%"
+> finding, and the discrepancy is not resolved here.** Corrected
+> whole-run busy MIPS are interp **31.65**, batch **43.16**, batch+jit
+> **46.04** -- batch is ~36% above interp and the JIT a further ~7%
+> above batch, which is not "within ~4%". The 2026-09-27 200-frame
+> window that produced the ~4% finding had them at 30.04/31.32, i.e.
+> genuinely close. Two different windows, two different answers.
+>
+> Treat both as provisional until someone reconciles them, and note the
+> reason for caution: post-fix, `busy` on this workload is only
+> **1.7-2.9 seconds** out of an 87.9 s run, so busy MIPS is now a large
+> instruction count over a small and noisy denominator, sensitive to
+> exactly which phases of boot fall inside the window. The retired-
+> instruction counts implied by these rows are not equal either (interp
+> ~93 M against batch+jit ~77 M for nominally the same 4400-frame
+> boot), which alone needs explaining before any backend-versus-backend
+> ranking is drawn from this table. **Do not cite the spread above as a
+> measured backend comparison** -- it is a flag that the comparison
+> needs a purpose-built measurement on identical instruction streams,
+> which is what `crates/cpu-bench` (step 8) exists to provide.
 
 Idle host CPU (batch+jit): user 2.33s + sys 3.74s over 19.961s real,
 ~5.6% -- an OS-level measurement, not affected by the `slept` bug.
