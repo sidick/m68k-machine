@@ -201,11 +201,24 @@ pub struct Chipset {
     /// Audio/disk control latch (`ADKCON`). Latched, never acted on.
     pub adkcon: u16,
 
-    /// Free-running raster line within the frame, from the frame clock.
-    pub vpos: u32,
-    /// Free-running horizontal position within the line.
-    pub hpos: u32,
-    /// Colour-clock remainder carried between `tick` calls.
+    /// Colour clocks elapsed since reset -- the single running clock
+    /// `vpos`/`hpos` are derived from on every read, never stored as
+    /// their own mutable state. See "Beam position, derived on read" in
+    /// `docs/beam-position-on-read.md` for why: a beam position that is
+    /// only a field `tick` last happened to leave behind is only ever as
+    /// current as whatever tick pattern a caller chose to use, which is
+    /// exactly the shape of bug `docs/deterministic-mode.md` records
+    /// (`--cpu-speed fixed`'s original lump-sum-per-line tick froze
+    /// `VHPOSR` because the *stored* `hpos` field only advanced once per
+    /// line, landing back on the same value every time). Monotonic and
+    /// never wrapped -- wrapping only happens in the derivation
+    /// (`hpos()`/`vpos()`/`tick`'s `BeamAdvance` accounting), which also
+    /// removes the old per-line `while` loop's O(lines crossed) cost and
+    /// the `u32` overflow a single very large `cpu_clocks` could reach
+    /// through repeated `hpos +=`.
+    total_colour_clocks: u64,
+    /// CPU-clock remainder not yet forming a full colour clock, carried
+    /// between `tick` calls.
     carry: u32,
     /// Frames completed since reset; the renderer and VERTB share this.
     pub frames: u64,
@@ -216,6 +229,23 @@ pub struct Chipset {
     /// ECS-aware software checks this for interlace/genlock framing even
     /// when not itself driving interlace.
     lof: bool,
+    /// Consecutive `tick()` calls whose own `cpu_clocks`, alone, covered
+    /// at least one whole raster line -- the exact shape of caller
+    /// mistake that produced the `VHPOSR`-freeze bug
+    /// (`docs/deterministic-mode.md`, "A real bug, found and fixed"):
+    /// device time advanced in one lump sum per line, an exact multiple
+    /// of the period `hpos` wraps on. Reset to 0 by any `tick()` call
+    /// that is *not* this shape. No amount of read-time derivation can
+    /// make a `VHPOSR` read taken only between such lumps observe
+    /// movement -- the beam's true position at every one of those
+    /// instants genuinely is identical, the same aliasing a strobe light
+    /// gives a spinning wheel (see `docs/beam-position-on-read.md`,
+    /// "What derive-on-read cannot fix" for the proof). This counter
+    /// exists so that hazard is *detectable* -- CLAUDE.md's "verify
+    /// positively; never read absence of a complaint as success" --
+    /// rather than silent for 870 million iterations the way it was
+    /// before `docs/deterministic-mode.md`'s fix.
+    pub coarse_tick_streak: u32,
 
     /// Mouse/joystick position registers, fed from host input. Format is
     /// the hardware's: high byte is a free-running vertical counter, low
@@ -569,16 +599,37 @@ impl Chipset {
         }
     }
 
+    /// Horizontal beam position within the current line, derived from
+    /// [`Self::total_colour_clocks`] every time it is asked for, never
+    /// stored as its own field. See `total_colour_clocks`'s doc comment.
+    fn hpos(&self) -> u32 {
+        (self.total_colour_clocks % PAL_COLOUR_CLOCKS_PER_LINE as u64) as u32
+    }
+
+    /// Raster line within the frame, derived the same way as
+    /// [`Self::hpos`]. `lines_per_frame` is read at derivation time, not
+    /// baked into `total_colour_clocks`, which matches the old
+    /// incrementally-mutated `vpos` field's own contract: switching
+    /// [`Self::set_ntsc`] takes effect against whatever position the beam
+    /// is *currently* at, not retroactively against its whole history --
+    /// in practice this only matters for the one test that exercises it,
+    /// since `set_ntsc` is not wired to anything before the first tick
+    /// in `machine-hosted` today.
+    fn vpos(&self) -> u32 {
+        let line_width = PAL_COLOUR_CLOCKS_PER_LINE as u64;
+        ((self.total_colour_clocks / line_width) % self.lines_per_frame as u64) as u32
+    }
+
     /// `VPOSR`: long-frame toggle in bit 15, Agnus ID in the high byte,
     /// bit 0 is vertical position bit 8.
     fn vposr(&self) -> u16 {
         let lof = if self.lof { 1 << 15 } else { 0 };
-        lof | VPOSR_AGNUS_ID | ((self.vpos >> 8) & 1) as u16
+        lof | VPOSR_AGNUS_ID | ((self.vpos() >> 8) & 1) as u16
     }
 
     /// `VHPOSR`: vertical position low byte, horizontal position low byte.
     fn vhposr(&self) -> u16 {
-        (((self.vpos & 0xFF) << 8) | (self.hpos & 0xFF)) as u16
+        (((self.vpos() & 0xFF) << 8) | (self.hpos() & 0xFF)) as u16
     }
 
     /// `SERDATR`: `OVRUN` (bit 15), `RBF` (bit 14), `TBE` (bit 13), `TSRE`
@@ -671,25 +722,60 @@ impl Chipset {
     /// Phase 2) the renderer, so `WaitTOF`, VBlank servers and copper
     /// positions all agree — proposal §7.1.
     pub fn tick(&mut self, cpu_clocks: u32, cpu_clocks_per_colour_clock: u32) -> BeamAdvance {
-        let total = self.carry + cpu_clocks;
-        let colour_clocks = total / cpu_clocks_per_colour_clock;
-        self.carry = total % cpu_clocks_per_colour_clock;
+        // Fail closed rather than divide by zero on a degenerate caller
+        // value: `cpu_clocks_per_colour_clock` is a machine constant in
+        // every real caller, but this function has no way to verify
+        // that, and the module's own rule is "hostile input fails
+        // closed, never panics".
+        let ccpc = cpu_clocks_per_colour_clock.max(1) as u64;
+        let total = self.carry as u64 + cpu_clocks as u64;
+        let colour_clocks = total / ccpc;
+        self.carry = (total % ccpc) as u32;
 
-        let mut advance = BeamAdvance::default();
-        self.hpos += colour_clocks;
-        while self.hpos >= PAL_COLOUR_CLOCKS_PER_LINE {
-            self.hpos -= PAL_COLOUR_CLOCKS_PER_LINE;
-            self.vpos += 1;
-            advance.lines_started += 1;
-            if self.vpos >= self.lines_per_frame {
-                self.vpos = 0;
-                self.frames += 1;
-                self.lof = !self.lof;
-                advance.frames_wrapped += 1;
-                self.raise_int(intbit::VERTB);
-            }
+        // Detect (not defeat -- see `coarse_tick_streak`'s doc comment)
+        // the exact caller shape that produced the original freeze:
+        // a single call covering a whole raster line or more, on its
+        // own, repeated. This has to be checked against *this call's*
+        // `cpu_clocks` specifically, not the running total, since it is
+        // the caller's own chunking (one opaque lump per line) that is
+        // the hazard, not how much time has elapsed overall.
+        let line_width = PAL_COLOUR_CLOCKS_PER_LINE as u64;
+        if colour_clocks >= line_width {
+            self.coarse_tick_streak = self.coarse_tick_streak.saturating_add(1);
+        } else {
+            self.coarse_tick_streak = 0;
         }
-        advance
+
+        // total_colour_clocks is monotonic and u64: derivation
+        // (`hpos()`/`vpos()`) does the wrapping, not this add, so a
+        // single call's `colour_clocks` can never overflow it the way
+        // the old `self.hpos += colour_clocks` (u32, wrapped every line)
+        // could for a large enough single call.
+        let lines_before = self.total_colour_clocks / line_width;
+        self.total_colour_clocks = self.total_colour_clocks.saturating_add(colour_clocks);
+        let lines_after = self.total_colour_clocks / line_width;
+        let lines_started = (lines_after - lines_before) as u32;
+
+        let lines_per_frame = self.lines_per_frame as u64;
+        let frames_before = lines_before / lines_per_frame;
+        let frames_after = lines_after / lines_per_frame;
+        let frames_wrapped = (frames_after - frames_before) as u32;
+
+        if frames_wrapped > 0 {
+            self.frames = self.frames.saturating_add(frames_wrapped as u64);
+            // LOF flips once per frame boundary; only its parity over
+            // this call matters, same net effect as flipping it in a
+            // per-frame loop.
+            if frames_wrapped % 2 == 1 {
+                self.lof = !self.lof;
+            }
+            self.raise_int(intbit::VERTB);
+        }
+
+        BeamAdvance {
+            lines_started,
+            frames_wrapped,
+        }
     }
 
     /// CPU clocks from the current `hpos`/`carry` until the beam would
@@ -708,9 +794,27 @@ impl Chipset {
     /// `cpu_clocks_per_colour_clock` (same reason), so the subtraction
     /// below never underflows.
     pub(crate) fn clocks_until_line_boundary(&self, cpu_clocks_per_colour_clock: u32) -> u32 {
-        let needed_colour_clocks = (PAL_COLOUR_CLOCKS_PER_LINE - self.hpos) as u64;
+        let needed_colour_clocks = (PAL_COLOUR_CLOCKS_PER_LINE - self.hpos()) as u64;
         let ccpc = cpu_clocks_per_colour_clock as u64;
         (needed_colour_clocks * ccpc - self.carry as u64) as u32
+    }
+
+    /// Whether the last two (or more) `tick()` calls each covered a whole
+    /// raster line or more on their own -- the caller pattern that froze
+    /// `VHPOSR` before `docs/deterministic-mode.md`'s fix (one call per
+    /// line, each an exact multiple of the period `hpos` wraps on). One
+    /// such call alone is not the hazard (a legitimate coarse catch-up,
+    /// e.g. the STOP-path resync, does this once and nothing reads in
+    /// between while the CPU is stopped); it is the *repetition*, with
+    /// reads interleaved, that reproduces the freeze
+    /// (`docs/beam-position-on-read.md`). A caller driving a CPU (or a
+    /// test standing in for one) can poll this after every `tick()` to
+    /// catch the pattern immediately rather than after however many
+    /// million polls it takes a stuck delay loop to give up -- see that
+    /// document's "What derive-on-read cannot fix" for why detection,
+    /// not correction, is the honest answer here.
+    pub fn beam_position_may_be_frozen(&self) -> bool {
+        self.coarse_tick_streak >= 2
     }
 }
 
@@ -740,6 +844,13 @@ fn apply_setclr(current: u16, value: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `CPU_CLOCKS_PER_COLOUR_CLOCK` lives in `lib.rs`; chipset's own
+    /// tests don't depend on that crate-level constant, so this pins the
+    /// same value (4) locally rather than reaching across the module
+    /// boundary for a number the hazard tests need to match real
+    /// callers.
+    const CPU_CLOCKS_PER_COLOUR_CLOCK_FOR_TEST: u32 = 4;
 
     #[test]
     fn setclr_sets_and_clears() {
@@ -1139,8 +1250,9 @@ mod tests {
     #[test]
     fn vhposr_composes_from_beam_position() {
         let mut c = Chipset::new();
-        c.vpos = 0x12;
-        c.hpos = 0x34;
+        // vpos=0x12, hpos=0x34: total_colour_clocks = 0x12 lines' worth
+        // plus 0x34 colour clocks into the current line.
+        c.total_colour_clocks = 0x12 * PAL_COLOUR_CLOCKS_PER_LINE as u64 + 0x34;
         assert_eq!(c.read(reg::VHPOSR), 0x1234);
     }
 
@@ -1150,8 +1262,8 @@ mod tests {
         // One colour clock's worth of CPU cycles.
         let wrapped = c.tick(4, 4).frames_wrapped;
         assert_eq!(wrapped, 0);
-        assert_eq!(c.hpos, 1);
-        assert_eq!(c.vpos, 0);
+        assert_eq!(c.hpos(), 1);
+        assert_eq!(c.vpos(), 0);
     }
 
     #[test]
@@ -1160,8 +1272,8 @@ mod tests {
         let clocks = PAL_COLOUR_CLOCKS_PER_LINE * 4; // one full line
         let wrapped = c.tick(clocks, 4).frames_wrapped;
         assert_eq!(wrapped, 0, "one line is not a full frame");
-        assert_eq!(c.hpos, 0);
-        assert_eq!(c.vpos, 1);
+        assert_eq!(c.hpos(), 0);
+        assert_eq!(c.vpos(), 1);
     }
 
     #[test]
@@ -1189,9 +1301,10 @@ mod tests {
     #[test]
     fn vpos_bit8_appears_in_vposr() {
         let mut c = Chipset::new();
-        c.vpos = 256; // bit 8 set
+        let line_width = PAL_COLOUR_CLOCKS_PER_LINE as u64;
+        c.total_colour_clocks = 256 * line_width; // vpos = 256, bit 8 set
         assert_eq!(c.read(reg::VPOSR) & 1, 1);
-        c.vpos = 255;
+        c.total_colour_clocks = 255 * line_width; // vpos = 255
         assert_eq!(c.read(reg::VPOSR) & 1, 0);
     }
 
@@ -1262,5 +1375,128 @@ mod tests {
         let one_more_line = PAL_COLOUR_CLOCKS_PER_LINE * 4;
         c.tick(one_more_line, 4);
         assert_eq!(c.frames, 1);
+    }
+
+    /// Reconstructs the exact hazard `docs/deterministic-mode.md` records:
+    /// a caller that advances device time in one lump sum per raster
+    /// line -- `--cpu-speed fixed`'s original bug, and structurally
+    /// identical to `run_guest`'s STOP-path resync
+    /// (`STOP_TICK_SLICE`/`ONE_LINE_CLOCKS`) if that pattern were ever
+    /// reused somewhere reads can happen in between. `ONE_LINE_CLOCKS`
+    /// (908 CPU clocks = 227 colour clocks) is *exactly* the period
+    /// `hpos` wraps on, so ticking it repeatedly and reading `hpos`
+    /// between ticks reproduces Kickstart's frozen `VHPOSR` poll
+    /// (870 million iterations, `D1`'s low byte always `$00`) at the
+    /// unit level.
+    ///
+    /// This is the test `docs/beam-position-on-read.md`'s "What
+    /// derive-on-read cannot fix" section is built on: **`hpos` itself
+    /// stays frozen even after the derive-on-read change** -- run this
+    /// against the pre-change (field-mutating) chipset and the
+    /// post-change (derived-from-`total_colour_clocks`) chipset and both
+    /// give the same frozen sequence, because the beam's true position
+    /// at every one of these instants genuinely *is* identical; no
+    /// read-time derivation can honestly report otherwise without
+    /// fabricating a position nobody observed. What the derive-on-read
+    /// change actually buys, and what this test asserts, is that the
+    /// hazard becomes *detectable*: [`Chipset::coarse_tick_streak`] /
+    /// [`Chipset::beam_position_may_be_frozen`] do not exist at all on
+    /// the pre-change chipset (this test fails to compile against it),
+    /// and correctly latch once the pattern repeats.
+    #[test]
+    fn whole_line_lump_ticking_freezes_hpos_but_is_now_detectable() {
+        let mut c = Chipset::new();
+        let one_line = PAL_COLOUR_CLOCKS_PER_LINE * CPU_CLOCKS_PER_COLOUR_CLOCK_FOR_TEST;
+
+        // First lump: on its own, this is legitimate (e.g. one STOP-path
+        // resync slice) and must not yet be flagged.
+        c.tick(one_line, CPU_CLOCKS_PER_COLOUR_CLOCK_FOR_TEST);
+        assert!(
+            !c.beam_position_may_be_frozen(),
+            "a single coarse tick alone is not the hazard"
+        );
+
+        let mut hpos_samples = [0u32; 10];
+        for sample in &mut hpos_samples {
+            c.tick(one_line, CPU_CLOCKS_PER_COLOUR_CLOCK_FOR_TEST);
+            *sample = c.hpos();
+        }
+
+        // The actual, documented failure mode: hpos genuinely never
+        // moves under this pattern -- confirmed, not assumed, exactly as
+        // CLAUDE.md's "verify positively" asks.
+        assert!(
+            hpos_samples.iter().all(|&h| h == hpos_samples[0]),
+            "hpos is mathematically frozen under exact-period lump ticking \
+             (samples: {hpos_samples:?}) -- this is the same aliasing a \
+             strobe light gives a spinning wheel, not a defect this \
+             change claims to fix; see docs/beam-position-on-read.md"
+        );
+
+        // What *is* new: the pattern is no longer silent. Two or more
+        // consecutive whole-line-or-more ticks latch the detector, so a
+        // host-side wedge check (or a future run loop) can catch this
+        // class of caller mistake immediately rather than after however
+        // many million polls a stuck delay loop takes to be noticed by
+        // hand.
+        assert!(
+            c.beam_position_may_be_frozen(),
+            "repeated whole-line ticks must latch the detector"
+        );
+
+        // Resuming realistic, fine-grained (sub-line) ticking -- the
+        // per-instruction contract `docs/deterministic-mode.md`'s fix
+        // and `run_guest`/`run_guest_fixed` already rely on -- clears the
+        // detector and the beam moves smoothly again, proving this
+        // isn't a one-way latch that would falsely flag ordinary
+        // per-instruction execution forever after a single legitimate
+        // coarse catch-up.
+        c.tick(4, CPU_CLOCKS_PER_COLOUR_CLOCK_FOR_TEST);
+        assert!(
+            !c.beam_position_may_be_frozen(),
+            "fine-grained ticking must clear the detector"
+        );
+    }
+
+    /// The realistic counterpart to the test above: fine-grained
+    /// (sub-line) ticks -- what every legitimate caller in `cycle` and
+    /// `fixed` mode actually issues, once per retired instruction -- give
+    /// `hpos` real, distinct intermediate values to observe, regardless
+    /// of whether the total per-line work is the same. This is the
+    /// pattern `docs/deterministic-mode.md`'s fix relies on, reconfirmed
+    /// here directly against `Chipset` (no CPU, no `MachineBus`
+    /// involved) so it is pinned at the unit level, not only via a full
+    /// real-ROM boot.
+    #[test]
+    fn fine_grained_ticking_shows_the_beam_actually_moving() {
+        let mut c = Chipset::new();
+        let ccpc = CPU_CLOCKS_PER_COLOUR_CLOCK_FOR_TEST;
+        let one_line = PAL_COLOUR_CLOCKS_PER_LINE * ccpc;
+        let instructions_per_line = 424u32; // docs/deterministic-mode.md's measured default
+
+        let mut hpos_samples = Vec::new();
+        // Same Bresenham-style exact split `run_guest_fixed` uses
+        // (`docs/deterministic-mode.md`), reproduced here as a caller of
+        // `Chipset::tick` rather than copied from `run.rs`.
+        let mut cumulative_before = 0u32;
+        for i in 1..=instructions_per_line {
+            let cumulative_after = (one_line * i) / instructions_per_line;
+            let amount = cumulative_after - cumulative_before;
+            cumulative_before = cumulative_after;
+            c.tick(amount, ccpc);
+            hpos_samples.push(c.hpos());
+        }
+
+        assert!(
+            !c.beam_position_may_be_frozen(),
+            "fine-grained ticking must never latch the coarse-tick detector"
+        );
+        let distinct: std::collections::BTreeSet<u32> = hpos_samples.iter().copied().collect();
+        assert!(
+            distinct.len() > 100,
+            "expected many distinct hpos values across the line, got {} \
+             (samples: {hpos_samples:?})",
+            distinct.len()
+        );
     }
 }
