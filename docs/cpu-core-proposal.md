@@ -211,10 +211,12 @@ Milestones are sequential and each carries the correctness layers from §5.
 
   | Measurement (max mode) | Hosted x86-64 | Hosted aarch64 | Rock 5B / KVM |
   |---|---|---|---|
-  | KS 3.2 boot to Workbench (s) | | | |
-  | AROS boot to Workbench (s) | | | |
-  | Idle-loop MIPS | | | |
-  | m68k-rs share of host time (%) | | | |
+  | KS 3.2 boot to Workbench (s) | (no host) | ~4 s to an idle Workbench (frame ~200, screenshot-confirmed; `docs/bus-fast-path-plan.md` step 7.2). The 109.60 s `WBREADY` figure measured here is the scripted input's fixed frame schedule, not boot time -- see `docs/cpu-core-c0-profile.md` §3 and the supervisor note there. | (no host) |
+  | AROS boot to Workbench (s) | (no host) | not measured -- see `docs/cpu-core-c0-profile.md` §5 | (no host) |
+  | Idle-loop MIPS | (no host) | ~0.1-0.2 M/s | (no host) |
+  | m68k-rs share of host time (%) | (no host) | CPU-busy: boot 65.7-68.3%, CPUBench 80.6-80.9% (majority, both) -- wall-clock: boot 2.6%, CPUBench 13.4-13.6%. See `docs/cpu-core-c0-profile.md` for method, per-workload attribution and the Amdahl implication. | (no host) |
+
+  **C0 result: m68k-rs is the CPU-busy-time majority of max-mode host time on both measured workloads -- go.** Full profile, attribution breakdown and reproduction commands: `docs/cpu-core-c0-profile.md`. That document also flags an open question for §2.1: the measured wall-clock share says boot-to-Workbench time is dominated by wall-clock-paced STOP sleep, not CPU throughput, so a 3-7x core (`docs/cpu-core-poc-results.md`) predicts roughly 2% faster boot, not 3-7x -- the large multiplier applies to sustained CPU-bound foreground work, not to boot time. Raised for the supervisor's judgment, not acted on here.
 
 - **C1 — Core trait, replay log, direct mapping.** Swappable CPU trait in the machine, keeping the fork behind it, with the replay hooks of §5.3 in the trait from the start. Fixed-instructions-per-line deterministic mode (§5.2) implemented and the gates re-baselined under it. Direct address-space mapping on the hosted backend built from AUTOCONFIG placements, with the page-type table and open-bus pages of §4.6. Measure signal-fault cost on Linux here. *Exit: m68k-rs runs through the trait in both timing modes, producing replay logs; gates pass in the new deterministic mode; fault cost recorded.*
 - **C2 — Decoder + IR + interpreter.** no_std crate, instruction suites pass (plus the 020+ vector set if §5.1's open item requires it), replay lockstep vs m68k-rs clean over both boots. *Exit: IR interpreter boots both OSes on Linux; speed vs m68k-rs recorded.*
