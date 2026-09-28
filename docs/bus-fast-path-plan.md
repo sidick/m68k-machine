@@ -458,6 +458,57 @@ called working"):
 > STOP-wake hang and its host-side fix, the `Wait 5` regression under
 > `batch`, and the JIT trace-cache regression test.
 
+> **Second supervisor correction (2026-09-28), read this too.** The
+> 2026-09-27 correction above fixed the *window* (measuring busy MIPS
+> over the active part of boot, frames 0-200, instead of an 88 s
+> mostly-idle run) but did not know about a second, independent bug in
+> `run_guest_max`'s own accounting that the 200-frame table above
+> happened to barely encounter and the three full-4400-frame tables
+> below did not escape: `slept` (`crates/machine-hosted/src/run.rs`,
+> the STOP-path sleep loop) accumulated the *nominal* sleep slice
+> requested from `std::thread::sleep` (`slept += slice`), never the
+> measured elapsed time the sleep actually took. `std::thread::sleep`
+> routinely overshoots its request; over the tens of thousands of
+> STOP-slice sleeps in an idle-heavy run, that overshoot was silently
+> reclassified as *busy* time by `MaxModeTiming::busy() = wall -
+> slept`, understating `slept` and overstating `busy` by roughly an
+> order of magnitude. Found and documented (not yet fixed) in
+> `docs/cpu-core-c0-profile.md` via an independent 1 kHz `samply`
+> CPU-busy profile of the same boot workload: the app's own report said
+> `busy=33.6-33.9s` of `wall=87.86s` (38.2%), while the sampled ground
+> truth was **3.8-4.0% of wall**. Fixed 2026-09-28 by measuring elapsed
+> sleep time at the accumulation site instead of crediting the nominal
+> request (see `run.rs`'s `MaxModeTiming` doc comment for the detail).
+>
+> **Direction and magnitude of the fix.** Because `busy` was
+> *overstated* before the fix, `busy_mips = instructions / busy` was
+> **understated** -- the corrected busy-MIPS figures are *higher*, not
+> lower, than the ones originally published below, by roughly an order
+> of magnitude (full-4400-frame interp: 2.67 -> 31.65 M/s, an ~11.9x
+> increase; see "Re-measured 2026-09-28" under each table below for the
+> per-backend numbers and the post-fix samply cross-check). **The
+> 2026-09-27 correction's 200-frame table above needed no change**: that
+> window (frames 0-200, almost entirely active pre-Workbench boot) has
+> few STOP entries, so the bug's effect on it was small -- confirmed
+> directly this pass, since the post-fix full-run busy-MIPS figures
+> converge to the same ~30 M/s ballpark that table already reported.
+> This *does* change the reading of step 8's "this machine's measured
+> ~30 busy MIPS" line: that figure was arrived at via the 200-frame
+> workaround specifically because the whole-run number was known to be
+> unusable; post-fix, the whole-run number agrees with it directly, and
+> the previously-published whole-run figures (2.0-2.7) were the
+> artifact, not the workaround.
+>
+> **What this means for the "at least twice a 68060" floor
+> (roughly 150-200 M instr/s, `docs/cpu-core-proposal.md` §8).** The
+> corrected ~30-43 M busy-instr/s (see below) is still well short of
+> that floor -- roughly 4-7x short, versus the ~56-95x short the
+> uncorrected 2.0-2.7 figures implied. The machine's CPU throughput on
+> this metric is **better than previously recorded**, not worse, but
+> the floor is still not cleared and step 7.2's "not a route to the
+> floor" conclusion is unaffected -- see "Re-measured 2026-09-28" boxes
+> below for the numbers this is based on.
+
 
 Machine and load: Apple M3 Pro, 11 logical cores, arm64 macOS. Not
 perfectly idle -- some measurements below ran back-to-back or briefly
@@ -478,10 +529,43 @@ tree, one run each:
 | | wall (4400f) | slept | busy | busy MIPS | idle busy MIPS (1000f) | WBREADY cycle | WBREADY max |
 |---|---|---|---|---|---|---|---|
 | cycle | 1.661s | -- | -- | 25.2 | -- | 6.073s | -- |
-| max, interp | 87.859s | 53.812s | 34.047s | **2.67** | **2.20** | -- | 109.614s |
+| max, interp | 87.859s | 53.812s | 34.047s | ~~2.67~~ **2.67 (wrong -- see below)** | ~~2.20~~ | -- | 109.614s |
+
+> **Re-measured 2026-09-28**, same host, `--label interp-fixed`, after
+> the `slept`-accounting fix (see the correction above): `slept` and
+> `busy` change substantially, `wall` and `WBREADY` do not (neither
+> depends on the buggy accounting).
+>
+> | | wall (4400f) | slept | busy | busy MIPS | idle busy MIPS (1000f) | WBREADY cycle | WBREADY max |
+> |---|---|---|---|---|---|---|---|
+> | max, interp (corrected) | 87.859s | 84.916s | 2.943s | **31.65** | **30.45** | 1.909s | 109.587s |
+>
+> The **2.67 and 2.20 figures above are the pre-fix, broken-accounting
+> values and should be read as understated by roughly an order of
+> magnitude**, not as a measurement of this backend's actual throughput
+> -- kept visible rather than deleted, per this project's documentation
+> rule. Cross-checked against an independent 1 kHz `samply` CPU-busy
+> profile of the same `--max-frames 4400` boot workload (run this pass,
+> `analyze_profile2.py`'s method, same as `docs/cpu-core-c0-profile.md`
+> §1.6/§6.1): sampled CPU-busy share of wall was **4.0%** (3505 of
+> 87857 samples); the app's own corrected self-report over the
+> identical run gives busy=2.948s of wall=87.859s, **3.35% of wall** --
+> within about **0.65 percentage points (~85% of the independent
+> figure)**, not the 34-point (38.2% vs 3.8-4.0%) gap the bug produced.
+> The residual ~0.65-point gap is consistent with genuine host work the
+> self-report correctly does *not* count as sleep -- the run loop's own
+> `Instant::now()`/`mach_absolute_time` bookkeeping and the serial-tcp
+> bridge poll between the top of the STOP loop and the sleep call,
+> which `docs/cpu-core-c0-profile.md` §6.1's own attribution table
+> already identifies as real (if small) CPU-busy time, not sleep.
 
 Idle host CPU (interp, `/usr/bin/time -l` over the 1000-frame idle
 window): user 3.47s + sys 2.87s over 19.980s real, ~32% of one core.
+This figure comes from `/usr/bin/time -l`, an OS measurement outside
+`run_guest_max`'s own accounting, so it is **not** affected by the
+`slept` bug above; not re-measured for this correction (already flagged
+as a whole-run, not isolated-idle-window, figure by the 2026-09-27
+correction above).
 
 **Window coverage (part 2).** `BUS_COVERAGE=1` on a cycle-mode run
 (faster and deterministic for this purpose; the guest executes the same
@@ -528,9 +612,37 @@ Numbers after the fix, `--label batch`, same machine, same script:
 
 | | wall (4400f) | slept | busy | busy MIPS | idle busy MIPS (1000f) | WBREADY cycle | WBREADY max |
 |---|---|---|---|---|---|---|---|
-| max, batch (plain boot, no script) | 87.859s | 54.385s | 33.474s | 2.00 | 1.74 | 2.017s | 109.436s |
+| max, batch (plain boot, no script) | 87.859s | 54.385s | 33.474s | ~~2.00~~ (wrong, see below) | ~~1.74~~ | 2.017s | 109.436s |
+
+> **Re-measured 2026-09-28**, same host, `--label batch-fixed`, after
+> the `slept`-accounting fix documented under 7.2's part-1 table above
+> (same bug, same fix, applied to every `run_guest_max` call regardless
+> of `--cpu-backend`). `wall`/`WBREADY` unchanged, as expected:
+>
+> | | wall (4400f) | slept | busy | busy MIPS | idle busy MIPS (1000f) | WBREADY cycle | WBREADY max |
+> |---|---|---|---|---|---|---|---|
+> | max, batch (corrected) | 87.859s | 86.178s | 1.681s | **43.16** | **39.71** | 2.030s | 109.420s |
+>
+> The **2.00/1.74 figures above are pre-fix and understated by roughly
+> an order of magnitude**, same direction and cause as the interp
+> table. Not independently samply-cross-checked this pass (interp's
+> cross-check above covers the shared fix; the backend-specific
+> difference is in guest-instruction throughput, not in the accounting
+> bug). Note the corrected batch busy-MIPS (43.16) is noticeably higher
+> than corrected interp's (31.65) on this particular 4400-frame window
+> -- unlike the near-equal figures the 2026-09-27 200-frame table found
+> for all three back ends (30.04/30.07 for batch there). This tracks a
+> difference in how far each backend's run actually got: batch's final
+> PC after 4400 frames (`0x00f8159c`) differs from interp's
+> (`0x502cfade`), i.e. the two runs are not at the same point in boot by
+> frame 4400 (unsurprising given ADR 0006's own note that max mode is
+> not bit-reproducible run to run, and the two backends drive the chunk
+> loop differently) -- not a new finding from this pass, and not
+> something the `slept` fix changes or explains.
 
 Idle host CPU (batch): user 2.19s + sys 3.59s over 19.973s real, ~29%.
+Not affected by the `slept` bug (an OS-level `/usr/bin/time -l`
+measurement); not re-measured for this correction.
 
 Under the *scripted, interactive* boot-and-click-and-type workload
 (`--input-script`, the same one `WBREADY`/`Wait 5` use), batch's busy
@@ -577,13 +689,31 @@ that file's own module doc comment for the full reasoning.
 
 | | wall (4400f) | slept | busy | busy MIPS | idle busy MIPS (1000f) | WBREADY cycle | WBREADY max |
 |---|---|---|---|---|---|---|---|
-| max, batch+jit (plain boot, no script) | 87.859s | 54.111s | 33.748s | 2.08 | 1.84 | 1.972s | 109.420s |
+| max, batch+jit (plain boot, no script) | 87.859s | 54.111s | 33.748s | ~~2.08~~ (wrong, see below) | ~~1.84~~ | 1.972s | 109.420s |
+
+> **Not independently re-measured 2026-09-28** (this backend needs its
+> own `--features jit` release build, and the pass that fixed and
+> re-baselined the other two tables above did not extend to it given
+> time budget). The 2.08/1.84 figures above carry the same
+> `slept`-accounting bug as the interp and batch tables and should be
+> read as understated by a similar order of magnitude, **not** as this
+> backend's real throughput. The best available corrected estimate is
+> the fixed backends' own numbers plus the already-established
+> same-backends-within-~4%-of-each-other finding (2026-09-27's 200-frame
+> table: batch+jit 31.32/31.06 against batch's 30.04/30.07) -- i.e.
+> batch+jit's true corrected busy MIPS on this workload is expected to
+> land close to corrected batch's 43.16 (see above), not far below
+> corrected interp's 31.65 the way the uncorrected 2.08-vs-2.67 numbers
+> implied. Re-measuring this row directly is the natural next step for
+> whoever revisits this table.
 
 Idle host CPU (batch+jit): user 2.33s + sys 3.74s over 19.961s real,
-~5.6%. `Wait 5` gap under batch+jit: 5.738s -- essentially unchanged
+~5.6% -- an OS-level measurement, not affected by the `slept` bug.
+`Wait 5` gap under batch+jit: 5.738s -- essentially unchanged
 from plain batch (5.739s). JIT gives a small (~4%) busy-MIPS improvement
 over plain batch on this plain-boot workload, still short of interp's
-2.67 -- expected, given the coverage numbers: most of this particular
+2.67 (pre-fix figure; see the corrected re-measurement above for both) --
+expected, given the coverage numbers: most of this particular
 workload's hot code is ROM-resident (never JIT-compiled, since `FastMem`
 and the trace cache only ever see fast RAM) or runs cold (boot-time
 init code executed once, never hot enough to trace). JIT was not
@@ -600,7 +730,10 @@ host-side STOP-wake probe standing in for something the fork doesn't do.
 Coverage explains part of it: 35.7% of fetches are ROM-resident and never
 reach the window or the trace cache. But even allowing for that, the
 fork's fast paths are not a route to the "at least twice a 68060" floor
-(roughly 150-200 M instructions/s; today about 30). That is evidence for
+(roughly 150-200 M instructions/s; today about 30-43, corrected
+2026-09-28 -- see the "Re-measured" boxes above; this was ~2-2.7 as
+originally published here, an artifact of the `slept`-accounting bug,
+not a smaller true figure). That is evidence for
 `docs/cpu-core-proposal.md`, whose direct mapping covers ROM, chip and
 fast RAM alike, rather than for more tuning of the fork's back ends.
 
@@ -608,7 +741,9 @@ fast RAM alike, rather than for more tuning of the fork's back ends.
 
 A direct answer to the question step 5's decision left open: of the gap
 between bare m68k-rs (72-178 M instr/s interpreted per the fork's own
-microbenchmark) and this machine's measured ~30 busy MIPS (step 7.2),
+microbenchmark) and this machine's measured ~30 busy MIPS (step 7.2 --
+confirmed directly, not just via the 200-frame workaround, after the
+`slept`-accounting fix documented under 7.2's results, 2026-09-28),
 how much is m68k-rs itself versus device/bus overhead, and how far is
 either from "at least twice a 68060"? `m68k/cpubench/kernels.s` is one
 vasm source assembled two ways -- a flat binary

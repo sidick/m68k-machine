@@ -210,9 +210,20 @@ pub enum Outcome {
 /// MIPS figure averaged in time spent asleep in STOP and never measured
 /// wall clock to Workbench at all -- this splits wall time into sleep
 /// (STOP-path parking, ADR 0006's "STOP sleeps") and busy time, so
-/// [`Self::busy_mips`] reports instructions per second of actual CPU
+/// [`Self::busy`] reports instructions per second of actual CPU
 /// execution rather than diluting it by however idle the sampled window
 /// happened to be. `None` in cycle mode, which has no sleep concept.
+///
+/// `slept` is the *measured elapsed time* of each STOP-path sleep (an
+/// `Instant::now()` taken right before `std::thread::sleep`, not the
+/// nominal slice requested). An earlier version of this struct credited
+/// the nominal slice instead; `std::thread::sleep`'s routine overshoot
+/// was then silently reclassified as busy time by [`Self::busy`], which
+/// on an idle-heavy boot workload overstated busy by about an order of
+/// magnitude (self-reported busy 38.2% of wall vs 3.8-4.0% by an
+/// independent 1 kHz `samply` profile of the same run -- see
+/// `docs/cpu-core-c0-profile.md`). Fixed by measuring elapsed time at
+/// the accumulation site in `run_guest_max`.
 #[derive(Clone, Copy, Debug)]
 pub struct MaxModeTiming {
     pub wall: Duration,
@@ -220,7 +231,20 @@ pub struct MaxModeTiming {
 }
 
 impl MaxModeTiming {
+    /// `wall - slept`, floored at zero. `slept` should never exceed
+    /// `wall` -- it is built from `Instant::elapsed()` calls strictly
+    /// within the `wall_start..wall_start.elapsed()` window -- so
+    /// `saturating_sub` here is underflow-safety, not a place a real
+    /// accounting bug should be able to hide quietly. If it ever fires,
+    /// something upstream is timing wrong; `debug_assert!` surfaces that
+    /// loudly in debug/test builds without costing anything in release.
     pub fn busy(&self) -> Duration {
+        debug_assert!(
+            self.slept <= self.wall,
+            "MaxModeTiming: slept ({:?}) exceeds wall ({:?}) -- timing accounting bug",
+            self.slept,
+            self.wall,
+        );
         self.wall.saturating_sub(self.slept)
     }
 }
@@ -271,8 +295,10 @@ impl Report {
     }
 
     /// `--cpu-speed max`'s end-of-run timing report (plan step 7.2):
-    /// total wall time, time slept in STOP, busy time, and busy MIPS
-    /// (instructions retired / busy seconds). `None` in cycle mode.
+    /// total wall time, *measured* time slept in STOP (see
+    /// [`MaxModeTiming`]'s doc comment -- this is elapsed sleep time, not
+    /// nominal requested slices), busy time, and busy MIPS (instructions
+    /// retired / busy seconds). `None` in cycle mode.
     pub fn timing_report(&self) -> Option<String> {
         let timing = self.max_mode_timing?;
         let busy = timing.busy();
@@ -1324,10 +1350,16 @@ fn run_guest_max(
     let backend = args.cpu_backend;
     // Step 7.2's baseline metrics (a gap in 7.1: its only MIPS figure
     // averaged in STOP sleep time and never measured wall clock at all).
-    // `slept` accumulates only the STOP-path sleep below; everything else
-    // this function does is "busy" by definition, including the outer
-    // loop's own bookkeeping -- `Report::timing_report` reports busy MIPS
-    // from `wall_start.elapsed() - slept`.
+    // `slept` accumulates the *measured elapsed time* of the STOP-path
+    // sleep below (an `Instant::now()` taken immediately before each
+    // `std::thread::sleep` call, not the nominal slice requested --
+    // `std::thread::sleep` routinely overshoots, and crediting the
+    // request undercounts sleep / overcounts busy; see the comment at the
+    // accumulation site). Everything else this function does is "busy" by
+    // definition, including the outer loop's own bookkeeping and the
+    // serial-tcp bridge poll between the top of this loop and the sleep
+    // call -- `Report::timing_report` reports busy MIPS from
+    // `wall_start.elapsed() - slept`.
     let wall_start = Instant::now();
     let mut slept = Duration::ZERO;
 
@@ -1630,8 +1662,19 @@ fn run_guest_max(
                     }
                 }
                 let slice = (t_event - now).min(MAX_MODE_STOP_SLEEP_SLICE);
+                let sleep_started = Instant::now();
                 std::thread::sleep(slice);
-                slept += slice;
+                // Measured elapsed time, not the nominal `slice` requested:
+                // `std::thread::sleep` routinely overshoots its request (OS
+                // scheduler granularity), and crediting the request instead
+                // of the overshoot silently reclassifies that overshoot as
+                // "busy" in `MaxModeTiming::busy()` below. That is exactly
+                // the bug this comment used to describe as correct --
+                // measured on a boot workload, self-reported busy=33.6-33.9s
+                // of wall=87.86s (38.2%) against an independent 1 kHz
+                // `samply` profile's true CPU-busy of 3.8-4.0%, about an
+                // order of magnitude off. See docs/cpu-core-c0-profile.md.
+                slept += sleep_started.elapsed();
             }
 
             // Advance device time event by event up to the real now, the

@@ -211,8 +211,14 @@ Two further steps are available in the pinned fork and were measured
   Busy MIPS, measured over the busy part of the boot (the figures first
   recorded here were idle-dominated and are corrected in the plan's 7.2
   results): interp 30.7/29.9, batch 30.0/30.1, batch+jit 31.3/31.1 over
-  two runs each. No window exists while the 040 MMU is enabled (not
-  exercised here; this machine does not yet enable it).
+  two runs each. (A separate `slept`-accounting bug in `run_guest_max`,
+  unrelated to the idle-window issue above, was found and fixed
+  2026-09-28 -- see `docs/bus-fast-path-plan.md` step 7.2's results.
+  These particular figures, measured over the narrow active-boot window
+  rather than a whole idle-heavy run, were confirmed by that fix to be
+  essentially unaffected by it; no correction needed here.) No window
+  exists while the 040 MMU is enabled (not exercised here; this machine
+  does not yet enable it).
 
 - **The trace JIT** (`jit` feature, Cranelift). Added as an
   off-by-default `machine-hosted` Cargo feature (`m68k/jit` on this

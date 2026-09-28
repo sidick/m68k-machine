@@ -2504,6 +2504,55 @@ fn max_cpu_speed_boots_to_workbench_and_keeps_real_time_across_wait_5() {
          real time, ADR 0006), measured {gap:.3}s -- output:\n{stdout_text}"
     );
 
+    // Regression check for the `slept` sleep-accounting bug (fixed
+    // 2026-09-28, `run.rs`'s STOP-path sleep loop): before the fix,
+    // `slept` accumulated the *nominal* sleep slice requested rather than
+    // the measured elapsed time, so `std::thread::sleep`'s routine
+    // overshoot was silently reclassified as busy. This run starts with
+    // an unscripted `SLEEP 4200` (84 guest seconds) during which the
+    // guest spends long stretches parked in STOP -- exactly the idle-heavy
+    // shape that bug corrupted worst -- so its self-reported busy share of
+    // wall should stay a small minority. The true figure measured
+    // independently against a 1 kHz `samply` CPU-busy profile of a
+    // comparable boot workload is 3.8-4.0% of wall
+    // (`docs/cpu-core-c0-profile.md`); the pre-fix bug reported 38.2% on
+    // that same workload. This bound (50%) is deliberately loose --
+    // roughly an order of magnitude of headroom over the true figure --
+    // so it catches a regression back toward that bug's magnitude without
+    // being sensitive to a loaded CI box's ordinary timing noise.
+    let timing_line = all_lines
+        .iter()
+        .rev()
+        .find(|l| l.contains("max-mode timing:"))
+        .unwrap_or_else(|| panic!("never saw a 'max-mode timing:' line -- output:\n{stdout_text}"));
+    let field = |name: &str| -> f64 {
+        let marker = format!("{name}=");
+        let start = timing_line
+            .find(&marker)
+            .unwrap_or_else(|| panic!("no '{marker}' in timing line: {timing_line}"))
+            + marker.len();
+        let rest = &timing_line[start..];
+        let end = rest.find(['s', ' ']).unwrap_or(rest.len());
+        rest[..end]
+            .parse::<f64>()
+            .unwrap_or_else(|e| panic!("bad {name} field in '{timing_line}': {e}"))
+    };
+    let wall = field("wall");
+    let busy = field("busy");
+    let busy_share = busy / wall;
+    eprintln!(
+        "self-reported max-mode timing: wall={wall:.3}s busy={busy:.3}s ({:.1}% of wall)",
+        busy_share * 100.0
+    );
+    assert!(
+        busy_share < 0.5,
+        "expected busy time to be a small minority of wall time on this idle-heavy scripted \
+         boot (true figure is single-digit percent, per docs/cpu-core-c0-profile.md) -- got \
+         {:.1}% of wall, which looks like a regression of the `slept` sleep-accounting bug \
+         fixed 2026-09-28 -- timing line: {timing_line}",
+        busy_share * 100.0
+    );
+
     let _ = std::fs::remove_file(&script_path);
 }
 

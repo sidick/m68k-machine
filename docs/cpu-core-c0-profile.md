@@ -104,6 +104,27 @@ The attribution script is `analyze_profile2.py` (kept in this session's scratchp
 
 **Cross-check and a genuine finding.** `run_guest_max` also self-reports `wall`/`slept`/`busy` at the end of every max-mode run (`Report::timing_report`). Comparing that to the sampled split surfaces a real bug in that self-report, not a bug in the sampling method: `slept` accumulates the *nominal* sleep slice requested (`slept += slice`, capped at `MAX_MODE_STOP_SLEEP_SLICE = 1 ms`), never the actual measured wall-clock duration the `std::thread::sleep` call took. On this host, `thread::sleep` overshoots its nominal 1 ms request by enough, over the tens of thousands of STOP-slice sleeps in an idle-heavy run, that the app's own `busy = wall - slept` figure is inflated by roughly an order of magnitude relative to the sampled ground truth: the boot workload's own report says `busy=33.6-33.9s` of `wall=87.86s` (38.2%), while the sampled profile puts **true CPU-busy time at 3.8-4.0% of wall clock, not 38%.** This is reported here as a finding for the maintainers (per the task brief: raise it, don't fix it) -- `run_guest_max`'s `busy_mips` figure, and by extension the "~30 busy MIPS" figures in `docs/bus-fast-path-plan.md` step 7.2/8, measure "wall time not accounted as nominal sleep," not genuine CPU-busy time, whenever STOP is entered anywhere near as often as it is during an idle-heavy run. The short, mostly-non-idle 200-frame runs used for busy-MIPS below are far less affected (few STOP entries during early boot), and their sampled-profile cross-check (not done for those specifically, given time budget) would be the way to confirm that.
 
+> **Fixed 2026-09-28** (a later pass than the one that wrote this
+> document): `slept` now accumulates measured `Instant::elapsed()` at
+> the sleep site rather than the nominal requested slice (`run.rs`'s
+> `MaxModeTiming` doc comment carries the detail). Re-running this same
+> boot workload (`--max-frames 4400`, max mode, interp) post-fix: the
+> app's own self-report gives `busy=2.948s` of `wall=87.859s`, **3.35%
+> of wall**, against a fresh 1 kHz `samply` CPU-busy profile of the
+> identical run (same `analyze_profile2.py` method as this section) of
+> **4.0%** -- agreement within about **0.65 percentage points**, not
+> the 34-point (38.2% vs 3.8-4.0%) gap recorded above. The confirmed
+> prediction two sentences up also held: the 200-frame busy-MIPS
+> figures below were barely affected by the bug (post-fix full-run
+> busy MIPS converges to the same ~30 M/s the 200-frame numbers already
+> reported), and the "~30 busy MIPS" figures in
+> `docs/bus-fast-path-plan.md` step 7.2/8 are consequently correct as
+> published, even though they were derived from the buggy full-run
+> accounting's own 200-frame workaround rather than a fix at the time.
+> The whole-run figures step 7.2's tables published directly (2.0-2.7,
+> not the 200-frame workaround) *were* wrong and are corrected in that
+> document's own step-7.2 results section, dated the same day.
+
 The primary figure in every table below is the **sampled CPU-busy share**, sleep excluded, per the task brief's instruction. Wall-clock shares (including sleep) are reported alongside and are always labelled as such.
 
 ---
