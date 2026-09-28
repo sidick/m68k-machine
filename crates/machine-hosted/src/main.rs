@@ -9,6 +9,7 @@ mod blitter_trace;
 mod bus;
 mod cli;
 mod console;
+mod cpu;
 mod hd_image;
 mod input_script;
 mod introspect;

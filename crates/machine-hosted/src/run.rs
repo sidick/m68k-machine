@@ -77,7 +77,7 @@
 //! instructions at one PC, which has no meaning when the CPU is
 //! unbudgeted, so max mode instead samples the PC once per chunk boundary
 //! and calls it a wedge after `MAX_MODE_WEDGE_SECONDS` of *wall clock*
-//! with the CPU not stopped (a `CycleBatchExit::Stopped` chunk resets the
+//! with the CPU not stopped (a `GuestExit::Stopped` chunk resets the
 //! streak rather than extending it -- Kickstart's idle dispatcher legitimately
 //! holds the same PC in STOP forever, and this detector must never mistake
 //! that for a wedge).
@@ -89,14 +89,13 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use m68k::{BatchExit, CpuCore, CycleBatchControl, CycleBatchExit, CycleBatchResult};
-
 use machine_core::block::BlockDevice;
 use machine_core::{pci, MachineBus, CHIP_RAM_SIZE, CPU_CLOCKS_PER_ECLOCK};
 
 use crate::bus::Bus;
 use crate::cli::Args;
 use crate::console::Console;
+use crate::cpu::{GuestBatchResult, GuestCpu, GuestExit, HookControl, HookCpu, M68kRsCore};
 use crate::hd_image::FileBlockDevice;
 use crate::input_script::InputScript;
 use crate::rom_image;
@@ -193,7 +192,7 @@ pub enum Outcome {
     /// nothing can ever resume it. Real Kickstart never does this; it is
     /// how the synthetic smoke-test ROM signals "done". Any other STOP
     /// (Kickstart's idle dispatcher uses mask 0) is not this outcome --
-    /// see `run_guest`'s handling of `CycleBatchExit::Stopped`.
+    /// see `run_guest`'s handling of `GuestExit::Stopped`.
     CleanHalt,
     /// A bound the caller asked for (`--max-frames`/`--max-instructions`)
     /// was hit before any other outcome. Expected for real ROMs at this
@@ -810,14 +809,14 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         None => None,
     };
 
-    let mut cpu = CpuCore::new();
-    cpu.set_cpu_type(args.cpu.into());
+    let mut cpu = M68kRsCore::new();
+    cpu.set_cpu_model(args.cpu);
     cpu.reset(&mut bus);
 
     console.diag(&format!(
         "reset vector: SSP={:#010x} PC={:#010x} (overlay {})",
         cpu.sp(),
-        cpu.pc,
+        cpu.pc(),
         if bus.0.overlay() { "mapped" } else { "clear" }
     ));
 
@@ -909,10 +908,10 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_guest(
+fn run_guest<C: GuestCpu>(
     args: &Args,
     console: &mut Console,
-    cpu: &mut CpuCore,
+    cpu: &mut C,
     bus: &mut Bus,
     mut serial_script: Option<&mut SerialScript>,
     mut input_script: Option<&mut InputScript>,
@@ -933,7 +932,7 @@ fn run_guest(
     // Tight-loop detector state, shared across hook invocations within one
     // outer-loop batch (recreated each batch since a fresh closure borrows
     // it fresh, but the values themselves persist across batches).
-    let mut last_pc: u32 = cpu.pc;
+    let mut last_pc: u32 = cpu.pc();
     let mut same_pc_streak: u64 = 0;
 
     let mut last_exception: Option<(&'static str, u32)> = None;
@@ -961,7 +960,13 @@ fn run_guest(
 
     let outcome = 'outer: loop {
         let trace = args.trace;
-        let cpu_type = cpu.cpu_type;
+        // `--trace`'s disassembler needs only the CPU model, which `args`
+        // already carries -- it decodes the 68k instruction stream, not
+        // anything specific to the executing `GuestCpu` implementation, so
+        // this does not need to go through the trait (see
+        // `docs/cpu-core-trait.md`'s note on why disassembly is not a
+        // trait method).
+        let cpu_type: m68k::CpuType = args.cpu.into();
         let mut hook_wedge: Option<String> = None;
         let mut hook_limit: Option<&'static str> = None;
 
@@ -1007,7 +1012,7 @@ fn run_guest(
             }
 
             total_instructions += 1;
-            let pc = cpu.ppc;
+            let pc = cpu.ppc();
             // Feed the serial register trace (bus.rs) the PC of the next
             // instruction to execute, so its accesses get attributed --
             // but only when something could read it back: `LAST_PC` exists
@@ -1015,7 +1020,7 @@ fn run_guest(
             // run with `SERIAL_REG_TRACE` unset has no use for storing it
             // on every retired instruction.
             if bus.serial_trace_on() {
-                crate::bus::LAST_PC.store(cpu.pc, std::sync::atomic::Ordering::Relaxed);
+                crate::bus::LAST_PC.store(cpu.pc(), std::sync::atomic::Ordering::Relaxed);
             }
 
             if trace {
@@ -1034,8 +1039,8 @@ fn run_guest(
                     {
                         console.diag(&format!(
                             "  WATCH {pc:#010x}: D0={:#010x} D1={:#010x} D2={:#010x} A0={:#010x} A1={:#010x} A2={:#010x} A6={:#010x} SP={:#010x}",
-                            cpu.dar[0], cpu.dar[1], cpu.dar[2],
-                            cpu.dar[8], cpu.dar[9], cpu.dar[10], cpu.dar[14], cpu.dar[15],
+                            cpu.dar(0), cpu.dar(1), cpu.dar(2),
+                            cpu.dar(8), cpu.dar(9), cpu.dar(10), cpu.dar(14), cpu.dar(15),
                         ));
                     }
                 }
@@ -1051,14 +1056,14 @@ fn run_guest(
                 hook_wedge = Some(format!(
                     "tight loop at PC {pc:#010x} ({same_pc_streak} instructions with no progress)"
                 ));
-                return CycleBatchControl::Return;
+                return HookControl::Return;
             }
 
             if frames >= last_progress_frame + PROGRESS_EVERY_FRAMES {
                 last_progress_frame = frames;
                 console.diag(&format!(
                     "progress: frame {frames}, PC {:#010x}, overlay {}, INTENA {:#06x}, INTREQ {:#06x}",
-                    cpu.pc,
+                    cpu.pc(),
                     if bus.0.overlay() { "mapped" } else { "clear" },
                     bus.0.chipset.intena,
                     bus.0.chipset.intreq,
@@ -1077,14 +1082,14 @@ fn run_guest(
 
             if args.max_instructions != 0 && total_instructions >= args.max_instructions {
                 hook_limit = Some("max-instructions");
-                return CycleBatchControl::Return;
+                return HookControl::Return;
             }
             if args.max_frames != 0 && frames >= args.max_frames {
                 hook_limit = Some("max-frames");
-                return CycleBatchControl::Return;
+                return HookControl::Return;
             }
 
-            CycleBatchControl::Continue
+            HookControl::Continue
         });
 
         // `result.instructions` double-counts against the hook's own
@@ -1100,7 +1105,7 @@ fn run_guest(
             overlay_was_cleared = true;
             console.diag(&format!(
                 "PHASE1 HOSTED: reached overlay-cleared (frame {}, instr {total_instructions}, PC {:#010x})",
-                bus.0.frames(), cpu.pc
+                bus.0.frames(), cpu.pc()
             ));
         }
 
@@ -1112,13 +1117,13 @@ fn run_guest(
         }
 
         match result.exit {
-            CycleBatchExit::BudgetExhausted | CycleBatchExit::BoundaryRequested => {
+            GuestExit::BudgetExhausted | GuestExit::BoundaryRequested => {
                 // Just this batch's cycle allowance running out; the outer
                 // loop's own limit checks (above) are what actually stop a
                 // run. Keep going.
                 continue 'outer;
             }
-            CycleBatchExit::Stopped => {
+            GuestExit::Stopped => {
                 // STOP is not HALT: it loads SR from its operand and
                 // suspends fetch until an *unmasked* interrupt arrives
                 // (68000UM4 §6.2), then resumes -- it is Kickstart's idle
@@ -1128,7 +1133,7 @@ fn run_guest(
                 // ever satisfy, which is exactly the synthetic smoke-test
                 // ROM's contract (`tests/smoke.rs`'s `STOP_SR = 0x2700`) --
                 // that, and only that, is a real clean halt.
-                if cpu.int_mask & 0x0700 == 0x0700 {
+                if cpu.int_mask() & 0x0700 == 0x0700 {
                     break 'outer Outcome::CleanHalt;
                 }
 
@@ -1198,7 +1203,7 @@ fn run_guest(
                     last_progress_frame = frames;
                     console.diag(&format!(
                         "progress: frame {frames}, PC {:#010x} (stopped), overlay {}, INTENA {:#06x}, INTREQ {:#06x}",
-                        cpu.pc,
+                        cpu.pc(),
                         if bus.0.overlay() { "mapped" } else { "clear" },
                         bus.0.chipset.intena,
                         bus.0.chipset.intreq,
@@ -1206,62 +1211,72 @@ fn run_guest(
                 }
                 continue 'outer;
             }
-            CycleBatchExit::AlineTrap { opcode } => {
+            GuestExit::AlineTrap { opcode } => {
                 if track_exception(
                     "A-line",
-                    cpu.ppc,
+                    cpu.ppc(),
                     &mut last_exception,
                     &mut exception_streak,
                 ) {
                     break 'outer Outcome::Wedged(format!(
                         "exception storm: A-line trap {opcode:#06x} at PC {:#010x} repeated {exception_streak} times",
-                        cpu.ppc
+                        cpu.ppc()
                     ));
                 }
                 cpu.take_aline_exception(bus);
             }
-            CycleBatchExit::FlineTrap { opcode } => {
+            GuestExit::FlineTrap { opcode } => {
                 if track_exception(
                     "F-line",
-                    cpu.ppc,
+                    cpu.ppc(),
                     &mut last_exception,
                     &mut exception_streak,
                 ) {
                     break 'outer Outcome::Wedged(format!(
                         "exception storm: F-line trap {opcode:#06x} at PC {:#010x} repeated {exception_streak} times",
-                        cpu.ppc
+                        cpu.ppc()
                     ));
                 }
                 cpu.take_fline_exception(bus);
             }
-            CycleBatchExit::TrapInstruction { trap_num } => {
-                if track_exception("TRAP", cpu.ppc, &mut last_exception, &mut exception_streak) {
+            GuestExit::TrapInstruction { trap_num } => {
+                if track_exception(
+                    "TRAP",
+                    cpu.ppc(),
+                    &mut last_exception,
+                    &mut exception_streak,
+                ) {
                     break 'outer Outcome::Wedged(format!(
                         "exception storm: TRAP #{trap_num} at PC {:#010x} repeated {exception_streak} times",
-                        cpu.ppc
+                        cpu.ppc()
                     ));
                 }
                 cpu.take_trap_exception(bus, trap_num);
             }
-            CycleBatchExit::Breakpoint { bp_num } => {
-                if track_exception("BKPT", cpu.ppc, &mut last_exception, &mut exception_streak) {
+            GuestExit::Breakpoint { bp_num } => {
+                if track_exception(
+                    "BKPT",
+                    cpu.ppc(),
+                    &mut last_exception,
+                    &mut exception_streak,
+                ) {
                     break 'outer Outcome::Wedged(format!(
                         "exception storm: BKPT #{bp_num} at PC {:#010x} repeated {exception_streak} times",
-                        cpu.ppc
+                        cpu.ppc()
                     ));
                 }
                 cpu.take_bkpt_exception(bus);
             }
-            CycleBatchExit::IllegalInstruction { opcode } => {
+            GuestExit::IllegalInstruction { opcode } => {
                 if track_exception(
                     "illegal",
-                    cpu.ppc,
+                    cpu.ppc(),
                     &mut last_exception,
                     &mut exception_streak,
                 ) {
                     break 'outer Outcome::Wedged(format!(
                         "exception storm: illegal opcode {opcode:#06x} at PC {:#010x} repeated {exception_streak} times",
-                        cpu.ppc
+                        cpu.ppc()
                     ));
                 }
                 cpu.take_illegal_exception(bus);
@@ -1273,7 +1288,7 @@ fn run_guest(
         outcome,
         instructions: total_instructions,
         frames: bus.0.frames(),
-        final_pc: cpu.pc,
+        final_pc: cpu.pc(),
         overlay_cleared: !bus.0.overlay(),
         max_mode_timing: None,
     }
@@ -1311,14 +1326,14 @@ fn duration_from_clocks(clocks: u32, clock_hz: f64) -> Duration {
 /// becomes wall-clock-based (`MAX_MODE_WEDGE_SECONDS`) rather than
 /// instruction-count-based, since max mode has no fixed instructions per
 /// second to size a count against. STOP sleeps the host rather than
-/// ticking device time in slices (cycle mode's `CycleBatchExit::Stopped`
+/// ticking device time in slices (cycle mode's `GuestExit::Stopped`
 /// arm), and a host that falls behind real time slips device time rather
 /// than bursting through the backlog (`MAX_MODE_BACKLOG_CAP`).
 #[allow(clippy::too_many_arguments)]
-fn run_guest_max(
+fn run_guest_max<C: GuestCpu>(
     args: &Args,
     console: &mut Console,
-    cpu: &mut CpuCore,
+    cpu: &mut C,
     bus: &mut Bus,
     mut serial_script: Option<&mut SerialScript>,
     mut input_script: Option<&mut InputScript>,
@@ -1334,7 +1349,7 @@ fn run_guest_max(
     let mut last_exception: Option<(&'static str, u32)> = None;
     let mut exception_streak: u64 = 0;
 
-    let mut wedge_pc: u32 = cpu.pc;
+    let mut wedge_pc: u32 = cpu.pc();
     let mut wedge_since = Instant::now();
 
     let mut screenshot_job = args.screenshot.as_ref().map(|path| {
@@ -1399,7 +1414,7 @@ fn run_guest_max(
         // a while loop.
         loop {
             let chunk_start = Instant::now();
-            let result: CycleBatchResult = match backend {
+            let result: GuestBatchResult = match backend {
                 crate::cli::CpuBackend::Interp => {
                     let budget =
                         chunk_cycles.clamp(MAX_MODE_MIN_CHUNK_CYCLES, MAX_MODE_MAX_CHUNK_CYCLES);
@@ -1408,18 +1423,15 @@ fn run_guest_max(
                 crate::cli::CpuBackend::Batch => {
                     let budget =
                         chunk_instrs.clamp(MAX_MODE_MIN_CHUNK_INSTRS, MAX_MODE_MAX_CHUNK_INSTRS);
-                    let batch = cpu.run_batch(bus, budget, &[]);
-                    CycleBatchResult {
-                        // `run_batch` reports no cycle count at all; `0`
-                        // here is inert -- nothing below reads `.cycles`
-                        // for the `Batch` arm (the chunk-size update
-                        // below is instruction-based instead), and device
-                        // time is advanced from `deadline`, never from
-                        // this field, in both back ends.
-                        cycles: 0,
-                        instructions: batch.instructions,
-                        exit: map_batch_exit(batch.exit),
-                    }
+                    // `run_batch_instructions` reports no cycle count at
+                    // all (`.cycles` is always `0`); nothing below reads
+                    // it for the `Batch` arm (the chunk-size update below
+                    // is instruction-based instead), and device time is
+                    // advanced from `deadline`, never from this field, in
+                    // both back ends. This is the one `GuestCpu` method
+                    // that is not required of a second core -- see its
+                    // doc comment and `docs/cpu-core-trait.md`.
+                    cpu.run_batch_instructions(bus, budget)
                 }
             };
             let chunk_elapsed = chunk_start.elapsed();
@@ -1471,27 +1483,27 @@ fn run_guest_max(
             drain_serial(bus, console, serial_tcp);
 
             // "With the CPU not stopped" (ADR 0006): a `Stopped` exit
-            // retires no instructions and leaves `cpu.pc` unchanged by
+            // retires no instructions and leaves `cpu.pc()` unchanged by
             // definition (Kickstart's idle dispatcher parks on the same
             // STOP over and over, exactly like a real wedge would look),
             // so it must reset the streak rather than extend it -- an
             // idle Workbench sitting in STOP for longer than
             // `MAX_MODE_WEDGE_SECONDS` is the expected, healthy case this
             // detector must never fire on.
-            if result.exit == CycleBatchExit::Stopped {
-                wedge_pc = cpu.pc;
+            if result.exit == GuestExit::Stopped {
+                wedge_pc = cpu.pc();
                 wedge_since = Instant::now();
-            } else if cpu.pc == wedge_pc {
+            } else if cpu.pc() == wedge_pc {
                 let stuck_for = wedge_since.elapsed();
                 if stuck_for.as_secs_f64() >= MAX_MODE_WEDGE_SECONDS {
                     hook_wedge = Some(format!(
                         "tight loop at PC {:#010x} ({:.1}s wall clock with no progress)",
-                        cpu.pc,
+                        cpu.pc(),
                         stuck_for.as_secs_f64()
                     ));
                 }
             } else {
-                wedge_pc = cpu.pc;
+                wedge_pc = cpu.pc();
                 wedge_since = Instant::now();
             }
 
@@ -1527,26 +1539,26 @@ fn run_guest_max(
             }
 
             match result.exit {
-                CycleBatchExit::BudgetExhausted => {
+                GuestExit::BudgetExhausted => {
                     if Instant::now() >= t_event {
                         break;
                     }
                 }
-                CycleBatchExit::BoundaryRequested => break,
-                CycleBatchExit::Stopped => {
+                GuestExit::BoundaryRequested => break,
+                GuestExit::Stopped => {
                     stopped_exit = true;
                     break;
                 }
-                CycleBatchExit::AlineTrap { opcode } => {
+                GuestExit::AlineTrap { opcode } => {
                     if track_exception(
                         "A-line",
-                        cpu.ppc,
+                        cpu.ppc(),
                         &mut last_exception,
                         &mut exception_streak,
                     ) {
                         hook_wedge = Some(format!(
                             "exception storm: A-line trap {opcode:#06x} at PC {:#010x} repeated {exception_streak} times",
-                            cpu.ppc
+                            cpu.ppc()
                         ));
                         break;
                     }
@@ -1555,16 +1567,16 @@ fn run_guest_max(
                         break;
                     }
                 }
-                CycleBatchExit::FlineTrap { opcode } => {
+                GuestExit::FlineTrap { opcode } => {
                     if track_exception(
                         "F-line",
-                        cpu.ppc,
+                        cpu.ppc(),
                         &mut last_exception,
                         &mut exception_streak,
                     ) {
                         hook_wedge = Some(format!(
                             "exception storm: F-line trap {opcode:#06x} at PC {:#010x} repeated {exception_streak} times",
-                            cpu.ppc
+                            cpu.ppc()
                         ));
                         break;
                     }
@@ -1573,12 +1585,16 @@ fn run_guest_max(
                         break;
                     }
                 }
-                CycleBatchExit::TrapInstruction { trap_num } => {
-                    if track_exception("TRAP", cpu.ppc, &mut last_exception, &mut exception_streak)
-                    {
+                GuestExit::TrapInstruction { trap_num } => {
+                    if track_exception(
+                        "TRAP",
+                        cpu.ppc(),
+                        &mut last_exception,
+                        &mut exception_streak,
+                    ) {
                         hook_wedge = Some(format!(
                             "exception storm: TRAP #{trap_num} at PC {:#010x} repeated {exception_streak} times",
-                            cpu.ppc
+                            cpu.ppc()
                         ));
                         break;
                     }
@@ -1587,12 +1603,16 @@ fn run_guest_max(
                         break;
                     }
                 }
-                CycleBatchExit::Breakpoint { bp_num } => {
-                    if track_exception("BKPT", cpu.ppc, &mut last_exception, &mut exception_streak)
-                    {
+                GuestExit::Breakpoint { bp_num } => {
+                    if track_exception(
+                        "BKPT",
+                        cpu.ppc(),
+                        &mut last_exception,
+                        &mut exception_streak,
+                    ) {
                         hook_wedge = Some(format!(
                             "exception storm: BKPT #{bp_num} at PC {:#010x} repeated {exception_streak} times",
-                            cpu.ppc
+                            cpu.ppc()
                         ));
                         break;
                     }
@@ -1601,16 +1621,16 @@ fn run_guest_max(
                         break;
                     }
                 }
-                CycleBatchExit::IllegalInstruction { opcode } => {
+                GuestExit::IllegalInstruction { opcode } => {
                     if track_exception(
                         "illegal",
-                        cpu.ppc,
+                        cpu.ppc(),
                         &mut last_exception,
                         &mut exception_streak,
                     ) {
                         hook_wedge = Some(format!(
                             "exception storm: illegal opcode {opcode:#06x} at PC {:#010x} repeated {exception_streak} times",
-                            cpu.ppc
+                            cpu.ppc()
                         ));
                         break;
                     }
@@ -1630,9 +1650,9 @@ fn run_guest_max(
         }
 
         if stopped_exit {
-            // See `run_guest`'s matching `CycleBatchExit::Stopped` arm for
+            // See `run_guest`'s matching `GuestExit::Stopped` arm for
             // why SR mask 7 (and only that) is a real clean halt.
-            if cpu.int_mask & 0x0700 == 0x0700 {
+            if cpu.int_mask() & 0x0700 == 0x0700 {
                 break 'outer Outcome::CleanHalt;
             }
             if args.max_frames != 0 && bus.0.frames() >= args.max_frames {
@@ -1718,7 +1738,7 @@ fn run_guest_max(
             // does; it costs nothing when the CPU is not yet serviceable
             // (`execute`'s own stopped branch returns without consuming
             // cycles in that case) and only takes real work exactly when
-            // a wake is due, in cycle mode's `CycleBatchExit::Stopped` arm
+            // a wake is due, in cycle mode's `GuestExit::Stopped` arm
             // and the interp back end never need this because both drive
             // `run_for_cycles`, which already includes this check.
             if backend == crate::cli::CpuBackend::Batch {
@@ -1751,32 +1771,12 @@ fn run_guest_max(
         outcome,
         instructions: total_instructions,
         frames: bus.0.frames(),
-        final_pc: cpu.pc,
+        final_pc: cpu.pc(),
         overlay_cleared: !bus.0.overlay(),
         max_mode_timing: Some(MaxModeTiming {
             wall: wall_start.elapsed(),
             slept,
         }),
-    }
-}
-
-/// Map `run_batch`'s [`BatchExit`] onto the same [`CycleBatchExit`] shape
-/// `run_guest_max`'s chunk-exit handling already switches on, so
-/// `--cpu-backend batch` reuses that match unchanged. `WatchedPc` never
-/// occurs: `run_guest_max` always calls `run_batch` with an empty
-/// `watch_pcs` list.
-fn map_batch_exit(exit: BatchExit) -> CycleBatchExit {
-    match exit {
-        BatchExit::BudgetExhausted => CycleBatchExit::BudgetExhausted,
-        BatchExit::Stopped => CycleBatchExit::Stopped,
-        BatchExit::AlineTrap { opcode } => CycleBatchExit::AlineTrap { opcode },
-        BatchExit::FlineTrap { opcode } => CycleBatchExit::FlineTrap { opcode },
-        BatchExit::TrapInstruction { trap_num } => CycleBatchExit::TrapInstruction { trap_num },
-        BatchExit::Breakpoint { bp_num } => CycleBatchExit::Breakpoint { bp_num },
-        BatchExit::IllegalInstruction { opcode } => CycleBatchExit::IllegalInstruction { opcode },
-        BatchExit::WatchedPc { .. } => {
-            unreachable!("run_guest_max always calls run_batch with an empty watch_pcs list")
-        }
     }
 }
 
@@ -1786,10 +1786,10 @@ fn map_batch_exit(exit: BatchExit) -> CycleBatchExit {
 /// frame count, which the caller already needs for its own limit check
 /// right after calling this.
 #[allow(clippy::too_many_arguments)]
-fn max_chunk_boundary(
+fn max_chunk_boundary<C: GuestCpu>(
     args: &Args,
     console: &mut Console,
-    cpu: &mut CpuCore,
+    cpu: &mut C,
     bus: &mut Bus,
     serial_script: Option<&mut SerialScript>,
     input_script: Option<&mut InputScript>,
@@ -1825,7 +1825,7 @@ fn max_chunk_boundary(
         *overlay_was_cleared = true;
         console.diag(&format!(
             "PHASE1 HOSTED: reached overlay-cleared (frame {frames}, instr {total_instructions}, PC {:#010x})",
-            cpu.pc
+            cpu.pc()
         ));
     }
 
@@ -1846,7 +1846,7 @@ fn max_chunk_boundary(
         *last_progress_real = Instant::now();
         console.diag(&format!(
             "progress (max): frame {frames}, PC {:#010x}, overlay {}, INTENA {:#06x}, INTREQ {:#06x}",
-            cpu.pc,
+            cpu.pc(),
             if bus.0.overlay() { "mapped" } else { "clear" },
             bus.0.chipset.intena,
             bus.0.chipset.intreq,
@@ -1894,9 +1894,9 @@ fn drain_serial(bus: &mut Bus, console: &mut Console, serial_tcp: Option<&Serial
 /// for why the CPU is guaranteed to be actively executing (not
 /// `stopped`) there, which `cpu.take_illegal_exception` needs.
 #[allow(clippy::too_many_arguments)]
-fn service_host_serial(
+fn service_host_serial<H: HookCpu>(
     args: &Args,
-    cpu: &mut CpuCore,
+    cpu: &mut H,
     bus: &mut Bus,
     console: &mut Console,
     script: Option<&mut SerialScript>,
