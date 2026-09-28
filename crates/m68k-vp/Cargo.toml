@@ -1,0 +1,25 @@
+[package]
+name = "m68k-vp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "PoC decoder + IR + threaded interpreter for docs/cpu-core-proposal.md's proposed m68k-vp core. #![no_std], no allocator, bounded arenas -- prototype for the proposal's C2 decision point, measured head-to-head against m68k-rs by crates/cpu-bench."
+publish = false
+
+[features]
+# Test/harness convenience only (docs/cpu-core-poc-results.md's brief):
+# the library is no_std without it. cargo test enables `std` implicitly via
+# the `not(any(feature = "std", test))` gate in src/lib.rs, so this feature
+# exists for callers that want std-only debug helpers outside of `cargo
+# test` (none exist yet); it pulls in nothing extra today.
+std = []
+
+[dev-dependencies]
+# The reference oracle for this crate's mandatory differential
+# correctness gate (src/tests.rs) -- never a runtime dependency of the
+# library itself (the lib target stays genuinely no_std; only tests need
+# std, gated in src/lib.rs). Same workspace pin every other crate uses.
+m68k = { workspace = true, features = ["std"] }
+
+[lints.clippy]
+all = "warn"

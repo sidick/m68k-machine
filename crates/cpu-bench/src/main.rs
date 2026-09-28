@@ -35,6 +35,7 @@
 
 use m68k::core::memory::{AddressBus, LinearMemoryBus};
 use m68k::{CpuCore, CpuType};
+use m68k_vp::{VpCore, VpExit, VpMemory};
 use std::time::{Duration, Instant};
 
 /// The assembled kernel blob, built by `scripts/build-cpubench.sh` from
@@ -147,6 +148,65 @@ fn new_bus() -> LinearMemoryBus {
     let mut bus = LinearMemoryBus::new(BUS_SIZE);
     bus.load(KERNEL_BASE, KERNELS_BIN);
     bus
+}
+
+/// The same blob, loaded into `m68k-vp`'s borrowed-buffer memory model
+/// (`crates/m68k-vp/src/mem.rs`) instead of `LinearMemoryBus` -- same
+/// size, same load address, so both cores run over identical guest RAM.
+fn new_vp_buf() -> Vec<u8> {
+    let mut buf = vec![0u8; BUS_SIZE];
+    let mut mem = VpMemory::new(&mut buf);
+    mem.load(KERNEL_BASE, KERNELS_BIN);
+    buf
+}
+
+/// Set up one `m68k-vp` call exactly like `prepare_call` does for
+/// m68k-rs: `d0` = outer iteration count, `a0`/`a1` = buffers, `a7` =
+/// stack top (`m68k-vp` has no `reset`/`set_a` helpers of its own --
+/// registers are plain public fields).
+fn prepare_call_vp(core: &mut VpCore, kernel: &KernelMeta, iterations: u32) {
+    core.cpu.pc = kernel.entry;
+    core.cpu.d[0] = iterations;
+    core.cpu.a[7] = STACK_TOP;
+    if kernel.buffers >= 1 {
+        core.cpu.a[0] = BUF_A;
+    }
+    if kernel.buffers >= 2 {
+        core.cpu.a[1] = BUF_B;
+    }
+}
+
+/// Calibrate one kernel on `m68k-vp`, mirroring `calibrate` above --
+/// same formula, same sentinel-return stop condition, same loud panic on
+/// mismatch (this is correctness gate 1 from
+/// docs/cpu-core-poc-results.md, run again here immediately before every
+/// timing measurement, exactly as the brief requires; `m68k-vp`'s own
+/// `cargo test` suite is where gate 1 *and* gate 2, the differential
+/// check against m68k-rs, live as permanent tests -- crates/m68k-vp/src/tests.rs).
+fn calibrate_vp(buf: &mut [u8], kernel: &KernelMeta) {
+    const CALIBRATION_ITERS: u32 = 97;
+
+    let mut mem = VpMemory::new(buf);
+    let mut core = VpCore::new();
+    prepare_call_vp(&mut core, kernel, CALIBRATION_ITERS);
+    mem.write_u32(STACK_TOP, RETURN_SENTINEL);
+
+    let expected = kernel.fixed_overhead + CALIBRATION_ITERS * kernel.instrs_per_iter;
+    let budget = expected + 64;
+    let result = core.run(&mut mem, budget, &[RETURN_SENTINEL]);
+
+    assert!(
+        matches!(result.exit, VpExit::WatchedPc(RETURN_SENTINEL)),
+        "kernel {}: m68k-vp calibration run did not stop at its own RTS (exit={:?})",
+        kernel.name,
+        result.exit
+    );
+    assert_eq!(
+        result.instructions, expected,
+        "kernel {}: m68k-vp retired {} instructions over {CALIBRATION_ITERS} outer iterations, \
+         expected {expected} (fixed_overhead={} + iterations * instrs_per_iter={})",
+        kernel.name, result.instructions, kernel.fixed_overhead, kernel.instrs_per_iter,
+    );
 }
 
 fn fresh_cpu() -> CpuCore {
@@ -303,6 +363,76 @@ fn batch_label() -> &'static str {
     "batch"
 }
 
+/// `m68k-vp`'s steady-state number: block cache stays warm across the
+/// whole measurement, same shape as `measure_interp`/`measure_batch`
+/// above (huge outer iteration count so the kernel's own loop never
+/// reaches its `rts`, huge instruction budget per call, accumulate until
+/// `MIN_MEASURE_SECONDS`). This is the number directly comparable to
+/// m68k-rs's `interp` column -- both are "decode once (or once per
+/// m68k-rs dispatch), run the hot loop" numbers over identical retired
+/// instructions.
+fn measure_vp_interp(buf: &mut [u8], kernel: &KernelMeta) -> Measurement {
+    let mut mem = VpMemory::new(buf);
+    let mut core = VpCore::new();
+    prepare_call_vp(&mut core, kernel, u32::MAX);
+
+    let mut total_instructions: u64 = 0;
+    let mut total_elapsed = Duration::ZERO;
+    let instr_budget: u32 = 4_000_000;
+
+    while total_elapsed.as_secs_f64() < MIN_MEASURE_SECONDS {
+        let start = Instant::now();
+        let result = core.run(&mut mem, instr_budget, &[]);
+        total_elapsed += start.elapsed();
+        total_instructions += u64::from(result.instructions);
+    }
+
+    Measurement {
+        path: "vp-interp",
+        instructions: total_instructions,
+        elapsed: total_elapsed,
+    }
+}
+
+/// `m68k-vp`'s cold-decode-inclusive number: the block cache is flushed
+/// before every chunk, and each chunk's instruction budget is sized to
+/// roughly one outer iteration of *this* kernel (`fixed_overhead +
+/// instrs_per_iter`, plus headroom) -- so every chunk pays full decode
+/// cost for the same few blocks over and over, rather than amortizing it
+/// across millions of iterations the way `measure_vp_interp` does. This
+/// is the number the task brief asks for "so the steady-state optimism
+/// of tiny hot loops is visible next to it": for a tiny kernel like
+/// `reg_addq_bra` (18 instructions/iteration), decoding a ~19-op block
+/// every ~18 retired instructions is a completely different cost profile
+/// than decoding it once and running it a million times.
+fn measure_vp_cold(buf: &mut [u8], kernel: &KernelMeta) -> Measurement {
+    let mut mem = VpMemory::new(buf);
+    let mut core = VpCore::new();
+    prepare_call_vp(&mut core, kernel, u32::MAX);
+
+    // At least one full outer iteration per chunk, so the chunk always
+    // makes forward progress even for the largest kernel
+    // (movem_saverestore's single block retires 11 instructions).
+    let chunk_budget = kernel.fixed_overhead + kernel.instrs_per_iter + 8;
+
+    let mut total_instructions: u64 = 0;
+    let mut total_elapsed = Duration::ZERO;
+
+    while total_elapsed.as_secs_f64() < MIN_MEASURE_SECONDS {
+        core.flush_cache();
+        let start = Instant::now();
+        let result = core.run(&mut mem, chunk_budget, &[]);
+        total_elapsed += start.elapsed();
+        total_instructions += u64::from(result.instructions);
+    }
+
+    Measurement {
+        path: "vp-cold",
+        instructions: total_instructions,
+        elapsed: total_elapsed,
+    }
+}
+
 fn main() {
     let kernels = parse_kernel_table();
 
@@ -322,9 +452,11 @@ fn main() {
     println!("{}", "-".repeat(74));
 
     let mut bus = new_bus();
+    let mut vp_buf = new_vp_buf();
 
     for kernel in &kernels {
         calibrate(&mut bus, kernel);
+        calibrate_vp(&mut vp_buf, kernel);
 
         let interp = measure_interp(&mut bus, kernel);
         println!(
@@ -344,6 +476,26 @@ fn main() {
             batch.mips(),
             batch.ns_per_instr(),
             batch.instructions
+        );
+
+        let vp_interp = measure_vp_interp(&mut vp_buf, kernel);
+        println!(
+            "{:<20} {:<10} {:>14.1} {:>14.2} {:>12}",
+            kernel.name,
+            vp_interp.path,
+            vp_interp.mips(),
+            vp_interp.ns_per_instr(),
+            vp_interp.instructions
+        );
+
+        let vp_cold = measure_vp_cold(&mut vp_buf, kernel);
+        println!(
+            "{:<20} {:<10} {:>14.1} {:>14.2} {:>12}",
+            kernel.name,
+            vp_cold.path,
+            vp_cold.mips(),
+            vp_cold.ns_per_instr(),
+            vp_cold.instructions
         );
     }
 }
@@ -369,5 +521,20 @@ mod tests {
     fn kernel_table_matches_name_list() {
         let kernels = parse_kernel_table();
         assert_eq!(kernels.len(), KERNEL_NAMES.len());
+    }
+
+    /// `m68k-vp`'s own calibration check, exercised here the same way as
+    /// `every_kernel_calibrates` above (m68k-vp's own `cargo test -p
+    /// m68k-vp` is where the full correctness gates -- this one plus the
+    /// differential check against m68k-rs -- live permanently, see
+    /// crates/m68k-vp/src/tests.rs; this is the same gate 1 check run
+    /// from cpu-bench's own build).
+    #[test]
+    fn every_kernel_calibrates_vp() {
+        let kernels = parse_kernel_table();
+        let mut buf = new_vp_buf();
+        for kernel in &kernels {
+            calibrate_vp(&mut buf, kernel);
+        }
     }
 }

@@ -195,6 +195,7 @@ name = "cpu-bench"
 version = "0.1.0"
 dependencies = [
  "m68k",
+ "m68k-vp",
 ]
 
 [[package]]
@@ -496,6 +497,13 @@ dependencies = [
  "cranelift-module",
  "libm",
  "serde",
+]
+
+[[package]]
+name = "m68k-vp"
+version = "0.1.0"
+dependencies = [
+ "m68k",
 ]
 
 [[package]]

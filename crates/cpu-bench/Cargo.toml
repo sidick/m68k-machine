@@ -29,5 +29,10 @@ jit = ["m68k/jit"]
 # benchmark exists to measure.
 m68k = { workspace = true, features = ["std"] }
 
+# docs/cpu-core-proposal.md's PoC core (crates/m68k-vp), added as the
+# fourth measured path ("vp-interp") alongside m68k-rs's interp/batch --
+# see that crate's own doc comment and docs/cpu-core-poc-results.md.
+m68k-vp = { path = "../m68k-vp" }
+
 [lints.clippy]
 all = "warn"
