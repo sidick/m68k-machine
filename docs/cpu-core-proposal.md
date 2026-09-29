@@ -133,6 +133,12 @@ Host-specific model:
 
 Blocks are chained to successors once both exist; pending-interrupt checks happen at block boundaries and on backward branches only.
 
+*Port cost: one external data point, and it is larger than "one emitter" (added 2026-09-29).* BigMig / Emu68-A9 (`https://github.com/raparici/BigMig-Emu68A9`, Ruben Aparicio) retargeted Michal Schulz's Emu68 from AArch64 to 32-bit ARMv7 for the DE10-Nano's Cortex-A9, and its README describes the work as: "The JIT's code generator, its cache maintenance and its exception paths were rebuilt for that target."
+
+That is three subsystems, where this section's framing — and §8's C5 and C7 estimates, C7 existing specifically to show a third ISA is cheap — treats the code generator as the port and relegates cache maintenance to a row in the table above and exceptions to a front-end call-out (§4.2, §4.8). One report on one port is not proof that our split is wrong: Emu68 is a different design with no IR layer, so more of its per-target surface is necessarily in the emitter. But it is the only real evidence available of what retargeting a 68k JIT to a second host ISA actually costs, and it points the same way for both of the items we have assumed are cheap. Treat "one emitter plus the board layer" as the optimistic bound until C5 measures our own, and expect cache maintenance and exception entry to carry real per-target work.
+
+**Licensing.** BigMig is **GPLv3** (its Emu68-derived components are MPL-2.0); it is a read-never-copy source under this project's firewall, in the same class as WinUAE and Copperline. The statement above is taken from its public README, and its source has not been read. Nothing from it is used here beyond this cost observation. Its published performance figures are **not** cited anywhere in this document and should not be: they are SysInfo 4.4 readings (520–770 "MIPS" at 800 MHz–1.2 GHz), which is a Dhrystone-derived score and not comparable to the retired-instructions-per-second figures this proposal and `crates/cpu-bench` use.
+
 ### 4.6 Memory model: direct address-space mapping
 
 The 4 GB m68k address space is mapped at a fixed offset in host virtual memory. A m68k access to RAM is `base + a32`. RAM regions (chip, fast, VRAM, the ROM copy) are backed by real host memory.
