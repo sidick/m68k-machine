@@ -74,6 +74,17 @@ amiga-ffs = "0.4"
 # has to keep minimal for a different set of constraints.
 amiga-rom = { workspace = true }
 
+# Host virtual-memory plumbing for the C1 direct address-space mapping
+# (`docs/cpu-core-proposal.md` §4.6, `docs/direct-mapping.md`): mmap/
+# mprotect/shm_open for the guest-address-space reservation, the shared
+# RAM backings aliased into it, and the signal-fault cost measurement
+# (`src/bin/fault_cost.rs`). Hosted-only, like everything above -- the
+# direct map is inherently host-virtual-memory machinery, which is why
+# it lives in this crate and not `machine-core` (that crate stays
+# `no_std` and dependency-free; the map *asks* it where AUTOCONFIG put
+# things, and needs nothing from it beyond that existing surface).
+libc = "0.2"
+
 [dev-dependencies]
 # **New dev-only dependency, flagged prominently per this crate's task
 # constraints.** Used solely by `tests/blitter_differential.rs` (`#[ignore]`d,

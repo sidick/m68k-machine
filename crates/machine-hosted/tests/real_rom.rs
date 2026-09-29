@@ -3513,3 +3513,64 @@ fn kickstart_3_2_2_a1200_rtg_workbench_desktop_is_grey_not_blank_or_corrupt_fixe
         "expected a drawn RTG Workbench desktop, got {non_background} non-background pixels"
     );
 }
+
+/// The direct-map gate for the debug-profile suite (`docs/direct-mapping.md`,
+/// "Default policy"): `--direct-map auto` resolves to *off* under the
+/// debug profile `cargo test` builds this binary with, so without this
+/// test the `--ignored` suite would stop exercising the direct map end
+/// to end the moment that default landed. This forces it on and off
+/// over the same `fixed`-mode boot (with the HD image attached, so
+/// AUTOCONFIG places fast RAM's board and hostblk's and the map's
+/// placement-driven rebuild actually runs) and asserts the narration is
+/// byte-identical apart from the `direct-map:` diag line itself -- the
+/// map is supposed to be invisible to guest-visible behaviour, and this
+/// is the differential that catches it the day it is not.
+#[test]
+#[ignore = "requires user-supplied Kickstart ROM + HD image on disk; run with --ignored"]
+fn fixed_mode_boot_is_identical_with_direct_map_forced_on() {
+    let rom = kickstart_a1200();
+    let hd = hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+    let run_with = |mode: &str| {
+        let (_, output) = run(&[
+            "--rom",
+            rom.as_str(),
+            "--hostblk",
+            hd.as_str(),
+            "--cpu-speed",
+            "fixed",
+            "--max-frames",
+            "500",
+            "--max-instructions",
+            "0",
+            "--direct-map",
+            mode,
+        ])
+        .unwrap();
+        assert!(
+            output.contains(&format!("direct-map: {mode}")),
+            "expected the loud direct-map diag line for mode '{mode}' -- output:\n{output}"
+        );
+        // Drop the one line that legitimately differs between the two
+        // modes (the diag line naming the decision), keep everything
+        // else for the byte-for-byte comparison.
+        output
+            .lines()
+            .filter(|l| !l.contains("direct-map:"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let on = run_with("on");
+    let off = run_with("off");
+    assert_eq!(
+        on, off,
+        "a fixed-mode boot must narrate identically with the direct map forced on and off \
+         (excluding the direct-map diag line itself)"
+    );
+    assert!(
+        on.contains("PHASE1 HOSTED:"),
+        "expected a final status line"
+    );
+}

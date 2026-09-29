@@ -515,13 +515,118 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         None => None,
     };
 
+    // The direct map (`docs/cpu-core-proposal.md` §4.6, `crate::directmap`)
+    // is disabled by `--no-direct-map` or by any of the three diagnostics
+    // that intercept bus accesses -- the same set `bus.rs`'s `Bus.5` doc
+    // comment names, read here (not where those diagnostics' own booleans
+    // are computed further down) because RAM's allocation strategy below
+    // depends on this decision and must be made before `MachineBus`
+    // borrows either buffer. `SERIAL_REG_TRACE`/`BUS_COVERAGE` are read
+    // once, here, for exactly that reason; `serial_trace_enabled`/
+    // `bus_coverage_enabled` further down re-derive the same env vars
+    // (cheap, side-effect-free, and keeps each one declared next to the
+    // diagnostic it gates, matching the existing style) rather than
+    // threading this value back out.
+    // `--direct-map auto` (the default) resolves by build profile: the
+    // map is a measured ~12% busy-MIPS win in release but a pure
+    // pessimization at opt-level 0, where its per-access dispatch never
+    // inlines -- enough added guest-execution latency to break the
+    // debug-profile suite's Wait-5 wall-clock gate (`docs/
+    // direct-mapping.md`, "Default policy"). The split is loud, never
+    // silent: the diag lines below say what was decided and why on
+    // every run.
+    let mode_requested = match args.direct_map {
+        crate::cli::DirectMapMode::On => true,
+        crate::cli::DirectMapMode::Off => false,
+        crate::cli::DirectMapMode::Auto => cfg!(not(debug_assertions)),
+    };
+    let interceptor_active = args.blitter_trace.is_some()
+        || std::env::var_os("SERIAL_REG_TRACE").is_some()
+        || std::env::var_os("BUS_COVERAGE").is_some()
+        // `--cpu-backend batch` too: its `FastMem` raw-pointer window
+        // over fast RAM's primary view and the direct map's alias view
+        // are in principle coherent (same `MAP_SHARED` pages), but no
+        // gate exercises that combination, and the conservative posture
+        // keeps `batch` byte-identical to its pre-direct-map behaviour.
+        // Revisit only if batch+direct-map is ever wanted *and* tested.
+        || args.cpu_backend == crate::cli::CpuBackend::Batch;
+    let direct_map_wanted = mode_requested && !interceptor_active;
+    if direct_map_wanted {
+        console.diag(&format!(
+            "direct-map: on ({})",
+            match args.direct_map {
+                crate::cli::DirectMapMode::On => "--direct-map on",
+                _ => "auto: release build",
+            }
+        ));
+    } else if mode_requested && interceptor_active {
+        console.diag(
+            "direct-map: off (an access-intercepting diagnostic or --cpu-backend batch \
+             is active; those always win -- see --direct-map's own doc comment)",
+        );
+    } else {
+        console.diag(&format!(
+            "direct-map: off ({})",
+            match args.direct_map {
+                crate::cli::DirectMapMode::Off => "--direct-map off",
+                _ => "auto: debug build",
+            }
+        ));
+    }
+
     // Heap-allocate: a 2 MB array built on the stack overflows a default
     // thread stack (the same pitfall `machine-core`'s own tests document).
-    let mut chip_ram: Box<[u8; CHIP_RAM_SIZE]> =
-        match vec![0u8; CHIP_RAM_SIZE].into_boxed_slice().try_into() {
-            Ok(b) => b,
-            Err(_) => unreachable!("boxed_slice has exactly CHIP_RAM_SIZE elements"),
-        };
+    //
+    // When the direct map is wanted, chip RAM is backed by a POSIX
+    // shared-memory region instead of a plain `Box` (`directmap.rs`'s
+    // module docs, "The RAM aliasing argument"): the region's primary
+    // `MAP_SHARED` view is exactly the `&mut [u8; CHIP_RAM_SIZE]`
+    // `MachineBus` borrows below, unchanged from the `Box` it replaces,
+    // and the *same* region is aliased a second time into the direct
+    // map's reservation once that's built further down.
+    //
+    // Exactly one of `chip_ram_box`/`chip_shm` is populated, chosen once
+    // here and never changed; both are declared in this outer scope (not
+    // inside the `if`) so whichever one is live outlives `bus` the same
+    // way the old unconditional `chip_ram: Box<...>` did -- dropped at
+    // the end of this function's scope, after every use of the direct
+    // map below. `direct_map_enabled` narrows `direct_map_wanted` by
+    // whether the shm allocation actually succeeded; the direct map
+    // itself is only built (further down) when this is true.
+    let mut chip_ram_box: Option<Box<[u8; CHIP_RAM_SIZE]>> = None;
+    let mut chip_shm: Option<crate::directmap::ShmRegion> = None;
+    let mut direct_map_enabled = direct_map_wanted;
+    if direct_map_wanted {
+        match crate::directmap::ShmRegion::create(CHIP_RAM_SIZE) {
+            Ok(shm) => chip_shm = Some(shm),
+            Err(e) => {
+                eprintln!(
+                    "direct map: creating chip RAM's shared-memory region failed, falling back \
+                     to a plain allocation with the direct map disabled: {e}"
+                );
+                direct_map_enabled = false;
+            }
+        }
+    }
+    if chip_shm.is_none() {
+        chip_ram_box = Some(
+            match vec![0u8; CHIP_RAM_SIZE].into_boxed_slice().try_into() {
+                Ok(b) => b,
+                Err(_) => unreachable!("boxed_slice has exactly CHIP_RAM_SIZE elements"),
+            },
+        );
+    }
+    // SAFETY (the `as_mut_slice` call only): `chip_shm`, when present, is
+    // this function's own fresh region; the returned slice is borrowed
+    // for the rest of this function's scope, the same lifetime shape the
+    // `Box` branch's `&mut *chip_ram_box` has.
+    let chip_ram: &mut [u8; CHIP_RAM_SIZE] = match (&mut chip_shm, &mut chip_ram_box) {
+        (Some(shm), None) => (unsafe { shm.as_mut_slice() })
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("ShmRegion::create(CHIP_RAM_SIZE) sized it")),
+        (None, Some(b)) => &mut *b,
+        _ => unreachable!("exactly one of chip_shm/chip_ram_box is populated above"),
+    };
 
     // Opened before `machine_bus` (which borrows it, `with_hostblk`'s
     // `&'a mut`) and outside the `Option` match below so the file, once
@@ -598,10 +703,42 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     // `cli.rs`'s own doc comment) must leave the AUTOCONFIG chain -- and
     // so every baseline that predates fast RAM -- untouched, the same
     // guarantee `MachineBus::with_fast_ram`'s doc comment gives.
-    let mut fast_ram: Vec<u8> = if args.fast_ram_mb > 0 {
-        vec![0u8; args.fast_ram_mb as usize * 1024 * 1024]
-    } else {
-        Vec::new()
+    //
+    // Same shm-vs-plain-allocation split as chip RAM above, for the same
+    // reason (`directmap.rs`'s module docs): only attempted at all when
+    // fast RAM is actually requested, since a `0`-byte shm region is a
+    // pointless syscall round trip `Vec::new()` already handles for
+    // free. `fast_shm`'s fd feeds `DirectMap::new`/`sync` below whenever
+    // AUTOCONFIG later places this board; the alias itself is not mapped
+    // here (fast RAM isn't placed yet at construction time -- that's a
+    // guest AUTOCONFIG write, `directmap.rs`'s module docs on
+    // `DirectMap::sync`).
+    let mut fast_ram_vec: Vec<u8> = Vec::new();
+    let mut fast_shm: Option<crate::directmap::ShmRegion> = None;
+    if args.fast_ram_mb > 0 {
+        let len = args.fast_ram_mb as usize * 1024 * 1024;
+        if direct_map_enabled {
+            match crate::directmap::ShmRegion::create(len) {
+                Ok(shm) => fast_shm = Some(shm),
+                Err(e) => {
+                    eprintln!(
+                        "direct map: creating fast RAM's shared-memory region failed, falling \
+                         back to a plain allocation for fast RAM only (chip RAM keeps whatever \
+                         its own attempt already chose): {e}"
+                    );
+                }
+            }
+        }
+        if fast_shm.is_none() {
+            fast_ram_vec = vec![0u8; len];
+        }
+    }
+    // SAFETY (the `as_mut_slice` call only): same reasoning as chip RAM's
+    // above -- `fast_shm`, when present, is this function's own fresh
+    // region, borrowed for the rest of this scope.
+    let fast_ram: &mut [u8] = match &mut fast_shm {
+        Some(shm) => unsafe { shm.as_mut_slice() },
+        None => &mut fast_ram_vec[..],
     };
 
     // `--rtgboard`'s geometry, parsed up front (a bad `WIDTHxHEIGHT` is a
@@ -711,7 +848,7 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     ];
     let mut pcibridge_vpci = pci::VirtualPciBus::new(&mut pcibridge_slots);
 
-    let machine_bus = MachineBus::new(&mut chip_ram, &rom_bytes);
+    let machine_bus = MachineBus::new(chip_ram, &rom_bytes);
     let machine_bus = match &ext_rom_bytes {
         Some(ext) => machine_bus.with_ext_rom(ext),
         None => machine_bus,
@@ -769,7 +906,7 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
             console.diag(&format!(
                 "fast-ram: {mb} MB, Zorro III AUTOCONFIG board (ERTF_MEMLIST)"
             ));
-            machine_bus.with_fast_ram(&mut fast_ram)
+            machine_bus.with_fast_ram(fast_ram)
         }
         _ => machine_bus,
     };
@@ -843,12 +980,42 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     // "diagnostic gated once, not re-checked per access" posture as
     // `SERIAL_REG_TRACE` above (`docs/bus-fast-path-plan.md` §3.5).
     let bus_coverage_enabled = std::env::var_os("BUS_COVERAGE").is_some();
+
+    // Built last among the pieces `Bus` bundles, once `machine_bus` is
+    // fully wired (every `.with_*` board above has already run) --
+    // `directmap.rs`'s classification asks `machine_bus.autoconfig`/
+    // `fast_ram_window`/`overlay` directly, so it needs the finished
+    // bus, not a partially-built one. `direct_map_enabled` already
+    // folded in `--no-direct-map` and the three interceptor flags
+    // (computed early, before RAM's allocation strategy needed to know
+    // this) plus whether chip RAM's own shm region actually came up; a
+    // fast-RAM shm failure does not disable the map (`fast_shm`'s own
+    // comment above), it just leaves fast RAM `Io`-only until (if ever)
+    // a plain allocation is added for it too -- not needed today since
+    // this only degrades gracefully to the pre-existing fallthrough
+    // path.
+    let mut direct_map: Option<crate::directmap::DirectMap> = None;
+    if direct_map_enabled {
+        let fast_fd = fast_shm.as_ref().map(|s| s.fd());
+        let chip_fd = chip_shm
+            .as_ref()
+            .expect("direct_map_enabled implies chip_shm creation already succeeded")
+            .fd();
+        match crate::directmap::DirectMap::new(chip_fd, fast_fd, &rom_bytes, &machine_bus) {
+            Ok(dm) => direct_map = Some(dm),
+            Err(e) => {
+                eprintln!("direct map: construction failed, falling back to disabled: {e}");
+            }
+        }
+    }
+
     let mut bus = Bus(
         machine_bus,
         blitter_trace,
         serial_trace_enabled,
         cpu_speed_max,
         bus_coverage_enabled.then(crate::bus::Coverage::default),
+        direct_map,
     );
 
     // `--cpu-backend batch` needs `--cpu-speed max`: cycle mode's

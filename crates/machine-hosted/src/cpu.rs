@@ -506,6 +506,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
         }
     }

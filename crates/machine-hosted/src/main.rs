@@ -10,6 +10,7 @@ mod bus;
 mod cli;
 mod console;
 mod cpu;
+mod directmap;
 mod hd_image;
 mod input_script;
 mod introspect;

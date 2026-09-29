@@ -530,6 +530,7 @@ dependencies = [
  "amiga-rdb",
  "amiga-rom",
  "clap",
+ "libc",
  "m68k",
  "machine-core",
  "png",

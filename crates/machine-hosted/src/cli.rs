@@ -340,6 +340,34 @@ pub struct Args {
     #[arg(long)]
     pub blitter_trace: Option<PathBuf>,
 
+    /// The direct address-space mapping (`docs/cpu-core-proposal.md` §4.6,
+    /// `crate::directmap`, `docs/direct-mapping.md`). `auto` (the default)
+    /// enables it in release builds and disables it in debug builds:
+    /// measured on the reference boot, the map is a ~12% busy-MIPS win in
+    /// release but a pure pessimization at opt-level 0 (its per-access
+    /// dispatch never inlines there), enough to stretch guest execution
+    /// latency and push `max_cpu_speed_boots_to_workbench_and_keeps_real_
+    /// time_across_wait_5`'s Wait-5 wall-clock bound past its +/-0.5s
+    /// margin in the debug-profile `--ignored` suite -- see
+    /// `docs/direct-mapping.md`'s "Default policy" section for the
+    /// numbers. The profile split is deliberately loud, not silent:
+    /// `run.rs` prints a `direct-map:` diag line stating on/off and why
+    /// on every run. `off` routes every bus access through `MachineBus`
+    /// unconditionally, exactly as this binary did before the direct map
+    /// existed (the A/B path, and the escape hatch for any host where the
+    /// POSIX `shm_open`/`mmap` reservation misbehaves -- construction
+    /// failure also falls back to off on its own). `on` forces it in any
+    /// profile -- the debug-suite direct-map gate uses this so the map
+    /// keeps real-ROM end-to-end coverage under `cargo test` despite the
+    /// `auto` default. Regardless of this flag, the map is forced off
+    /// whenever `SERIAL_REG_TRACE`, `--blitter-trace`, `BUS_COVERAGE`, or
+    /// `--cpu-backend batch` is active -- see `directmap.rs`'s module
+    /// docs for why those and the direct map are mutually exclusive
+    /// (`on` does not override them; the diag line says so when it
+    /// happens).
+    #[arg(long, value_enum, default_value_t = DirectMapMode::Auto)]
+    pub direct_map: DirectMapMode,
+
     /// Attach fast RAM (`machine_core::fastram`) over heap-allocated
     /// storage, sized in megabytes, and register its single Zorro III
     /// AUTOCONFIG board (`ERTF_MEMLIST` set, so `expansion.library` links
@@ -545,4 +573,18 @@ impl From<CpuModel> for m68k::CpuType {
             CpuModel::M68040 => m68k::CpuType::M68040,
         }
     }
+}
+
+/// `--direct-map`'s three modes -- see that flag's own doc comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum DirectMapMode {
+    /// On in release builds, off in debug builds (the measured
+    /// win-vs-pessimization split the flag's doc comment records).
+    Auto,
+    /// Forced on in any profile (still yields to the interceptor
+    /// diagnostics and `--cpu-backend batch`).
+    On,
+    /// Forced off: every access through `MachineBus`, the pre-direct-map
+    /// path.
+    Off,
 }

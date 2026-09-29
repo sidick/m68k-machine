@@ -7,8 +7,10 @@ second slice -- see `docs/deterministic-mode.md` for that mode itself
 (the run loop, the measured default, the re-baselined gates) and the
 note inline below on what it settled about this document's own
 speculation. Direct address-space mapping and the signal-fault cost
-measurement (the rest of C1) are still **not** part of either change and
-are not started.
+measurement (the rest of C1) are now implemented as C1's third slice --
+see `docs/direct-mapping.md` for both (the fault cost is a **macOS**
+figure; the Linux measurement §4.6 names is still outstanding), and its
+closing section for the honest item-by-item C1 exit accounting.
 
 **Where:** `crates/machine-hosted/src/cpu.rs`.
 

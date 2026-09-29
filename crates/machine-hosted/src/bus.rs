@@ -10,6 +10,7 @@ use m68k::{AddressBus, FastMem};
 use machine_core::MachineBus;
 
 use crate::blitter_trace::BlitterTrace;
+use crate::directmap::{DirectMap, ReadOutcome, WriteOutcome};
 
 /// Bus-access region, for the `BUS_COVERAGE` diagnostic (plan step 7.2):
 /// which memory region a CPU access lands in, split from whether it is
@@ -139,12 +140,22 @@ fn trace_serial(enabled: bool, kind: &str, address: u32, value: u16) {
 /// future caller of the plain hook-free `run_for_cycles` on this same
 /// `Bus` in cycle mode must still see `false` unconditionally, exactly
 /// today's behaviour.
+/// `.5` is the direct address-space mapping (`docs/cpu-core-proposal.md`
+/// §4.6, `crate::directmap`), `None` when it is disabled -- either by
+/// `--no-direct-map`, by construction failure (`run.rs` falls back with
+/// an `eprintln!`, never a panic), or automatically whenever any of the
+/// three interceptors above (`.1`/`.2`/`.4`) is active, the same posture
+/// `fast_mem()` below already takes for `.1`/`.2`: a diagnostic that
+/// watches specific bus accesses cannot coexist with a path that serves
+/// most accesses without ever calling into `self.0`. See `directmap.rs`'s
+/// module docs for the full design and the RAM-aliasing safety argument.
 pub struct Bus<'a>(
     pub MachineBus<'a>,
     pub Option<BlitterTrace>,
     pub bool,
     pub bool,
     pub Option<Coverage>,
+    pub Option<DirectMap>,
 );
 
 impl Bus<'_> {
@@ -212,6 +223,12 @@ impl AddressBus for Bus<'_> {
     }
 
     fn read_byte(&mut self, address: u32) -> u8 {
+        if let Some(dm) = &self.5 {
+            match dm.read_byte(address) {
+                ReadOutcome::Ram(v) | ReadOutcome::OpenBus(v) => return v,
+                ReadOutcome::Fallthrough => {}
+            }
+        }
         self.record(address, false);
         let value = self.0.read_byte(address);
         trace_serial(self.2, "Rb", address, value as u16);
@@ -219,6 +236,12 @@ impl AddressBus for Bus<'_> {
     }
 
     fn read_word(&mut self, address: u32) -> u16 {
+        if let Some(dm) = &self.5 {
+            match dm.read_word(address) {
+                ReadOutcome::Ram(v) | ReadOutcome::OpenBus(v) => return v,
+                ReadOutcome::Fallthrough => {}
+            }
+        }
         self.record(address, false);
         let value = self.0.read_word(address);
         trace_serial(self.2, "R", address, value);
@@ -226,26 +249,56 @@ impl AddressBus for Bus<'_> {
     }
 
     fn read_long(&mut self, address: u32) -> u32 {
+        if let Some(dm) = &self.5 {
+            match dm.read_long(address) {
+                ReadOutcome::Ram(v) | ReadOutcome::OpenBus(v) => return v,
+                ReadOutcome::Fallthrough => {}
+            }
+        }
         self.record(address, false);
         self.0.read_long(address)
     }
 
     fn write_byte(&mut self, address: u32, value: u8) {
+        if let Some(dm) = &mut self.5 {
+            match dm.write_byte(address, value) {
+                WriteOutcome::Ram | WriteOutcome::OpenBus => return,
+                WriteOutcome::Fallthrough => {}
+            }
+        }
         self.record(address, false);
         trace_serial(self.2, "Wb", address, value as u16);
         self.0.write_byte(address, value);
+        if let Some(dm) = &mut self.5 {
+            dm.sync(&self.0);
+        }
     }
 
     fn write_word(&mut self, address: u32, value: u16) {
+        if let Some(dm) = &mut self.5 {
+            match dm.write_word(address, value) {
+                WriteOutcome::Ram | WriteOutcome::OpenBus => return,
+                WriteOutcome::Fallthrough => {}
+            }
+        }
         self.record(address, false);
         if let Some(trace) = &mut self.1 {
             trace.observe_word(address, value);
         }
         trace_serial(self.2, "W", address, value);
         self.0.write_word(address, value);
+        if let Some(dm) = &mut self.5 {
+            dm.sync(&self.0);
+        }
     }
 
     fn write_long(&mut self, address: u32, value: u32) {
+        if let Some(dm) = &mut self.5 {
+            match dm.write_long(address, value) {
+                WriteOutcome::Ram | WriteOutcome::OpenBus => return,
+                WriteOutcome::Fallthrough => {}
+            }
+        }
         // Observed as the two word writes `MachineBus::write_long` itself
         // decomposes a long write into -- graphics.library commonly pokes
         // register pairs like `BLTCON0`/`BLTCON1` with one `MOVE.L`, so a
@@ -258,9 +311,18 @@ impl AddressBus for Bus<'_> {
         trace_serial(self.2, "W", address, (value >> 16) as u16);
         trace_serial(self.2, "W", address.wrapping_add(2), value as u16);
         self.0.write_long(address, value);
+        if let Some(dm) = &mut self.5 {
+            dm.sync(&self.0);
+        }
     }
 
     fn read_immediate_word(&mut self, address: u32) -> u16 {
+        if let Some(dm) = &self.5 {
+            match dm.read_word(address) {
+                ReadOutcome::Ram(v) | ReadOutcome::OpenBus(v) => return v,
+                ReadOutcome::Fallthrough => {}
+            }
+        }
         self.record(address, true);
         let value = self.0.read_word(address);
         trace_serial(self.2, "R", address, value);
@@ -268,6 +330,12 @@ impl AddressBus for Bus<'_> {
     }
 
     fn read_immediate_long(&mut self, address: u32) -> u32 {
+        if let Some(dm) = &self.5 {
+            match dm.read_long(address) {
+                ReadOutcome::Ram(v) | ReadOutcome::OpenBus(v) => return v,
+                ReadOutcome::Fallthrough => {}
+            }
+        }
         self.record(address, true);
         self.0.read_long(address)
     }
@@ -302,5 +370,228 @@ impl AddressBus for Bus<'_> {
             base,
             len: mem.len() as u32,
         })
+    }
+}
+
+#[cfg(test)]
+mod direct_map_differential {
+    //! Differential oracle (`docs/cpu-core-proposal.md` §4.6's C1 slice):
+    //! two otherwise-identical machines, one `Bus` with the direct map
+    //! on and one with it off, driven through the exact same sequence of
+    //! `AddressBus` calls, must produce byte-identical results at every
+    //! step. `crate::directmap`'s own unit tests check the page-type
+    //! table in isolation; this checks the two *paths* agree on actual
+    //! guest-visible behaviour, which is the property that matters.
+
+    use machine_core::{
+        autoconfig::{ec, AUTOCONFIG_BASE},
+        CHIP_RAM_END, CHIP_RAM_SIZE, CIA_BASE, CUSTOM_BASE, OVERLAY_END, ROM_BASE, ROM_WINDOW_SIZE,
+    };
+
+    use super::*;
+    use crate::directmap::{DirectMap, ShmRegion};
+
+    const FAST_LEN: usize = 256 * 1024;
+    const FAST_BASE: u32 = 0x4000_0000;
+
+    fn synthetic_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; ROM_WINDOW_SIZE];
+        for (i, b) in rom.iter_mut().enumerate() {
+            *b = (i % 251) as u8 ^ 0xA5;
+        }
+        rom
+    }
+
+    /// Build a plain (non-direct-map) `Bus` over its own chip RAM, ROM
+    /// and fast RAM, all owned by the caller's frame.
+    fn plain_bus<'a>(
+        chip: &'a mut Box<[u8; CHIP_RAM_SIZE]>,
+        rom: &'a [u8],
+        fast: &'a mut [u8],
+    ) -> Bus<'a> {
+        let mb = MachineBus::new(chip, rom).with_fast_ram(fast);
+        Bus(mb, None, false, false, None, None)
+    }
+
+    /// Build a direct-map `Bus` over its own shm-backed chip RAM, ROM
+    /// and fast RAM.
+    fn direct_bus<'a>(chip: &'a mut ShmRegion, rom: &'a [u8], fast: &'a mut ShmRegion) -> Bus<'a> {
+        let chip_fd = chip.fd();
+        let fast_fd = fast.fd();
+        // SAFETY: test-only, single-threaded; `chip`/`fast` outlive the
+        // returned `Bus` (both are borrowed from the caller's frame,
+        // which also owns the `DirectMap` built from the same fds).
+        let chip_slice: &mut [u8; CHIP_RAM_SIZE] =
+            unsafe { chip.as_mut_slice() }.try_into().unwrap();
+        let fast_slice: &mut [u8] = unsafe { fast.as_mut_slice() };
+        let mb = MachineBus::new(chip_slice, rom).with_fast_ram(fast_slice);
+        let dm = DirectMap::new(chip_fd, Some(fast_fd), rom, &mb)
+            .expect("direct map construction must succeed in this test environment");
+        Bus(mb, None, false, false, None, Some(dm))
+    }
+
+    /// Configure fast RAM at [`FAST_BASE`] and clear the ROM overlay on
+    /// `bus`, via real guest-visible writes (`AddressBus::write_byte`),
+    /// exactly the way the guest's own AUTOCONFIG ROM and CIA-A PRA
+    /// write would -- never by poking a private field, per this
+    /// project's standing rule.
+    fn configure(bus: &mut Bus) {
+        AddressBus::write_byte(
+            bus,
+            AUTOCONFIG_BASE + ec::Z3_BASEADDRESS,
+            (FAST_BASE >> 24) as u8,
+        );
+        AddressBus::write_byte(
+            bus,
+            AUTOCONFIG_BASE + ec::Z3_BASEADDRESS + 1,
+            (FAST_BASE >> 16) as u8,
+        );
+        AddressBus::write_byte(bus, 0x00BF_E001, 0x00); // OVL clear
+    }
+
+    /// Every address this differential sweeps, covering every region
+    /// and edge case §4.6 and this milestone's brief call out: chip
+    /// start/end, both sides of the overlay boundary, the fast RAM
+    /// base/end/clamp edge, ROM, the custom-chip page, a CIA register,
+    /// the AUTOCONFIG window, and deep open bus.
+    fn sweep_addresses() -> Vec<u32> {
+        vec![
+            0x0000_0000,                           // chip start (overlay boundary too)
+            OVERLAY_END - 2,                       // straddles the overlay boundary
+            OVERLAY_END,                           // first non-overlay chip page
+            CHIP_RAM_END - 4,                      // chip end
+            ROM_BASE,                              // ROM start
+            ROM_BASE + ROM_WINDOW_SIZE as u32 - 4, // ROM end
+            CIA_BASE,                              // CIA register space
+            CUSTOM_BASE,                           // custom chip page
+            AUTOCONFIG_BASE,                       // AUTOCONFIG config window
+            FAST_BASE,                             // fast RAM start
+            FAST_BASE + FAST_LEN as u32 - 4,       // fast RAM end (still backed)
+            FAST_BASE + FAST_LEN as u32,           // just past the clamp -- declared but unbacked
+            0x0050_0000,                           // deep open bus
+        ]
+    }
+
+    #[test]
+    fn direct_map_matches_machine_bus_byte_for_byte() {
+        let rom = synthetic_rom();
+
+        let mut plain_chip: Box<[u8; CHIP_RAM_SIZE]> = vec![0u8; CHIP_RAM_SIZE]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap();
+        let mut plain_fast = vec![0u8; FAST_LEN];
+        let mut plain = plain_bus(&mut plain_chip, &rom, &mut plain_fast[..]);
+
+        let mut direct_chip = ShmRegion::create(CHIP_RAM_SIZE).unwrap();
+        let mut direct_fast = ShmRegion::create(FAST_LEN).unwrap();
+        let mut direct = direct_bus(&mut direct_chip, &rom, &mut direct_fast);
+
+        // Overlay ON (both `Bus`es start this way, `MachineBus::new`'s
+        // own contract): sweep the low chip-RAM range, which must read
+        // ROM's shadow through both paths, *before* it's ever cleared --
+        // this is the one state transition `configure` below leaves
+        // this test blind to if skipped, since `configure` always
+        // clears the overlay as one of its first acts.
+        assert!(plain.0.overlay());
+        assert!(direct.0.overlay());
+        for addr in [0x0000_0000u32, OVERLAY_END - 2, OVERLAY_END - 4] {
+            for width in [1u32, 2, 4] {
+                let (pb, db) = read_width(&mut plain, &mut direct, addr, width);
+                assert_eq!(
+                    pb, db,
+                    "overlay-on read mismatch at {addr:#010x} width {width}"
+                );
+            }
+        }
+
+        configure(&mut plain);
+        configure(&mut direct);
+        assert_eq!(plain.0.overlay(), direct.0.overlay());
+        assert!(!plain.0.overlay());
+        assert_eq!(plain.0.fast_ram_window(), direct.0.fast_ram_window());
+
+        // Overlay OFF now: the same low chip-RAM addresses must agree
+        // again, this time reading real (still-zeroed) chip RAM rather
+        // than ROM's shadow -- the other half of the on/off transition.
+        for addr in [0x0000_0000u32, OVERLAY_END - 2, OVERLAY_END - 4] {
+            for width in [1u32, 2, 4] {
+                let (pb, db) = read_width(&mut plain, &mut direct, addr, width);
+                assert_eq!(
+                    pb, db,
+                    "overlay-off read mismatch at {addr:#010x} width {width}"
+                );
+            }
+        }
+
+        for &addr in &sweep_addresses() {
+            for width in [1u32, 2, 4] {
+                // Read-before-write, both paths, must already agree
+                // (covers ROM and open bus, which are never written).
+                let (pb, db) = read_width(&mut plain, &mut direct, addr, width);
+                assert_eq!(
+                    pb, db,
+                    "pre-write read mismatch at {addr:#010x} width {width}"
+                );
+
+                // Write a value derived from the address/width (so
+                // different sweep entries don't coincidentally share a
+                // value), then read back through both paths again.
+                let value = addr.wrapping_mul(2654435761).wrapping_add(width);
+                write_width(&mut plain, &mut direct, addr, width, value);
+                let (pb2, db2) = read_width(&mut plain, &mut direct, addr, width);
+                assert_eq!(
+                    pb2, db2,
+                    "post-write readback mismatch at {addr:#010x} width {width}"
+                );
+            }
+        }
+
+        // Wraparound: the last byte of a multi-byte access at the very
+        // top of the address space overflows `u32` and must fall
+        // through on the direct-map side, landing on whatever
+        // `MachineBus` itself does with it (both paths must still
+        // agree).
+        for width in [2u32, 4] {
+            let addr = 0xFFFF_FFFF - (width - 2);
+            let (pb, db) = read_width(&mut plain, &mut direct, addr, width);
+            assert_eq!(pb, db, "wraparound read mismatch width {width}");
+        }
+    }
+
+    fn read_width(plain: &mut Bus, direct: &mut Bus, addr: u32, width: u32) -> (u32, u32) {
+        match width {
+            1 => (
+                AddressBus::read_byte(plain, addr) as u32,
+                AddressBus::read_byte(direct, addr) as u32,
+            ),
+            2 => (
+                AddressBus::read_word(plain, addr) as u32,
+                AddressBus::read_word(direct, addr) as u32,
+            ),
+            4 => (
+                AddressBus::read_long(plain, addr),
+                AddressBus::read_long(direct, addr),
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    fn write_width(plain: &mut Bus, direct: &mut Bus, addr: u32, width: u32, value: u32) {
+        match width {
+            1 => {
+                AddressBus::write_byte(plain, addr, value as u8);
+                AddressBus::write_byte(direct, addr, value as u8);
+            }
+            2 => {
+                AddressBus::write_word(plain, addr, value as u16);
+                AddressBus::write_word(direct, addr, value as u16);
+            }
+            4 => {
+                AddressBus::write_long(plain, addr, value);
+                AddressBus::write_long(direct, addr, value);
+            }
+            _ => unreachable!(),
+        }
     }
 }
