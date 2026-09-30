@@ -294,6 +294,37 @@ Linux's direct `SIGSEGV` path, so treat every number below as a likely
 milestone first runs on a Linux host. Do not record these numbers in
 a Linux slot.
 
+**Linux hand-off (reviewed 2026-09-29, C1 close-out).** What the
+harness needs before it can be run on a Linux box or KVM guest,
+recorded here so whoever has that host does not rediscover it:
+
+- `fault_cost.rs` has **no `cfg` gating today**: `DarwinUcontext`/
+  `DarwinMcontext64` are hand-declared local structs, so the file
+  *compiles* on Linux as-is but the `MODE_PC_ADVANCE` handler's cast
+  (`ctx as *mut DarwinUcontext`, then `ss.pc += 4`) would be
+  wrong-layout undefined behaviour there. It must not be run on Linux
+  unmodified. Gating the Darwin structs
+  `#[cfg(all(target_os = "macos", target_arch = "aarch64"))]` and
+  adding a `compile_error!` fallback for unported combinations would
+  make the trap impossible rather than merely documented.
+- The Linux/aarch64 port is small: unlike Apple targets, the `libc`
+  crate *does* define `ucontext_t` for `linux`/`aarch64`, with an
+  inline `uc_mcontext` whose `pc` field is directly assignable -- the
+  PC-advance arm becomes
+  `(*(ctx as *mut libc::ucontext_t)).uc_mcontext.pc += 4`, a
+  cfg-gated helper of a few lines.
+- Linux/x86-64 is more work, flagged rather than attempted: the PC
+  lives at `uc_mcontext.gregs[libc::REG_RIP]`, and the fixed `+= 4`
+  skip is AArch64-only -- x86's variable-length instructions mean the
+  harness would need to know (or decode) the faulting store's length.
+- Everything else in the harness is portable libc and needs no
+  change: `sigaction`/`SA_SIGINFO`, `mmap`/`mprotect`, `MAP_ANON`,
+  `sysconf(_SC_PAGESIZE)` (16 KiB pages here, 4 KiB typical on
+  Linux -- the harness already reads it at runtime), and both SIGBUS
+  and SIGSEGV are already installed with observed-signal reporting,
+  so Linux delivering SIGSEGV where macOS delivers SIGBUS is
+  reported, not a surprise.
+
 Harness: `crates/machine-hosted/src/bin/fault_cost.rs`; full run is
 `cargo build --release -p machine-hosted --bin fault_cost &&
 ./target/release/fault_cost`, strictly serial. Measured 2026-09-29:
@@ -353,6 +384,13 @@ commits the split either way, which is all §4.6 asks of C1.
   where that hook will hang.
 
 ## C1 exit, assessed honestly
+
+**Superseded (2026-09-30):** this assessment was written at the direct-
+mapping slice, when the replay recorder/player did not yet exist and the
+gate conversion was partial. Both have since been finished --
+`docs/replay-log.md` carries the current item-by-item C1 exit
+assessment; the text below is kept as the record of where C1 stood at
+this slice.
 
 §8's C1 exit: *"m68k-rs runs through the trait in both timing modes,
 producing replay logs; gates pass in the new deterministic mode; fault

@@ -16,6 +16,7 @@ mod input_script;
 mod introspect;
 mod netharness;
 mod pktvol;
+mod replay;
 mod rom_image;
 mod run;
 mod screenshot;

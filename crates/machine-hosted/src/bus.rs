@@ -10,7 +10,8 @@ use m68k::{AddressBus, FastMem};
 use machine_core::MachineBus;
 
 use crate::blitter_trace::BlitterTrace;
-use crate::directmap::{DirectMap, ReadOutcome, WriteOutcome};
+use crate::directmap::{DirectMap, PageType, ReadOutcome, WriteOutcome};
+use crate::replay::{Player, Recorder};
 
 /// Bus-access region, for the `BUS_COVERAGE` diagnostic (plan step 7.2):
 /// which memory region a CPU access lands in, split from whether it is
@@ -149,6 +150,20 @@ fn trace_serial(enabled: bool, kind: &str, address: u32, value: u16) {
 /// watches specific bus accesses cannot coexist with a path that serves
 /// most accesses without ever calling into `self.0`. See `directmap.rs`'s
 /// module docs for the full design and the RAM-aliasing safety argument.
+/// `.6` is the record/replay recorder (`docs/cpu-core-proposal.md` §5.3,
+/// `crate::replay`, `docs/replay-log.md`), `.7` its player -- `--record`/
+/// `--replay`, `None`/`None` on a plain run (every existing baseline).
+/// Constructed exactly like `.5`: after `machine_bus` is fully wired, and
+/// mutually vetoing the direct map the same way the three pre-existing
+/// interceptors do (`run.rs`'s own diag line says so) -- a recorder or
+/// player needs to see every access at the classification granularity
+/// its own table decides, which the direct map's `PROT_NONE` fast path
+/// would bypass entirely for `Ram`/`Rom`/`OpenBus` pages. At most one of
+/// `.6`/`.7` is ever `Some` at once (`run.rs` refuses `--record` and
+/// `--replay` together); both fields exist rather than one `enum` so
+/// `bus.rs`'s access-rule code below reads the same way `.1`/`.2`/`.4`/`.5`
+/// already do (one `if let Some` per concern, not a match over a
+/// three-state enum every call site would otherwise need).
 pub struct Bus<'a>(
     pub MachineBus<'a>,
     pub Option<BlitterTrace>,
@@ -156,6 +171,8 @@ pub struct Bus<'a>(
     pub bool,
     pub Option<Coverage>,
     pub Option<DirectMap>,
+    pub Option<Recorder>,
+    pub Option<Player>,
 );
 
 impl Bus<'_> {
@@ -210,6 +227,129 @@ impl Bus<'_> {
     }
 }
 
+/// Serve one read through an active [`Player`]: classify with the
+/// player's own table (never `MachineBus`'s, which the player treats as
+/// stale for anything but a pure `Rom` read), and dispatch per
+/// `docs/replay-log.md`'s access rules. `width` is `1`/`2`/`4`; the
+/// returned value is widened into the low bits of a `u32` the same way
+/// every read path in this file already does. On any divergence, the
+/// mismatch is recorded on `player` (never panics or aborts here --
+/// `AddressBus`'s signature has nowhere to return a `Result`) and a
+/// best-effort `0` is returned so execution can continue long enough for
+/// `run.rs`'s outer loop to notice and report it, per the milestone
+/// brief's "reported immediately" (checked right after the retiring
+/// instruction's hook call, the earliest point outside this trait
+/// implementation that can act on it).
+fn replay_read(player: &mut Player, bus: &mut MachineBus, address: u32, width: u8) -> u32 {
+    let pc = LAST_PC.load(Ordering::Relaxed);
+    match player.classify(address) {
+        PageType::Rom => crate::replay::read_rom_value(bus, address, width),
+        PageType::OpenBus => crate::replay::open_bus_read(width),
+        PageType::Ram => {
+            let ordinal = player.ordinal();
+            match player.read_ram(bus, address, width, ordinal, pc) {
+                Ok(v) => v,
+                Err(e) => {
+                    player.record_divergence(*e);
+                    0
+                }
+            }
+        }
+        PageType::Io => match player.expect_io_read(address, width, pc) {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                player.record_divergence(*e);
+                0
+            }
+            Err(io_err) => {
+                player.record_divergence(crate::replay::Divergence::LogIoError(io_err.to_string()));
+                0
+            }
+        },
+    }
+}
+
+/// Whether an `Io`-classified write must still be applied to the
+/// player's own (otherwise-dead) `MachineBus`, rather than discarded --
+/// found and fixed against a real boot recording (`docs/replay-log.md`'s
+/// "A real bug, found and fixed" section), not part of the original
+/// design. Two ranges qualify, both "administrative" in the sense that
+/// applying them is pure bookkeeping this crate's own address-decode
+/// logic needs to stay correct, not "servicing a live device" the way a
+/// CIA timer, a custom-chip register, or a hostblk/pktport/pcibridge
+/// doorbell would be:
+///
+/// - **Chip RAM while the overlay is mapped.** `classify` types this `Io`
+///   (not `Ram`) because *reads* there are redirected to ROM's shadow
+///   while the overlay is active -- but *writes* always land on the real
+///   chip-RAM cells underneath regardless of overlay
+///   (`machine_core::MachineBus`'s own module docs: "the low `OVERLAY_END`
+///   bytes read ROM and write chip RAM"). A discarded write here would
+///   leave those cells zero forever, even though a later
+///   `ClassificationTransition` (once overlay clears) retypes the exact
+///   same addresses `Ram` and serves them straight from `GuestMemory` --
+///   silently wrong data the first time anything reads back what an
+///   overlay-era write stored (early boot's own stack and locals, in
+///   practice).
+/// - **The AUTOCONFIG config window.** `MachineBus`'s own AUTOCONFIG
+///   state machine (board placement, `fast_ram_window`) is exactly what
+///   [`Player::classify`]'s `Ram` case for fast RAM needs `GuestMemory`
+///   to resolve correctly on this side too -- discarding these writes
+///   would leave the player's own bus never learning where fast RAM
+///   lives, so a `Ram`-classified fast-RAM access would find no backing
+///   region and report a spurious divergence. Replaying the exact same,
+///   already-log-validated configuration sequence is safe: it is pure
+///   address-decode bookkeeping, not a side effect only a live device
+///   could reproduce.
+///
+/// Every other `Io` address (custom chips, CIA registers proper, every
+/// AUTOCONFIG-placed board's own register/doorbell window) keeps the
+/// original "compare against the log, then discard" rule: there is no
+/// live device on this side to apply those to, and applying them could
+/// re-trigger work (a blit, a DMA doorbell) a dead device model cannot
+/// perform correctly.
+fn replay_write_must_apply(address: u32) -> bool {
+    (machine_core::CHIP_RAM_BASE..machine_core::CHIP_RAM_END).contains(&address)
+        || (machine_core::autoconfig::AUTOCONFIG_BASE..machine_core::autoconfig::AUTOCONFIG_END)
+            .contains(&address)
+}
+
+/// Write counterpart of [`replay_read`]. `Ram` writes are the CPU's own
+/// instruction stream re-executing (not device DMA, which arrives via
+/// `DeviceWrite` events instead) -- applied directly to the player's
+/// `GuestMemory`, bypassing `MachineBus`'s possibly-stale overlay state.
+/// `Io` writes are compared against the log and, except for
+/// [`replay_write_must_apply`]'s two administrative ranges, always
+/// discarded -- there is no live device on this side to apply them to.
+fn replay_write(player: &mut Player, bus: &mut MachineBus, address: u32, width: u8, value: u32) {
+    let pc = LAST_PC.load(Ordering::Relaxed);
+    match player.classify(address) {
+        PageType::Rom | PageType::OpenBus => {}
+        PageType::Ram => {
+            let ordinal = player.ordinal();
+            if let Err(e) = player.write_ram(bus, address, width, value, ordinal, pc) {
+                player.record_divergence(*e);
+            }
+        }
+        PageType::Io => {
+            match player.expect_io_write(address, width, value, pc) {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => player.record_divergence(*e),
+                Err(io_err) => player
+                    .record_divergence(crate::replay::Divergence::LogIoError(io_err.to_string())),
+            }
+            if replay_write_must_apply(address) {
+                match width {
+                    1 => bus.write_byte(address, value as u8),
+                    2 => bus.write_word(address, value as u16),
+                    4 => bus.write_long(address, value),
+                    _ => unreachable!("width is always 1, 2 or 4"),
+                }
+            }
+        }
+    }
+}
+
 impl AddressBus for Bus<'_> {
     fn take_boundary_request(&mut self) -> bool {
         // `.3`'s own doc comment: only max mode ever asks `MachineBus`,
@@ -223,6 +363,9 @@ impl AddressBus for Bus<'_> {
     }
 
     fn read_byte(&mut self, address: u32) -> u8 {
+        if let Some(player) = &mut self.7 {
+            return replay_read(player, &mut self.0, address, 1) as u8;
+        }
         if let Some(dm) = &self.5 {
             match dm.read_byte(address) {
                 ReadOutcome::Ram(v) | ReadOutcome::OpenBus(v) => return v,
@@ -232,10 +375,18 @@ impl AddressBus for Bus<'_> {
         self.record(address, false);
         let value = self.0.read_byte(address);
         trace_serial(self.2, "Rb", address, value as u16);
+        if let Some(rec) = &mut self.6 {
+            if rec.classify(address) == PageType::Io {
+                let _ = rec.log_io_read(address, 1, value as u32);
+            }
+        }
         value
     }
 
     fn read_word(&mut self, address: u32) -> u16 {
+        if let Some(player) = &mut self.7 {
+            return replay_read(player, &mut self.0, address, 2) as u16;
+        }
         if let Some(dm) = &self.5 {
             match dm.read_word(address) {
                 ReadOutcome::Ram(v) | ReadOutcome::OpenBus(v) => return v,
@@ -245,10 +396,18 @@ impl AddressBus for Bus<'_> {
         self.record(address, false);
         let value = self.0.read_word(address);
         trace_serial(self.2, "R", address, value);
+        if let Some(rec) = &mut self.6 {
+            if rec.classify(address) == PageType::Io {
+                let _ = rec.log_io_read(address, 2, value as u32);
+            }
+        }
         value
     }
 
     fn read_long(&mut self, address: u32) -> u32 {
+        if let Some(player) = &mut self.7 {
+            return replay_read(player, &mut self.0, address, 4);
+        }
         if let Some(dm) = &self.5 {
             match dm.read_long(address) {
                 ReadOutcome::Ram(v) | ReadOutcome::OpenBus(v) => return v,
@@ -256,10 +415,20 @@ impl AddressBus for Bus<'_> {
             }
         }
         self.record(address, false);
-        self.0.read_long(address)
+        let value = self.0.read_long(address);
+        if let Some(rec) = &mut self.6 {
+            if rec.classify(address) == PageType::Io {
+                let _ = rec.log_io_read(address, 4, value);
+            }
+        }
+        value
     }
 
     fn write_byte(&mut self, address: u32, value: u8) {
+        if let Some(player) = &mut self.7 {
+            replay_write(player, &mut self.0, address, 1, value as u32);
+            return;
+        }
         if let Some(dm) = &mut self.5 {
             match dm.write_byte(address, value) {
                 WriteOutcome::Ram | WriteOutcome::OpenBus => return,
@@ -267,14 +436,26 @@ impl AddressBus for Bus<'_> {
             }
         }
         self.record(address, false);
+        if let Some(rec) = &mut self.6 {
+            if rec.classify(address) == PageType::Io {
+                let _ = rec.log_io_write(address, 1, value as u32);
+            }
+        }
         trace_serial(self.2, "Wb", address, value as u16);
         self.0.write_byte(address, value);
         if let Some(dm) = &mut self.5 {
             dm.sync(&self.0);
         }
+        if let Some(rec) = &mut self.6 {
+            let _ = rec.maybe_transition(&self.0);
+        }
     }
 
     fn write_word(&mut self, address: u32, value: u16) {
+        if let Some(player) = &mut self.7 {
+            replay_write(player, &mut self.0, address, 2, value as u32);
+            return;
+        }
         if let Some(dm) = &mut self.5 {
             match dm.write_word(address, value) {
                 WriteOutcome::Ram | WriteOutcome::OpenBus => return,
@@ -285,14 +466,26 @@ impl AddressBus for Bus<'_> {
         if let Some(trace) = &mut self.1 {
             trace.observe_word(address, value);
         }
+        if let Some(rec) = &mut self.6 {
+            if rec.classify(address) == PageType::Io {
+                let _ = rec.log_io_write(address, 2, value as u32);
+            }
+        }
         trace_serial(self.2, "W", address, value);
         self.0.write_word(address, value);
         if let Some(dm) = &mut self.5 {
             dm.sync(&self.0);
         }
+        if let Some(rec) = &mut self.6 {
+            let _ = rec.maybe_transition(&self.0);
+        }
     }
 
     fn write_long(&mut self, address: u32, value: u32) {
+        if let Some(player) = &mut self.7 {
+            replay_write(player, &mut self.0, address, 4, value);
+            return;
+        }
         if let Some(dm) = &mut self.5 {
             match dm.write_long(address, value) {
                 WriteOutcome::Ram | WriteOutcome::OpenBus => return,
@@ -308,15 +501,26 @@ impl AddressBus for Bus<'_> {
             trace.observe_word(address, (value >> 16) as u16);
             trace.observe_word(address.wrapping_add(2), value as u16);
         }
+        if let Some(rec) = &mut self.6 {
+            if rec.classify(address) == PageType::Io {
+                let _ = rec.log_io_write(address, 4, value);
+            }
+        }
         trace_serial(self.2, "W", address, (value >> 16) as u16);
         trace_serial(self.2, "W", address.wrapping_add(2), value as u16);
         self.0.write_long(address, value);
         if let Some(dm) = &mut self.5 {
             dm.sync(&self.0);
         }
+        if let Some(rec) = &mut self.6 {
+            let _ = rec.maybe_transition(&self.0);
+        }
     }
 
     fn read_immediate_word(&mut self, address: u32) -> u16 {
+        if let Some(player) = &mut self.7 {
+            return replay_read(player, &mut self.0, address, 2) as u16;
+        }
         if let Some(dm) = &self.5 {
             match dm.read_word(address) {
                 ReadOutcome::Ram(v) | ReadOutcome::OpenBus(v) => return v,
@@ -326,10 +530,18 @@ impl AddressBus for Bus<'_> {
         self.record(address, true);
         let value = self.0.read_word(address);
         trace_serial(self.2, "R", address, value);
+        if let Some(rec) = &mut self.6 {
+            if rec.classify(address) == PageType::Io {
+                let _ = rec.log_io_read(address, 2, value as u32);
+            }
+        }
         value
     }
 
     fn read_immediate_long(&mut self, address: u32) -> u32 {
+        if let Some(player) = &mut self.7 {
+            return replay_read(player, &mut self.0, address, 4);
+        }
         if let Some(dm) = &self.5 {
             match dm.read_long(address) {
                 ReadOutcome::Ram(v) | ReadOutcome::OpenBus(v) => return v,
@@ -337,7 +549,13 @@ impl AddressBus for Bus<'_> {
             }
         }
         self.record(address, true);
-        self.0.read_long(address)
+        let value = self.0.read_long(address);
+        if let Some(rec) = &mut self.6 {
+            if rec.classify(address) == PageType::Io {
+                let _ = rec.log_io_read(address, 4, value);
+            }
+        }
+        value
     }
 
     /// Direct window into fast RAM's placed AUTOCONFIG window, for
@@ -350,7 +568,7 @@ impl AddressBus for Bus<'_> {
     /// range could move, so both are checked unconditionally rather than
     /// reasoned about address-range by address-range here.
     fn fast_mem(&mut self) -> Option<FastMem> {
-        if self.2 || self.1.is_some() {
+        if self.2 || self.1.is_some() || self.6.is_some() || self.7.is_some() {
             return None;
         }
         let (base, mem) = self.0.fast_ram_window_mut()?;
@@ -410,7 +628,7 @@ mod direct_map_differential {
         fast: &'a mut [u8],
     ) -> Bus<'a> {
         let mb = MachineBus::new(chip, rom).with_fast_ram(fast);
-        Bus(mb, None, false, false, None, None)
+        Bus(mb, None, false, false, None, None, None, None)
     }
 
     /// Build a direct-map `Bus` over its own shm-backed chip RAM, ROM
@@ -427,7 +645,7 @@ mod direct_map_differential {
         let mb = MachineBus::new(chip_slice, rom).with_fast_ram(fast_slice);
         let dm = DirectMap::new(chip_fd, Some(fast_fd), rom, &mb)
             .expect("direct map construction must succeed in this test environment");
-        Bus(mb, None, false, false, None, Some(dm))
+        Bus(mb, None, false, false, None, Some(dm), None, None)
     }
 
     /// Configure fast RAM at [`FAST_BASE`] and clear the ROM overlay on

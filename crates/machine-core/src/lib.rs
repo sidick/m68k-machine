@@ -99,6 +99,86 @@ pub const ROM_END: u32 = ROM_BASE + ROM_WINDOW_SIZE as u32;
 /// A byte value returned by every open-bus read.
 pub const OPEN_BUS_BYTE: u8 = 0xFF;
 
+/// The opt-in device-write span log's live state, over storage borrowed
+/// from the caller (`docs/cpu-core-proposal.md` §5.3's C1 record/replay
+/// harness). `machine-core` is allocator-free and borrows all its
+/// backing storage from the caller (chip RAM, fast RAM, ROM); this log
+/// is no exception -- [`MachineBus::set_device_write_log`] takes the
+/// `(addr, len)` slice as a borrow, so a board that never calls it pays
+/// zero bytes for this feature, and a board that does call it (only
+/// `machine-hosted`'s recorder is expected to) picks its own capacity
+/// instead of this crate dictating one.
+///
+/// This is **not a ring**: once the caller's slice is full, a further
+/// span is dropped and [`Self::overflowed`] goes sticky -- drop-newest,
+/// not overwrite-oldest. Adjacent recordings are coalesced into the
+/// immediately preceding span (see [`Self::record`]) so a blitter row's
+/// many one-word writes collapse into one span, the same shape a single
+/// `ram_slice_mut` grant already produces for a DMA'd buffer.
+struct DeviceWriteLog<'a> {
+    spans: &'a mut [(u32, u32)],
+    count: usize,
+    overflowed: bool,
+}
+
+impl<'a> DeviceWriteLog<'a> {
+    fn new(spans: &'a mut [(u32, u32)]) -> Self {
+        Self {
+            spans,
+            count: 0,
+            overflowed: false,
+        }
+    }
+
+    /// Records a `len`-byte write at `addr`, merging it into the single
+    /// most recently recorded span if the two are adjacent at either
+    /// end (this write starts exactly where the last one ended, or ends
+    /// exactly where the last one started). Never coalesces across a
+    /// gap, and never merges with anything other than the immediately
+    /// preceding span, so a recorded span is always exactly the bytes
+    /// written -- never a bounding box that includes bytes nothing
+    /// touched, which would hide a real divergence from a replayer that
+    /// trusts these spans.
+    ///
+    /// A zero-length write is a no-op (nothing to record). Arithmetic on
+    /// guest-controlled addresses/lengths is checked throughout, per this
+    /// crate's hostile-input standing rule: overflow is treated as "not
+    /// adjacent" rather than panicking or wrapping into a bogus merge.
+    pub(crate) fn record(&mut self, addr: u32, len: u32) {
+        if len == 0 {
+            return;
+        }
+        if self.count > 0 {
+            let (last_addr, last_len) = self.spans[self.count - 1];
+            if let Some(new_len) = last_len.checked_add(len) {
+                if last_addr.checked_add(last_len) == Some(addr) {
+                    self.spans[self.count - 1].1 = new_len;
+                    return;
+                }
+                if addr.checked_add(len) == Some(last_addr) {
+                    self.spans[self.count - 1] = (addr, new_len);
+                    return;
+                }
+            }
+        }
+        if self.count < self.spans.len() {
+            self.spans[self.count] = (addr, len);
+            self.count += 1;
+        } else {
+            self.overflowed = true;
+        }
+    }
+
+    fn spans(&self) -> &[(u32, u32)] {
+        &self.spans[..self.count]
+    }
+
+    fn clear(&mut self) {
+        self.count = 0;
+        self.overflowed = false;
+    }
+}
+
 /// A validated view onto this machine's actual RAM, for a device whose
 /// transfer engine moves guest-supplied buffers directly -- `hostblk`'s
 /// doorbell descriptor and per-sector transfer buffers are the motivating
@@ -173,6 +253,14 @@ pub struct GuestRam<'a> {
     /// (`docs/device-ledger.md`, standing rule 2). Refreshed at every
     /// placement mutation site, so it is never stale on a read.
     fast_window: Option<(u32, u32)>,
+
+    /// The device-write span log, present only while
+    /// [`MachineBus::set_device_write_log`] has handed in storage --
+    /// `None` (the default) costs nothing beyond the `Option` tag, and
+    /// every write path that might record checks this once. See
+    /// [`DeviceWriteLog`]'s own doc comment for the borrowed-storage
+    /// rationale and the coalescing/overflow semantics.
+    write_log: Option<DeviceWriteLog<'a>>,
 }
 
 impl<'a> GuestRam<'a> {
@@ -182,6 +270,21 @@ impl<'a> GuestRam<'a> {
             fast_ram: None,
             fast_ram_board: None,
             fast_window: None,
+            write_log: None,
+        }
+    }
+
+    /// Records `(addr, len)` into the device-write span log if one is
+    /// currently attached ([`MachineBus::set_device_write_log`]); a
+    /// no-op otherwise. Called from [`Self::ram_slice_mut`] (every
+    /// device engine's DMA-style grant) and, via
+    /// [`MachineBus::run_blitter`], from the blitter's own direct
+    /// chip-RAM writes -- see [`MachineBus::device_write_spans`]'s doc
+    /// comment for the complete list of what this does and does not
+    /// cover.
+    fn record_write_span(&mut self, addr: u32, len: u32) {
+        if let Some(log) = &mut self.write_log {
+            log.record(addr, len);
         }
     }
 
@@ -225,11 +328,25 @@ impl<'a> GuestMemory for GuestRam<'a> {
         None
     }
 
+    /// Grants a mutable view of guest RAM -- the path this crate uses to
+    /// hand a device engine (`hostblk`/`pktport`/`pcibridge`/PCI
+    /// virtio-net -- their `tick`s take a `&mut dyn GuestMemory`) write
+    /// access to chip or fast RAM, which is what makes this one of the
+    /// two recording points for the opt-in device-write span log
+    /// ([`MachineBus::set_device_write_log`]). The other is the
+    /// blitter's own direct chip-RAM writes (`MachineBus::run_blitter`,
+    /// synchronous inside `MachineBus::write_word`), which cannot go
+    /// through this method (it writes one word at a time as it walks a
+    /// blit, not one whole span up front) but records into the same log
+    /// -- see [`MachineBus::device_write_spans`]'s doc comment for the
+    /// complete picture.
     fn ram_slice_mut(&mut self, addr: u32, len: u32) -> Option<&mut [u8]> {
         if let Some(span) = self.chip_ram_span(addr, len) {
+            self.record_write_span(addr, len);
             return Some(&mut self.chip_ram[span]);
         }
         if let Some(span) = self.fast_ram_span(addr, len) {
+            self.record_write_span(addr, len);
             return Some(&mut self.fast_ram.as_mut()?[span]);
         }
         None
@@ -1713,7 +1830,16 @@ impl<'a> MachineBus<'a> {
     /// Run an armed blit to completion and raise the blitter-finished
     /// interrupt. Synchronous by design — see [`blitter`]'s module docs.
     fn run_blitter(&mut self) {
-        if self.blitter.execute(self.ram.chip_ram) {
+        // `self.ram.chip_ram` and `self.ram.write_log` are disjoint
+        // fields of `self.ram`, so both can be borrowed at once here --
+        // the same reason the bus's `ram` field exists as its own struct
+        // at all (`GuestRam`'s own doc comment). The blitter writes
+        // chip RAM directly rather than through `ram_slice_mut`
+        // (`Self::set_device_write_log`'s doc comment on why this is a
+        // second, necessary recording point), so it needs its own
+        // handle into the same log.
+        let log = self.ram.write_log.as_mut();
+        if self.blitter.execute_logged(self.ram.chip_ram, log) {
             self.chipset.raise_int(chipset::intbit::BLIT);
         }
     }
@@ -2014,6 +2140,106 @@ impl<'a> MachineBus<'a> {
         }
         self.write_word(address, (value >> 16) as u16);
         self.write_word(address.wrapping_add(2), value as u16);
+    }
+}
+
+impl<'a> MachineBus<'a> {
+    /// Attaches (or detaches) the opt-in device-write span log's storage
+    /// (`docs/cpu-core-proposal.md` §5.3's C1 record/replay harness).
+    /// `Some(storage)` enables the log over that caller-supplied `(addr,
+    /// len)` slice -- its length is the log's whole capacity, chosen by
+    /// the caller, not by this crate (`machine-core` borrows all its
+    /// backing storage rather than allocating; see [`DeviceWriteLog`]'s
+    /// doc comment). `None` disables the log and drops the borrow,
+    /// discarding whatever was recorded. Either call starts from a clean
+    /// count and clear overflow flag.
+    ///
+    /// **Invariant the recorder relies on**: every guest-RAM write this
+    /// machine ever performs outside the CPU's own bus accesses is
+    /// recorded here. That is two kinds of write, both covered:
+    ///
+    /// - Every *deferred* device write -- `hostblk::Hostblk::tick`,
+    ///   `pktport::Pktport::tick`, `pcibridge::PciBridge::tick` (which
+    ///   covers the virtio-net stub's RX path), and MIRAGE's reference
+    ///   implementation if it ever grows DMA -- goes through
+    ///   [`GuestRam::ram_slice_mut`] (via the `&mut dyn GuestMemory` each
+    ///   engine is handed in [`Self::tick`]), which records on every
+    ///   successful grant.
+    /// - The **blitter**'s writes, which are synchronous-on-register-write
+    ///   (`Self::run_blitter`, called from inside [`Self::write_word`] the
+    ///   instant the guest writes `BLTSIZE`) and go straight to
+    ///   `self.ram`'s chip RAM one word at a time as the blit walks --
+    ///   never through `ram_slice_mut`, since there is no single span to
+    ///   grant up front. Each word store is still recorded, coalesced
+    ///   with the immediately preceding one when adjacent
+    ///   ([`DeviceWriteLog::record`]), so a normal multi-word blit row
+    ///   collapses into one span rather than one entry per word. This
+    ///   *is* load-bearing, not redundant: a replayer has no live
+    ///   blitter of its own (§5.3 -- the guest's I/O register writes are
+    ///   compared against the recording and discarded, never re-executed
+    ///   against a model), and CPU code routinely reads back blitter
+    ///   output (Intuition/graphics.library read-modify-write planar
+    ///   bitmaps), so the blit's RAM effects must appear in the log for
+    ///   a replay to reproduce what the guest actually saw.
+    ///
+    /// The only guest-RAM writes NOT captured are the CPU's own bus
+    /// accesses (`Self::write_byte`/`write_word`/`write_long` and their
+    /// fast paths) -- those are the instruction stream itself, which a
+    /// record/replay harness reproduces by re-executing, not by log
+    /// replay.
+    ///
+    /// This is a drop-newest log with a sticky overflow flag, not a
+    /// ring: once the caller's slice is full, a further (non-coalescing)
+    /// span is dropped and [`Self::device_write_log_overflowed`] goes
+    /// sticky -- see [`DeviceWriteLog`]'s doc comment.
+    ///
+    /// Disabled (`None`) by default; the cost while disabled is exactly
+    /// one `Option` check inside `ram_slice_mut` and inside the
+    /// blitter's per-word store, both device-tick/blit paths only --
+    /// this never touches the CPU's own read/write fast paths
+    /// ([`Self::fast_region`]/[`Self::fast_region_mut`]) or
+    /// [`Self::fast_ram_window_mut`] (the `machine-hosted` `FastMem`
+    /// seam), and costs zero bytes of storage for any board that never
+    /// calls this setter.
+    pub fn set_device_write_log(&mut self, storage: Option<&'a mut [(u32, u32)]>) {
+        self.ram.write_log = storage.map(DeviceWriteLog::new);
+    }
+
+    /// The spans recorded so far: `(addr, len)` pairs, oldest first,
+    /// since the log was last (re)attached or cleared -- see
+    /// [`Self::set_device_write_log`]'s doc comment for exactly which
+    /// writes that covers and how adjacent writes coalesce. Empty
+    /// whenever the log is disabled (nothing is ever appended while
+    /// off).
+    pub fn device_write_spans(&self) -> &[(u32, u32)] {
+        self.ram
+            .write_log
+            .as_ref()
+            .map(DeviceWriteLog::spans)
+            .unwrap_or(&[])
+    }
+
+    /// Whether a span was ever dropped because the caller's storage
+    /// ([`Self::set_device_write_log`]) was full. Sticky: stays set
+    /// across further recording until [`Self::clear_device_write_spans`]
+    /// clears it, so a caller that only checks this once at the end of a
+    /// run still learns about a mid-run overflow. Always `false` while
+    /// the log is disabled.
+    pub fn device_write_log_overflowed(&self) -> bool {
+        self.ram.write_log.as_ref().is_some_and(|l| l.overflowed)
+    }
+
+    /// Clears both the recorded spans and the sticky overflow flag, so a
+    /// caller that drains [`Self::device_write_spans`] periodically (once
+    /// per instruction-index window, say) gets a clean slate rather than
+    /// having to separately track "have I already seen this overflow".
+    /// Keeps the log enabled with the same borrowed storage -- this is
+    /// not the same as calling `set_device_write_log(None)`. A no-op
+    /// while the log is disabled.
+    pub fn clear_device_write_spans(&mut self) {
+        if let Some(log) = &mut self.ram.write_log {
+            log.clear();
+        }
     }
 }
 
@@ -2905,6 +3131,237 @@ mod tests {
         let mut check = [0u8; block::SECTOR_BYTES];
         disk.read_sector(0, &mut check);
         assert_eq!(&check[..], &pattern[..]);
+    }
+
+    // ---- device-write span log (docs/cpu-core-proposal.md §5.3) --------
+
+    /// Submit one `READ` through a configured `hostblk` card and tick it
+    /// to completion, returning the buffer address/length the descriptor
+    /// named -- shared by the span-log tests below, which only differ in
+    /// whether the log is enabled around the call.
+    fn run_one_hostblk_read(bus: &mut MachineBus, base: u32) -> (u32, u32) {
+        let desc_addr = 0x1000u32;
+        let buf_addr = 0x2000u32;
+        bus.write_byte(desc_addr, hostblk::cmd::READ);
+        bus.write_byte(desc_addr + 1, 0); // unit
+        bus.write_long(desc_addr + 4, block::SECTOR_BYTES as u32); // length
+        bus.write_long(desc_addr + 8, 0); // offset hi
+        bus.write_long(desc_addr + 12, 0); // offset lo
+        bus.write_long(desc_addr + 16, buf_addr); // buffer
+
+        bus.write_long(base + hostblk::reg::DOORBELL, desc_addr);
+        bus.tick(ONE_LINE_CLOCKS);
+        assert_eq!(
+            bus.read_byte(base + hostblk::reg::COMPLETION_ERROR + 3),
+            hostblk::err::OK,
+            "test setup: the READ must actually complete for this test to mean anything"
+        );
+        (buf_addr, block::SECTOR_BYTES as u32)
+    }
+
+    #[test]
+    fn device_write_log_records_nothing_while_disabled() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut disk = MirageDisk::new(64);
+        let pattern: std::vec::Vec<u8> = (0..block::SECTOR_BYTES as u32).map(|i| i as u8).collect();
+        let mut seed = [0u8; block::SECTOR_BYTES];
+        seed.copy_from_slice(&pattern);
+        disk.write_sector(0, &seed);
+        let mut bus = new_bus(&mut ram, &rom).with_hostblk(0, &mut disk, false);
+        let base = 0x4000_0000u32;
+        configure_hostblk_z3(&mut bus, base);
+
+        // Log is off by default -- `MachineBus::set_device_write_log` is
+        // never called here.
+        run_one_hostblk_read(&mut bus, base);
+
+        assert_eq!(
+            bus.device_write_spans(),
+            &[],
+            "disabled by default: a real DMA'd READ must not record anything"
+        );
+        assert!(!bus.device_write_log_overflowed());
+    }
+
+    /// The positive case: crib's `configured_hostblk_routes_its_window_
+    /// and_completes_a_transfer_via_int2`'s setup, but with the log
+    /// enabled, and asserts the READ's buffer write actually shows up.
+    /// Standard of evidence (task brief): this assertion is shown to
+    /// fail against the broken thing first -- see the report for the
+    /// disabled-recording-line run -- and shown to pass here.
+    #[test]
+    fn device_write_log_records_a_hostblk_dma_buffer_write_when_enabled() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut disk = MirageDisk::new(64);
+        let pattern: std::vec::Vec<u8> = (0..block::SECTOR_BYTES as u32).map(|i| i as u8).collect();
+        let mut seed = [0u8; block::SECTOR_BYTES];
+        seed.copy_from_slice(&pattern);
+        disk.write_sector(0, &seed);
+        let mut bus = new_bus(&mut ram, &rom).with_hostblk(0, &mut disk, false);
+        let base = 0x4000_0000u32;
+        configure_hostblk_z3(&mut bus, base);
+
+        let mut storage = [(0u32, 0u32); 8];
+        bus.set_device_write_log(Some(&mut storage));
+        let (buf_addr, len) = run_one_hostblk_read(&mut bus, base);
+
+        assert_eq!(
+            bus.device_write_spans(),
+            &[(buf_addr, len)],
+            "hostblk's READ DMA writes the whole buffer in one ram_slice_mut grant"
+        );
+        assert!(!bus.device_write_log_overflowed());
+    }
+
+    #[test]
+    fn device_write_log_overflow_is_sticky_and_never_panics() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom);
+        const TEST_CAPACITY: usize = 4;
+        let mut storage = [(0u32, 0u32); TEST_CAPACITY];
+        bus.set_device_write_log(Some(&mut storage));
+
+        // One more grant than the caller's storage holds, each a
+        // 1-byte span with a 1-byte gap after it so adjacent-write
+        // coalescing (the whole point of the blitter capture) cannot
+        // merge them and hide an undercount.
+        for i in 0..(TEST_CAPACITY as u32 + 1) {
+            GuestMemory::ram_slice_mut(&mut bus, i * 2, 1).expect("in-bounds chip RAM byte");
+        }
+
+        assert_eq!(bus.device_write_spans().len(), TEST_CAPACITY);
+        assert!(
+            bus.device_write_log_overflowed(),
+            "the capacity+1'th grant must set the sticky overflow flag, not panic or wrap"
+        );
+
+        // One more grant on top of an already-full, already-overflowed
+        // log: still no panic, count still capped.
+        GuestMemory::ram_slice_mut(&mut bus, (TEST_CAPACITY as u32 + 1) * 2, 1)
+            .expect("in-bounds chip RAM byte");
+        assert_eq!(bus.device_write_spans().len(), TEST_CAPACITY);
+        assert!(bus.device_write_log_overflowed());
+    }
+
+    #[test]
+    fn device_write_log_clear_resets_spans_and_keeps_the_borrow_enabled() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom);
+        const TEST_CAPACITY: usize = 4;
+        let mut storage = [(0u32, 0u32); TEST_CAPACITY];
+        bus.set_device_write_log(Some(&mut storage));
+
+        for i in 0..(TEST_CAPACITY as u32 + 1) {
+            GuestMemory::ram_slice_mut(&mut bus, i * 2, 1).expect("in-bounds chip RAM byte");
+        }
+        assert!(bus.device_write_log_overflowed());
+
+        bus.clear_device_write_spans();
+        assert_eq!(bus.device_write_spans(), &[]);
+        assert!(
+            !bus.device_write_log_overflowed(),
+            "clear resets the sticky flag too (documented on clear_device_write_spans)"
+        );
+
+        // The log is still enabled with the same storage after a clear
+        // -- clearing is not the same as `set_device_write_log(None)`.
+        GuestMemory::ram_slice_mut(&mut bus, 0, 1).expect("in-bounds chip RAM byte");
+        assert_eq!(bus.device_write_spans(), &[(0, 1)]);
+    }
+
+    #[test]
+    fn device_write_log_disabling_with_none_drops_the_borrow_and_future_writes() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom);
+        let mut storage = [(0u32, 0u32); 4];
+        bus.set_device_write_log(Some(&mut storage));
+        GuestMemory::ram_slice_mut(&mut bus, 0, 1).expect("in-bounds chip RAM byte");
+        assert_eq!(bus.device_write_spans(), &[(0, 1)]);
+
+        bus.set_device_write_log(None);
+        assert_eq!(bus.device_write_spans(), &[]);
+        assert!(!bus.device_write_log_overflowed());
+
+        GuestMemory::ram_slice_mut(&mut bus, 4, 1).expect("in-bounds chip RAM byte");
+        assert_eq!(
+            bus.device_write_spans(),
+            &[],
+            "disabled again: nothing recorded, and the old storage's contents don't leak back"
+        );
+    }
+
+    /// The blitter capture: a two-row area blit with a nonzero modulo
+    /// (a gap between the end of row 0's destination and the start of
+    /// row 1's) must produce exactly two spans -- one per row, each
+    /// covering exactly the bytes that row wrote -- never one bounding
+    /// span across the modulo gap the blit never touched, and never one
+    /// entry per word within a row (adjacent-word coalescing must merge
+    /// those). Cribs `plain_bltbitmap_straight_copy`'s setup shape from
+    /// `blitter::tests`, run through the real bus so `MachineBus::
+    /// run_blitter`'s wiring (not just `Blitter::execute` in isolation)
+    /// is what is under test.
+    ///
+    /// Standard of evidence (task brief): shown to fail with the
+    /// blitter's recording call commented out, then shown to pass with
+    /// it restored -- see the report.
+    #[test]
+    fn device_write_log_records_exact_per_row_spans_for_a_blit() {
+        let mut ram = boxed_chip_ram();
+        let rom = [0u8; ROM_WINDOW_SIZE];
+        let mut bus = new_bus(&mut ram, &rom);
+
+        // Two rows, two words wide, D-only copy from A with a one-word
+        // (2-byte) destination modulo -- so row 0 writes bytes
+        // [dst, dst+4) and row 1 writes [dst+6, dst+10), leaving
+        // [dst+4, dst+6) (the modulo gap) untouched.
+        // Above `OVERLAY_END`: a fresh `MachineBus` boots with the ROM
+        // overlay mapped, which redirects *reads* below it to ROM
+        // (writes still land in chip RAM regardless, `fast_region_mut`'s
+        // own doc comment) -- this test reads the result back through
+        // `bus.read_word`, so it must sit outside that window to see
+        // what was actually written rather than the mirrored ROM.
+        let src = OVERLAY_END + 0x1000;
+        let dst = OVERLAY_END + 0x2000;
+        for i in 0..4u32 {
+            bus.write_word(src + i * 2, 0x1111 * (i as u16 + 1));
+        }
+
+        let con0 = 0x09F0u16; // USEA | USED, LF = A (0xF0 -> D=A)
+        bus.write_word(CUSTOM_BASE + blitter::reg::BLTCON0 as u32, con0);
+        bus.write_word(CUSTOM_BASE + blitter::reg::BLTCON1 as u32, 0); // ascending, no line
+        bus.write_word(CUSTOM_BASE + blitter::reg::BLTAFWM as u32, 0xFFFF);
+        bus.write_word(CUSTOM_BASE + blitter::reg::BLTALWM as u32, 0xFFFF);
+        bus.write_long(CUSTOM_BASE + blitter::reg::BLTAPTH as u32, src);
+        bus.write_long(CUSTOM_BASE + blitter::reg::BLTDPTH as u32, dst);
+        bus.write_word(CUSTOM_BASE + blitter::reg::BLTAMOD as u32, 0);
+        bus.write_word(CUSTOM_BASE + blitter::reg::BLTDMOD as u32, 2); // 1-word gap between rows
+
+        let mut storage = [(0u32, 0u32); 8];
+        bus.set_device_write_log(Some(&mut storage));
+
+        // BLTSIZE: height=2 rows, width=2 words -- the write that arms
+        // and (via `run_blitter`) immediately runs the blit.
+        bus.write_word(CUSTOM_BASE + blitter::reg::BLTSIZE as u32, (2u16 << 6) | 2);
+
+        // Sanity: the blit actually ran and wrote what we expect, same
+        // as `plain_bltbitmap_straight_copy` checks.
+        assert_eq!(bus.read_word(dst), 0x1111);
+        assert_eq!(bus.read_word(dst + 2), 0x2222);
+        assert_eq!(bus.read_word(dst + 6), 0x3333);
+        assert_eq!(bus.read_word(dst + 8), 0x4444);
+
+        assert_eq!(
+            bus.device_write_spans(),
+            &[(dst, 4), (dst + 6, 4)],
+            "one exact span per row: two adjacent-word writes coalesced within each row, \
+             but the modulo gap between rows must not be bridged"
+        );
+        assert!(!bus.device_write_log_overflowed());
     }
 
     // ---- fast RAM wiring ------------------------------------------------

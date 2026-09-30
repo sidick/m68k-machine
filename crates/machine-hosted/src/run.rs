@@ -106,7 +106,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use machine_core::block::BlockDevice;
-use machine_core::{pci, MachineBus, CHIP_RAM_SIZE, CPU_CLOCKS_PER_ECLOCK};
+use machine_core::{pci, GuestMemory, MachineBus, CHIP_RAM_SIZE, CPU_CLOCKS_PER_ECLOCK};
 
 use crate::bus::Bus;
 use crate::cli::Args;
@@ -334,6 +334,23 @@ pub enum Outcome {
     Wedged(String),
     /// Couldn't even get to running (ROM I/O, empty image, etc.).
     SetupError(String),
+    /// `--replay` reached the log's `End` event with no divergence
+    /// (`docs/cpu-core-proposal.md` §5.3's player finishing clean). Exit
+    /// 0, like [`Outcome::CleanHalt`], but reported with the replay-
+    /// specific evidence the milestone brief asks for rather than
+    /// `CleanHalt`'s halt-specific wording. A divergence, by contrast,
+    /// reuses [`Outcome::Wedged`] -- it is exactly that trait's shape
+    /// ("something is wrong, stop and report it, exit nonzero"), and
+    /// `Wedged`'s `String` payload already carries a free-form reason.
+    ReplayClean {
+        ordinals: u64,
+        io_reads: u64,
+        io_writes: u64,
+        ipl_events: u64,
+        device_writes: u64,
+        transitions: u64,
+        checkpoints: u64,
+    },
 }
 
 /// `--cpu-speed max`'s own timing breakdown (plan step 7.2). 7.1's only
@@ -400,6 +417,7 @@ impl Report {
             Outcome::LimitReached(_) => 1,
             Outcome::Wedged(_) => 2,
             Outcome::SetupError(_) => 3,
+            Outcome::ReplayClean { .. } => 0,
         }
     }
 
@@ -410,6 +428,19 @@ impl Report {
             Outcome::LimitReached(which) => format!("LIMIT REACHED ({which})"),
             Outcome::Wedged(reason) => format!("WEDGED ({reason})"),
             Outcome::SetupError(reason) => format!("SETUP ERROR ({reason})"),
+            Outcome::ReplayClean {
+                ordinals,
+                io_reads,
+                io_writes,
+                ipl_events,
+                device_writes,
+                transitions,
+                checkpoints,
+            } => format!(
+                "REPLAY CLEAN ({ordinals} ordinals, {io_reads} io-reads, {io_writes} io-writes, \
+                 {ipl_events} ipl-events, {device_writes} device-writes, {transitions} \
+                 transitions, {checkpoints} checkpoints -- zero divergences)"
+            ),
         };
         format!(
             "{detail} -- {} instructions, {} frames, overlay {}, final PC {:#010x}",
@@ -535,6 +566,67 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     // direct-mapping.md`, "Default policy"). The split is loud, never
     // silent: the diag lines below say what was decided and why on
     // every run.
+    // `--record`/`--replay` (`docs/cpu-core-proposal.md` §5.3, `docs/replay-
+    // log.md`): validated up front, before any RAM allocation or bus
+    // construction, for the same "diagnose a bad flag combination
+    // immediately" reason every other setup-error check in this function
+    // runs before the work it would otherwise waste. Both veto the direct
+    // map below (`interceptor_active`, extended) for the same reason the
+    // three pre-existing interceptors do: the recorder/player must see
+    // every access at their own classification granularity, which the
+    // direct map's `PROT_NONE` fast path bypasses for `Ram`/`Rom`/`OpenBus`
+    // pages.
+    let record_active = args.record.is_some();
+    let replay_active = args.replay.is_some();
+    if record_active && replay_active {
+        return setup_error(
+            console,
+            "--record and --replay cannot both be given -- recording and replaying are \
+             mutually exclusive for one run"
+                .to_string(),
+        );
+    }
+    if (record_active || replay_active) && args.cpu_speed != crate::cli::CpuSpeed::Fixed {
+        return setup_error(
+            console,
+            format!(
+                "{} requires --cpu-speed fixed: only fixed mode can apply a logged IPL/\
+                 classification event at an exact retired-instruction index, and only fixed \
+                 mode ticks devices once per instruction, which is what makes the device-write \
+                 span drain exact (docs/replay-log.md)",
+                if record_active {
+                    "--record"
+                } else {
+                    "--replay"
+                }
+            ),
+        );
+    }
+    if (record_active || replay_active) && args.cpu_backend == crate::cli::CpuBackend::Batch {
+        return setup_error(
+            console,
+            "--record/--replay cannot be combined with --cpu-backend batch".to_string(),
+        );
+    }
+    if (record_active || replay_active) && args.blitter_trace.is_some() {
+        return setup_error(
+            console,
+            "--record/--replay cannot be combined with --blitter-trace".to_string(),
+        );
+    }
+    if (record_active || replay_active) && std::env::var_os("SERIAL_REG_TRACE").is_some() {
+        return setup_error(
+            console,
+            "--record/--replay cannot be combined with SERIAL_REG_TRACE".to_string(),
+        );
+    }
+    if (record_active || replay_active) && std::env::var_os("BUS_COVERAGE").is_some() {
+        return setup_error(
+            console,
+            "--record/--replay cannot be combined with BUS_COVERAGE".to_string(),
+        );
+    }
+
     let mode_requested = match args.direct_map {
         crate::cli::DirectMapMode::On => true,
         crate::cli::DirectMapMode::Off => false,
@@ -549,7 +641,10 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         // gate exercises that combination, and the conservative posture
         // keeps `batch` byte-identical to its pre-direct-map behaviour.
         // Revisit only if batch+direct-map is ever wanted *and* tested.
-        || args.cpu_backend == crate::cli::CpuBackend::Batch;
+        || args.cpu_backend == crate::cli::CpuBackend::Batch
+        // `--record`/`--replay`: see this function's own validation above.
+        || record_active
+        || replay_active;
     let direct_map_wanted = mode_requested && !interceptor_active;
     if direct_map_wanted {
         console.diag(&format!(
@@ -560,10 +655,18 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
             }
         ));
     } else if mode_requested && interceptor_active {
-        console.diag(
-            "direct-map: off (an access-intercepting diagnostic or --cpu-backend batch \
-             is active; those always win -- see --direct-map's own doc comment)",
-        );
+        console.diag(&format!(
+            "direct-map: off (an access-intercepting diagnostic, --cpu-backend batch, or \
+             --record/--replay is active; those always win -- see --direct-map's own doc \
+             comment){}",
+            if record_active {
+                " (--record is active)"
+            } else if replay_active {
+                " (--replay is active)"
+            } else {
+                ""
+            }
+        ));
     } else {
         console.diag(&format!(
             "direct-map: off ({})",
@@ -848,6 +951,20 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     ];
     let mut pcibridge_vpci = pci::VirtualPciBus::new(&mut pcibridge_slots);
 
+    // The recorder's device-write span log (`docs/cpu-core-proposal.md`
+    // §5.3, `MachineBus::set_device_write_log`): a caller-owned slice,
+    // large enough that a real boot essentially never overflows it between
+    // two drains (`run_guest_fixed` drains after every tick). Declared
+    // here, before `machine_bus` borrows it, for the same lifetime reason
+    // every other card's backing storage above is -- only allocated at all
+    // when `--record` is given, matching every other "absent unless
+    // attached" contract in this function.
+    let mut device_write_log_storage: Vec<(u32, u32)> = if record_active {
+        vec![(0, 0); 65536]
+    } else {
+        Vec::new()
+    };
+
     let machine_bus = MachineBus::new(chip_ram, &rom_bytes);
     let machine_bus = match &ext_rom_bytes {
         Some(ext) => machine_bus.with_ext_rom(ext),
@@ -957,6 +1074,16 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
     } else {
         machine_bus
     };
+    // Attached last, once every board above has had its chance to place
+    // itself -- `set_device_write_log` never affects placement, but this
+    // keeps the "every `.with_*` call happens before anything reads the
+    // finished bus" ordering the rest of this function already relies on
+    // (`DirectMap::new` below, and `Recorder::create` further down, both
+    // read `machine_bus` only after this point).
+    let mut machine_bus = machine_bus;
+    if record_active {
+        machine_bus.set_device_write_log(Some(&mut device_write_log_storage));
+    }
     let blitter_trace = match &args.blitter_trace {
         Some(path) => match crate::blitter_trace::BlitterTrace::open(path) {
             Ok(t) => {
@@ -1009,6 +1136,104 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         }
     }
 
+    // `--record`/`--replay` (`docs/cpu-core-proposal.md` §5.3): built last
+    // among `Bus`'s pieces, once `machine_bus` is fully wired, for the
+    // same reason the direct map is -- both need to classify from the
+    // finished bus's own AUTOCONFIG/overlay state, not a partially-built
+    // one. At most one of the two is ever constructed (`run()`'s own
+    // validation above refuses giving both flags).
+    // Checkpoint interval: `REPLAY_CHECKPOINT_INTERVAL`, gated the same
+    // "read once, diagnostic/test knob, zero cost unless set" way as
+    // `MEASURE_INSTR_PER_LINE`/`SERIAL_REG_TRACE` -- exists so the seeded-
+    // divergence tests (`docs/replay-log.md`) can tighten the interval to
+    // get a checkpoint soon after a deliberately corrupted event, without
+    // needing a permanent CLI flag for a value production use never wants
+    // tuned.
+    let checkpoint_interval = std::env::var("REPLAY_CHECKPOINT_INTERVAL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(crate::replay::DEFAULT_CHECKPOINT_INTERVAL);
+    let mut recorder: Option<crate::replay::Recorder> = None;
+    if let Some(path) = &args.record {
+        match crate::replay::Recorder::create(
+            path,
+            &machine_bus,
+            &rom_bytes,
+            args.instructions_per_line.max(1),
+            checkpoint_interval,
+        ) {
+            Ok(r) => {
+                console.diag(&format!(
+                    "record: writing replay log to {} (docs/replay-log.md)",
+                    path.display()
+                ));
+                recorder = Some(r);
+            }
+            Err(e) => {
+                return setup_error(console, format!("opening --record {}: {e}", path.display()))
+            }
+        }
+    }
+    let mut player: Option<crate::replay::Player> = None;
+    if let Some(path) = &args.replay {
+        match crate::replay::Player::open(path) {
+            Ok(p) => {
+                let rom_hash = crate::replay::fnv1a64(&rom_bytes);
+                if p.header().rom_hash != rom_hash {
+                    return setup_error(
+                        console,
+                        format!(
+                            "--replay {}: ROM identity mismatch (log recorded against a ROM \
+                             hashing to {:#018x}, this run's ROM hashes to {:#018x}) -- replaying \
+                             a log against a different ROM than it was recorded with is not \
+                             supported",
+                            path.display(),
+                            p.header().rom_hash,
+                            rom_hash
+                        ),
+                    );
+                }
+                if p.header().chip_ram_size != machine_core::CHIP_RAM_SIZE as u32 {
+                    return setup_error(
+                        console,
+                        format!(
+                            "--replay {}: chip RAM size mismatch (log recorded {} bytes, this \
+                             build has {} bytes -- chip RAM size is architecturally fixed, so \
+                             this should never happen outside a build skew)",
+                            path.display(),
+                            p.header().chip_ram_size,
+                            machine_core::CHIP_RAM_SIZE
+                        ),
+                    );
+                }
+                let fast_ram_size = machine_bus.fast_ram_window().map(|(_, l)| l).unwrap_or(0);
+                if p.header().fast_ram_size != fast_ram_size {
+                    return setup_error(
+                        console,
+                        format!(
+                            "--replay {}: fast RAM size mismatch (log recorded {} bytes, this \
+                             run has {} bytes attached at header-check time -- pass the same \
+                             --fast-ram-mb the recording used)",
+                            path.display(),
+                            p.header().fast_ram_size,
+                            fast_ram_size
+                        ),
+                    );
+                }
+                console.diag(&format!(
+                    "replay: replaying log from {} (docs/replay-log.md; instructions-per-line \
+                     recorded as {})",
+                    path.display(),
+                    p.header().instructions_per_line
+                ));
+                player = Some(p);
+            }
+            Err(e) => {
+                return setup_error(console, format!("opening --replay {}: {e}", path.display()))
+            }
+        }
+    }
+
     let mut bus = Bus(
         machine_bus,
         blitter_trace,
@@ -1016,6 +1241,8 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         cpu_speed_max,
         bus_coverage_enabled.then(crate::bus::Coverage::default),
         direct_map,
+        recorder,
+        player,
     );
 
     // `--cpu-backend batch` needs `--cpu-speed max`: cycle mode's
@@ -1118,7 +1345,9 @@ pub fn run(args: &Args, console: &mut Console) -> Report {
         if bus.0.overlay() { "mapped" } else { "clear" }
     ));
 
-    let report = if cpu_speed_max {
+    let report = if replay_active {
+        run_guest_replay(console, &mut cpu, &mut bus)
+    } else if cpu_speed_max {
         run_guest_max(
             args,
             console,
@@ -2236,10 +2465,21 @@ fn run_guest_fixed<C: GuestCpu>(
         let mut hook_line_done = false;
 
         let hook_instructions_before = total_instructions;
+        let mut hook_record_overflow = false;
         let result = cpu.run_for_cycles_with_hook(
             bus,
             FIXED_MODE_BATCH_CYCLES,
             |cpu, bus, _cycles| {
+                // `docs/cpu-core-proposal.md` §5.3's ordinal (`docs/replay-
+                // log.md`'s worked example): the *first* action of every
+                // hook invocation, mirrored by the identical bump in the
+                // `Stopped` arm below. `None` when `--record` wasn't
+                // given, so this costs one `Option` check on the hot path
+                // -- `bus.6`'s own doc comment's standing contract.
+                if let Some(rec) = &mut bus.6 {
+                    rec.advance_ordinal();
+                }
+
                 // Deliberately not reading `_cycles`: see this function's
                 // own doc comment on why fixed mode never consults a
                 // per-instruction timing cost.
@@ -2273,6 +2513,43 @@ fn run_guest_fixed<C: GuestCpu>(
                 let amount = (cumulative_after - cumulative_before) as u32;
                 bus.0.tick(amount);
                 cpu.set_irq(bus.0.pending_irq_level());
+
+                // Recorder bookkeeping, in the same order §5.3 lists:
+                // IPL (on change), then the device-write spans this tick
+                // may have produced (hostblk/pktport/pcibridge DMA via
+                // `ram_slice_mut`, and the blitter's own synchronous
+                // chip-RAM writes -- both drained the same way, since
+                // both go through `MachineBus::device_write_spans`), then
+                // a checkpoint if this ordinal is due one. Exact only
+                // because fixed mode ticks once per instruction
+                // (`docs/replay-log.md`'s own caveat for cycle/max mode).
+                if bus.6.is_some() {
+                    let level = bus.0.pending_irq_level();
+                    if let Some(rec) = &mut bus.6 {
+                        let _ = rec.log_ipl_if_changed(level);
+                    }
+                    let spans: Vec<(u32, u32)> = bus.0.device_write_spans().to_vec();
+                    for (addr, len) in spans {
+                        if let Some(bytes) = bus.0.ram_slice(addr, len) {
+                            let bytes = bytes.to_vec();
+                            if let Some(rec) = &mut bus.6 {
+                                let _ = rec.log_device_write(addr, &bytes);
+                            }
+                        }
+                    }
+                    if bus.0.device_write_log_overflowed() {
+                        hook_record_overflow = true;
+                    }
+                    bus.0.clear_device_write_spans();
+                    let regs = crate::replay::regs_of(cpu);
+                    if let Some(rec) = &mut bus.6 {
+                        let _ = rec.maybe_checkpoint(regs);
+                    }
+                    if hook_record_overflow {
+                        return HookControl::Return;
+                    }
+                }
+
                 drain_serial(bus, console, serial_tcp);
 
                 let frames = bus.0.frames();
@@ -2362,6 +2639,20 @@ fn run_guest_fixed<C: GuestCpu>(
             total_instructions = hook_instructions_before + result.instructions as u64;
         }
 
+        // `docs/cpu-core-proposal.md` §5.3's recording contract: an
+        // overflowed device-write log is not survivable -- the log would
+        // silently be missing writes a replayer needs, which is worse
+        // than not recording at all. Abort loudly and immediately, never
+        // "keep going with a known-incomplete log" (the milestone brief's
+        // own words).
+        if hook_record_overflow {
+            eprintln!(
+                "record: device-write log overflowed (capacity exhausted between two drains) -- \
+                 aborting the recording; the log so far is incomplete and must not be replayed"
+            );
+            std::process::exit(4);
+        }
+
         if !overlay_was_cleared && !bus.0.overlay() {
             overlay_was_cleared = true;
             console.diag(&format!(
@@ -2418,8 +2709,47 @@ fn run_guest_fixed<C: GuestCpu>(
                 // `run_for_cycles_with_hook`'s own contract). Advance
                 // exactly one line anyway, matching §5.2's "while
                 // stopped, lines advance with no instructions retired".
+                //
+                // `docs/cpu-core-proposal.md` §5.3's ordinal also advances
+                // here -- this is the *other* of the two bump points the
+                // module doc names (`crate::replay`'s "Ordinal" section):
+                // IPL changes that arrive purely from a STOP-path resync
+                // (no instruction retiring at all) still need a key to be
+                // logged/replayed at.
+                if let Some(rec) = &mut bus.6 {
+                    rec.advance_ordinal();
+                }
                 bus.0.tick(ONE_LINE_CLOCKS);
                 cpu.set_irq(bus.0.pending_irq_level());
+                if bus.6.is_some() {
+                    let level = bus.0.pending_irq_level();
+                    if let Some(rec) = &mut bus.6 {
+                        let _ = rec.log_ipl_if_changed(level);
+                    }
+                    let spans: Vec<(u32, u32)> = bus.0.device_write_spans().to_vec();
+                    for (addr, len) in spans {
+                        if let Some(bytes) = bus.0.ram_slice(addr, len) {
+                            let bytes = bytes.to_vec();
+                            if let Some(rec) = &mut bus.6 {
+                                let _ = rec.log_device_write(addr, &bytes);
+                            }
+                        }
+                    }
+                    let overflowed = bus.0.device_write_log_overflowed();
+                    bus.0.clear_device_write_spans();
+                    let regs = crate::replay::regs_of(cpu);
+                    if let Some(rec) = &mut bus.6 {
+                        let _ = rec.maybe_checkpoint(regs);
+                    }
+                    if overflowed {
+                        eprintln!(
+                            "record: device-write log overflowed (capacity exhausted between two \
+                             drains) -- aborting the recording; the log so far is incomplete and \
+                             must not be replayed"
+                        );
+                        std::process::exit(4);
+                    }
+                }
                 drain_serial(bus, console, serial_tcp);
 
                 let frames = bus.0.frames();
@@ -2514,6 +2844,244 @@ fn run_guest_fixed<C: GuestCpu>(
             }
         }
     };
+
+    if let Some(rec) = &mut bus.6 {
+        let regs = crate::replay::regs_of(cpu);
+        if let Err(e) = rec.finish(total_instructions, regs, &bus.0) {
+            eprintln!("record: failed to write the log's End record: {e}");
+            std::process::exit(4);
+        }
+        console.diag(&format!(
+            "record: {} ordinals, {} io-reads, {} io-writes, {} ipl-events, {} device-writes, \
+             {} classification-transitions, {} checkpoints",
+            rec.ordinal(),
+            rec.io_read_events,
+            rec.io_write_events,
+            rec.ipl_events,
+            rec.device_write_events,
+            rec.transition_events,
+            rec.checkpoint_events,
+        ));
+    }
+
+    Report {
+        outcome,
+        instructions: total_instructions,
+        frames: bus.0.frames(),
+        final_pc: cpu.pc(),
+        overlay_cleared: !bus.0.overlay(),
+        max_mode_timing: None,
+    }
+}
+
+/// First differing field between two [`crate::replay::Regs`], for a
+/// divergence report -- `"none"` if they're equal (callers only call this
+/// once they already know the two differ, so this arm is defensive, not
+/// expected).
+fn first_reg_diff(expected: &crate::replay::Regs, actual: &crate::replay::Regs) -> &'static str {
+    const DN: [&str; 8] = ["D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7"];
+    const AN: [&str; 8] = ["A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7"];
+    for (i, name) in DN.iter().enumerate() {
+        if expected.d[i] != actual.d[i] {
+            return name;
+        }
+    }
+    for (i, name) in AN.iter().enumerate() {
+        if expected.a[i] != actual.a[i] {
+            return name;
+        }
+    }
+    if expected.pc != actual.pc {
+        return "PC";
+    }
+    if expected.sr != actual.sr {
+        return "SR";
+    }
+    "none"
+}
+
+/// The replayer (`docs/cpu-core-proposal.md` §5.3, `docs/replay-log.md`):
+/// structurally a stripped [`run_guest_fixed`] with every live-device
+/// concern removed. No chipset devices are ever ticked, no IPL is ever
+/// derived from live state (`MachineBus::pending_irq_level` is never
+/// called), no serial/input scripts run, and no screenshots are taken --
+/// everything the guest sees comes from the log (`bus.7`, wired into
+/// `bus.rs`'s `AddressBus` impl) or from direct `GuestMemory` access on
+/// this run's own RAM.
+///
+/// The outer loop's only job is to keep calling
+/// `run_for_cycles_with_hook` (so the CPU re-executes the exact same
+/// instruction stream the recording did) and to stop -- cleanly, at the
+/// log's `Event::End`, or with a divergence report -- exactly once one of
+/// those two things happens. There is no `--max-frames`/`--max-instructions`
+/// bound here: replay is bounded by the log itself, which a real
+/// recording always terminates with an `End` record (`Recorder::finish`).
+fn run_guest_replay<C: GuestCpu>(console: &mut Console, cpu: &mut C, bus: &mut Bus) -> Report {
+    let mut total_instructions: u64 = 0;
+    let mut end_info: Option<(u64, u64, crate::replay::Regs)> = None;
+
+    let outcome = 'outer: loop {
+        let mut hook_end = false;
+        let mut hook_divergence = false;
+
+        let hook_instructions_before = total_instructions;
+        let result =
+            cpu.run_for_cycles_with_hook(bus, FIXED_MODE_BATCH_CYCLES, |cpu, bus, _cycles| {
+                let effects = {
+                    let player = bus
+                        .7
+                        .as_mut()
+                        .expect("run_guest_replay is only ever called with a player attached");
+                    player.advance_ordinal();
+                    match player.drain_side_effects(&mut bus.0) {
+                        Ok(e) => e,
+                        Err(io_err) => {
+                            player.record_divergence(crate::replay::Divergence::LogIoError(
+                                io_err.to_string(),
+                            ));
+                            crate::replay::DrainedEffects::default()
+                        }
+                    }
+                };
+                if let Some(level) = effects.ipl {
+                    cpu.set_irq(level);
+                }
+                total_instructions += 1;
+                if let Some((ordinal, expected)) = effects.checkpoint {
+                    let actual = crate::replay::regs_of(cpu);
+                    if expected != actual {
+                        let diff = first_reg_diff(&expected, &actual);
+                        bus.7.as_mut().unwrap().record_divergence(
+                            crate::replay::Divergence::CheckpointMismatch {
+                                ordinal,
+                                expected,
+                                actual,
+                                first_diff: diff,
+                            },
+                        );
+                    }
+                }
+                if let Some(end) = effects.end {
+                    end_info = Some(end);
+                    hook_end = true;
+                    return HookControl::Return;
+                }
+                if bus.7.as_ref().unwrap().divergence().is_some() {
+                    hook_divergence = true;
+                    return HookControl::Return;
+                }
+                HookControl::Continue
+            });
+
+        if total_instructions < hook_instructions_before + result.instructions as u64 {
+            total_instructions = hook_instructions_before + result.instructions as u64;
+        }
+
+        if hook_end {
+            break 'outer Outcome::CleanHalt; // overwritten below once we've compared final state
+        }
+        if hook_divergence {
+            break 'outer Outcome::Wedged(format!(
+                "replay divergence: {}",
+                bus.7.as_ref().unwrap().divergence().unwrap()
+            ));
+        }
+
+        match result.exit {
+            GuestExit::BudgetExhausted | GuestExit::BoundaryRequested => continue 'outer,
+            GuestExit::Stopped => {
+                if cpu.int_mask() & 0x0700 == 0x0700 {
+                    break 'outer Outcome::CleanHalt;
+                }
+                let player = bus.7.as_mut().expect("player attached");
+                player.advance_ordinal();
+                let effects = match player.drain_side_effects(&mut bus.0) {
+                    Ok(e) => e,
+                    Err(io_err) => {
+                        player.record_divergence(crate::replay::Divergence::LogIoError(
+                            io_err.to_string(),
+                        ));
+                        crate::replay::DrainedEffects::default()
+                    }
+                };
+                if let Some(level) = effects.ipl {
+                    cpu.set_irq(level);
+                }
+                if let Some(end) = effects.end {
+                    end_info = Some(end);
+                    break 'outer Outcome::CleanHalt;
+                }
+                if let Some(d) = bus.7.as_ref().unwrap().divergence() {
+                    break 'outer Outcome::Wedged(format!("replay divergence: {d}"));
+                }
+                continue 'outer;
+            }
+            GuestExit::AlineTrap { .. } => {
+                cpu.take_aline_exception(bus);
+            }
+            GuestExit::FlineTrap { .. } => {
+                cpu.take_fline_exception(bus);
+            }
+            GuestExit::TrapInstruction { trap_num } => {
+                cpu.take_trap_exception(bus, trap_num);
+            }
+            GuestExit::Breakpoint { .. } => {
+                cpu.take_bkpt_exception(bus);
+            }
+            GuestExit::IllegalInstruction { .. } => {
+                cpu.take_illegal_exception(bus);
+            }
+        }
+    };
+
+    // A clean `End` still gets one last check: final registers must match
+    // exactly (the milestone brief's "at End, compare final state").
+    let outcome = if let Outcome::CleanHalt = outcome {
+        if let Some((_, _, expected)) = end_info {
+            let actual = crate::replay::regs_of(cpu);
+            if expected != actual {
+                let diff = first_reg_diff(&expected, &actual);
+                if let Some(player) = bus.7.as_mut() {
+                    player.record_divergence(crate::replay::Divergence::FinalStateMismatch {
+                        expected,
+                        actual,
+                        first_diff: diff,
+                    });
+                }
+            }
+        }
+        match bus.7.as_ref().and_then(|p| p.divergence()) {
+            Some(d) => Outcome::Wedged(format!("replay divergence: {d}")),
+            None => {
+                let player = bus.7.as_ref().expect("player attached");
+                Outcome::ReplayClean {
+                    ordinals: player.ordinal(),
+                    io_reads: player.io_read_events_consumed,
+                    io_writes: player.io_write_events_consumed,
+                    ipl_events: player.ipl_events_applied,
+                    device_writes: player.device_writes_applied,
+                    transitions: player.transitions_applied,
+                    checkpoints: player.checkpoints_compared,
+                }
+            }
+        }
+    } else {
+        outcome
+    };
+
+    if let Some(player) = bus.7.as_ref() {
+        console.diag(&format!(
+            "replay: {} ordinals, {} io-reads consumed, {} io-writes consumed, {} ipl-events, \
+             {} device-writes, {} classification-transitions, {} checkpoints",
+            player.ordinal(),
+            player.io_read_events_consumed,
+            player.io_write_events_consumed,
+            player.ipl_events_applied,
+            player.device_writes_applied,
+            player.transitions_applied,
+            player.checkpoints_compared,
+        ));
+    }
 
     Report {
         outcome,

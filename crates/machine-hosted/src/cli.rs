@@ -441,6 +441,42 @@ pub struct Args {
     /// posture every card's first increment took.
     #[arg(long, default_value_t = false)]
     pub pcibridge: bool,
+
+    /// Record a `docs/cpu-core-proposal.md` §5.3 replay log of this run to
+    /// `PATH` (`docs/replay-log.md`). Requires `--cpu-speed fixed` (the
+    /// only mode fixed enough to apply a logged IPL/classification event
+    /// at an exact retired-instruction index, and the only one that ticks
+    /// devices once per instruction, which is what makes the device-
+    /// write-span drain exact -- see that doc for both reasons in full).
+    /// Refused together with `--replay` (recording and replaying are
+    /// mutually exclusive for one run), `--cpu-backend batch`,
+    /// `--blitter-trace`, `SERIAL_REG_TRACE`, or `BUS_COVERAGE` -- all of
+    /// those intercept or bypass the same bus accesses the recorder needs
+    /// to classify and log, the same posture the direct map's own
+    /// interceptor vetoes already take (`--direct-map`'s own doc
+    /// comment). Vetoes the direct map outright, for the same reason: the
+    /// recorder must see every access at its own classification
+    /// granularity, which the direct map's `PROT_NONE` fast path bypasses
+    /// for `Ram`/`Rom`/`OpenBus` pages. `run.rs` prints a `record:` diag
+    /// line stating this on every recording run.
+    #[arg(long)]
+    pub record: Option<PathBuf>,
+
+    /// Replay a log previously captured with `--record` instead of
+    /// running a live machine: no chipset devices are serviced, no
+    /// serial/input scripts run, and no screenshots are taken (see
+    /// `docs/replay-log.md`'s "how replay works"). Same `--cpu-speed
+    /// fixed`-only requirement, mutual exclusions, and direct-map veto as
+    /// `--record` -- see that flag's own doc comment. `--rom`/`--hostblk`/
+    /// `--fast-ram-mb` etc. must still describe the same machine shape the
+    /// recording used (ROM identity and RAM sizes are validated against
+    /// the log's header; a mismatch is a setup error, not a silent
+    /// replay). On a clean replay, prints a success line with the total
+    /// ordinals/instructions compared and event counts by kind; on any
+    /// divergence, exits nonzero with a report of the first mismatch
+    /// (ordinal, kind, expected/actual, PC).
+    #[arg(long)]
+    pub replay: Option<PathBuf>,
 }
 
 /// CLI surface for [`machine_core::rtgboard::format`] -- kept as a

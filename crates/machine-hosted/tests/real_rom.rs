@@ -3514,6 +3514,672 @@ fn kickstart_3_2_2_a1200_rtg_workbench_desktop_is_grey_not_blank_or_corrupt_fixe
     );
 }
 
+/// `fixed`-mode sibling of `aros_68k_screenshot_shows_boot_screen_content_without_boot_media`,
+/// same `--max-frames 500`/`--screenshot-frame 400`. Like its original,
+/// this runs unconditionally (AROS assets are vendored in-repo), not
+/// gated on `--ignored`.
+#[test]
+fn aros_68k_screenshot_shows_boot_screen_content_without_boot_media_fixed_mode() {
+    assert!(
+        Path::new(AROS_MAIN).exists() && Path::new(AROS_EXT).exists(),
+        "AROS ROM pair is vendored in-repo (assets/aros/) and must be present"
+    );
+    let path = screenshot_path("aros-fixed-mode");
+    let (status, stdout) = run(&[
+        "--rom",
+        AROS_MAIN,
+        "--ext-rom",
+        AROS_EXT,
+        "--cpu-speed",
+        "fixed",
+        "--max-frames",
+        "500",
+        "--max-instructions",
+        "300000000",
+        "--screenshot",
+        path.to_str().unwrap(),
+        "--screenshot-frame",
+        "400",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+    assert!(
+        stdout.contains("screenshot: frame 400"),
+        "expected the capture to actually fire by frame 400"
+    );
+
+    let (width, height, rgba) = decode_png(&path);
+    assert_eq!(
+        (width, height),
+        (
+            machine_core::display::MAX_WIDTH as u32,
+            machine_core::display::MAX_HEIGHT as u32
+        )
+    );
+    let background = dominant_pixel(&rgba);
+    let distinct_from_background = rgba.chunks(4).filter(|px| *px != background).count();
+    assert!(
+        distinct_from_background > 2_000,
+        "expected the AROS boot-logo screen to draw real content \
+         (got {distinct_from_background} non-background pixels) -- see \
+         this test's doc comment"
+    );
+    let distinct_colours = rgba
+        .chunks(4)
+        .map(|px| <[u8; 4]>::try_from(px).unwrap())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert!(
+        distinct_colours >= 8,
+        "expected the boot logo's 16-colour palette to show up as many \
+         distinct colours (got {distinct_colours})"
+    );
+}
+
+/// `fixed`-mode sibling of `kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger_over_tcp`,
+/// same `--max-frames 500`, `--trigger-illegal-after-frames 20` and
+/// `--serial-tcp` flood-DEL break-in. Not covered by the plain
+/// `--serial-script` romwack sibling above: this exercises the
+/// `--serial-tcp` bridge itself (a separate host->guest path from
+/// `--serial-script`) under `fixed` mode.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger_over_tcp_fixed_mode() {
+    let rom = kickstart_a1200();
+    if !have_fixtures(&[&rom]) {
+        return;
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_machine-hosted"))
+        .args([
+            "--rom",
+            &rom,
+            "--cpu-speed",
+            "fixed",
+            "--trigger-illegal-after-frames",
+            "20",
+            "--serial-tcp",
+            "127.0.0.1:0",
+            "--max-frames",
+            "500",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn machine-hosted");
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+
+    // `run.rs`'s own diag line for a bound `--serial-tcp` listener:
+    // "host  | serial-tcp: listening on 127.0.0.1:<port> -- ...". Read
+    // lines until it shows up rather than guessing a port ourselves --
+    // `:0` above means the OS chose it.
+    let mut addr = None;
+    let mut lines = Vec::new();
+    for _ in 0..200 {
+        let mut line = String::new();
+        let n = stdout.read_line(&mut line).expect("read child stdout");
+        assert!(
+            n > 0,
+            "child exited before printing its --serial-tcp address"
+        );
+        let line = line.trim_end().to_string();
+        if let Some(rest) = line.strip_prefix("host  | serial-tcp: listening on ") {
+            let addr_str = rest.split(" --").next().unwrap_or(rest).trim();
+            addr = Some(addr_str.to_string());
+            lines.push(line);
+            break;
+        }
+        lines.push(line);
+    }
+    let addr = addr.expect("never saw the --serial-tcp listening address in stdout");
+    eprintln!("connecting to {addr}");
+
+    let client = TcpStream::connect(&addr).expect("connect to --serial-tcp bridge");
+    client
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+
+    // Flood DEL from a dedicated thread for the same reason
+    // `romwack-break-in.txt` floods it across 400 scripted frames -- see
+    // this test's own doc comment. Stops itself once the main thread
+    // below has seen the debugger banner, or after a generous ceiling so
+    // a failed break-in doesn't leave a thread spinning forever.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flood_stop = std::sync::Arc::clone(&stop);
+    let flooder = std::thread::spawn(move || {
+        let mut flood_client = client;
+        for _ in 0..20_000 {
+            if flood_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            if flood_client.write_all(&[0x7f]).is_err() {
+                return; // guest side closed -- run ended
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    // Read the rest of the child's output until it exits (bounded by
+    // `--max-frames 500` above regardless of whether the break-in
+    // lands), collecting every line for the same assertions the
+    // `--serial-script` sibling test makes.
+    loop {
+        let mut line = String::new();
+        match stdout.read_line(&mut line) {
+            Ok(0) => break, // EOF: child closed stdout (exiting)
+            Ok(_) => lines.push(line.trim_end().to_string()),
+            Err(_) => break,
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = flooder.join();
+    let status = child.wait().expect("wait for machine-hosted");
+
+    let stdout_text = lines.join("\n");
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout_text}");
+    assert!(
+        stdout_text.contains("GUEST | rom-wack"),
+        "expected the ROM's own rom-wack debugger banner, reached over --serial-tcp"
+    );
+    assert!(
+        stdout_text.contains("XCPT: 8000002F"),
+        "expected a register dump for the forced illegal-instruction exception"
+    );
+}
+
+/// `fixed`-mode sibling of `kickstart_3_2_2_a1200_workbench_renders_through_the_rtgboard_card_driver`,
+/// same `--max-frames 5200`/`--screenshot-frame 5000`. Not previously
+/// re-run under `fixed` mode -- see `docs/deterministic-mode.md`'s
+/// "Which gates were re-baselined" for why this and the other three
+/// combination gates below were expected, not yet verified, to pass.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and the patched rtgboard HDF on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_workbench_renders_through_the_rtgboard_card_driver_fixed_mode() {
+    let rom = kickstart_a1200();
+    let hd = rtgboard_hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+
+    let path = screenshot_path("kickstart-rtgboard-fixed-mode");
+    let serial_log_path = std::env::temp_dir().join(format!(
+        "machine-hosted-kickstart-rtgboard-fixed-mode-{}.serial.log",
+        std::process::id()
+    ));
+
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--cpu-speed",
+        "fixed",
+        "--rtgboard",
+        "640x480",
+        "--rtgboard-format",
+        "rgb565",
+        "--max-frames",
+        "5200",
+        "--max-instructions",
+        "3000000000",
+        "--screenshot",
+        path.to_str().unwrap(),
+        "--screenshot-frame",
+        "5000",
+        "--serial-log",
+        serial_log_path.to_str().unwrap(),
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    assert!(
+        stdout.contains("screenshot: frame 5000"),
+        "expected the capture to actually fire by frame 5000"
+    );
+
+    let serial_log = std::fs::read_to_string(&serial_log_path)
+        .unwrap_or_else(|e| panic!("read serial log {serial_log_path:?}: {e}"));
+    for marker in [
+        "rtgboard: FindCard: board at",
+        "rtgboard: InitCard: rtg.library version",
+        "rtgboard: SetGC 640x480 committed: APPLIED",
+        "rtgboard: SetPanning: offset 0x0 committed: APPLIED",
+    ] {
+        assert!(
+            serial_log.contains(marker),
+            "expected the driver's serial narration to contain {marker:?}; \
+             see this test's doc comment for the full expected chain -- \
+             serial log:\n{serial_log}"
+        );
+    }
+    assert!(
+        !serial_log.contains("committed: REJECTED"),
+        "expected no rejected mode/panning commit -- a REJECTED commit here \
+         usually means --rtgboard-format rgb565 was dropped or the catalog/ \
+         proposal match broke; see this test's doc comment. serial log:\n{serial_log}"
+    );
+
+    let (width, height, rgba) = decode_png(&path);
+    assert_eq!(
+        (width, height),
+        (640, 480),
+        "an RTG screenshot's dimensions come from the driver-programmed \
+         mode -- (752, 576) here would mean SetGC never committed and the \
+         capture fell back to the planar path; see this test's doc comment"
+    );
+
+    let background = dominant_pixel(&rgba);
+    let channels = [background[0], background[1], background[2]];
+    let max = *channels.iter().max().unwrap();
+    let min = *channels.iter().min().unwrap();
+    assert!(
+        max - min <= 8,
+        "expected a neutral-ish grey background (R/G/B within 8 of each \
+         other, allowing for RGB565's 5/6/5-bit quantization), got \
+         {background:?} -- see the original test's doc comment for the \
+         CLUT-trap failure mode this guards against"
+    );
+    assert!(
+        (120..200).contains(&background[0]),
+        "expected a mid-grey Workbench background, got {background:?} \
+         (measured on the cycle-mode fixture: [173, 170, 173, 255])"
+    );
+
+    let non_background = rgba.chunks(4).filter(|px| *px != background).count();
+    assert!(
+        non_background >= 20_000,
+        "expected the real Workbench desktop through the rtgboard driver, \
+         got {non_background} non-background pixels -- 13,637 would mean \
+         the FakeNativeModes/CLUT trap fired instead; see the original \
+         test's doc comment"
+    );
+
+    let mut colours: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    for px in rgba.chunks(4) {
+        colours.insert(px);
+    }
+    assert!(
+        colours.len() <= 10,
+        "expected a clean few-colour Workbench desktop, got {} distinct \
+         colours -- the CLUT-broken screen measured 21; see the original \
+         test's doc comment",
+        colours.len()
+    );
+
+    let _ = std::fs::remove_file(&serial_log_path);
+}
+
+/// `fixed`-mode sibling of `scripted_pointer_and_double_click_work_on_the_rtgboard_rtg_screen`,
+/// same `--max-frames 5700`/`--screenshot-frame 5200`/`--screenshot-every 220`
+/// and input script.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and the patched rtgboard HDF on disk; run with --ignored"]
+fn scripted_pointer_and_double_click_work_on_the_rtgboard_rtg_screen_fixed_mode() {
+    let rom = kickstart_a1200();
+    let hd = rtgboard_hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+
+    let script_path = std::env::temp_dir().join(format!(
+        "machine-hosted-rtgboard-pointer-fixed-mode-{}.input",
+        std::process::id()
+    ));
+    std::fs::write(
+        &script_path,
+        "SLEEP 5100\n\
+         MOVE 100 100\nSLEEP 150\n\
+         MOVE 500 380\nSLEEP 200\n\
+         MOVE 42 73\nSLEEP 10\n\
+         BUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 5\n\
+         BUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 300\n",
+    )
+    .expect("write input script");
+
+    let serial_log_path = std::env::temp_dir().join(format!(
+        "machine-hosted-rtgboard-pointer-fixed-mode-{}.serial.log",
+        std::process::id()
+    ));
+
+    let base_path = screenshot_path("rtgboard-pointer-fixed-mode");
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--cpu-speed",
+        "fixed",
+        "--rtgboard",
+        "640x480",
+        "--rtgboard-format",
+        "rgb565",
+        "--input-script",
+        script_path.to_str().unwrap(),
+        "--screenshot",
+        base_path.to_str().unwrap(),
+        "--screenshot-frame",
+        "5200",
+        "--screenshot-every",
+        "220",
+        "--max-frames",
+        "5700",
+        "--max-instructions",
+        "4200000000",
+        "--serial-log",
+        serial_log_path.to_str().unwrap(),
+        "--inspect",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    assert!(
+        stdout.contains("screenshot: frame 5640"),
+        "expected the final --screenshot-every capture to actually fire by frame 5640"
+    );
+
+    let serial_log = std::fs::read_to_string(&serial_log_path)
+        .unwrap_or_else(|e| panic!("read serial log {serial_log_path:?}: {e}"));
+    for marker in [
+        "rtgboard: FindCard: board at",
+        "rtgboard: InitCard: rtg.library version",
+        "rtgboard: SetGC 640x480 committed: APPLIED",
+        "rtgboard: SetPanning: offset 0x0 committed: APPLIED",
+    ] {
+        assert!(
+            serial_log.contains(marker),
+            "expected the driver's serial narration to contain {marker:?}; \
+             serial log:\n{serial_log}"
+        );
+    }
+    assert!(
+        !serial_log.contains("committed: REJECTED"),
+        "expected no rejected mode/panning commit; serial log:\n{serial_log}"
+    );
+
+    assert!(
+        stdout.contains("MouseX 42  MouseY 73"),
+        "expected IntuitionBase->MouseX/MouseY to read back exactly (42, 73) \
+         on this RTG screen, un-doubled -- see the original test's doc comment: {stdout}"
+    );
+
+    assert!(
+        stdout.contains("EVENT_COUNT 0  EVENT_OVERFLOW 0"),
+        "expected the input card's queue fully drained with no drops by the end of the run: {stdout}"
+    );
+
+    let capture1 = base_path.with_file_name(format!(
+        "{}-005200.png",
+        base_path.file_stem().unwrap().to_string_lossy()
+    ));
+    let capture2 = base_path.with_file_name(format!(
+        "{}-005420.png",
+        base_path.file_stem().unwrap().to_string_lossy()
+    ));
+    let capture3 = base_path.with_file_name(format!(
+        "{}-005640.png",
+        base_path.file_stem().unwrap().to_string_lossy()
+    ));
+
+    let (width1, height1, rgba1) = decode_png(&capture1);
+    let (width2, height2, rgba2) = decode_png(&capture2);
+    let (width3, height3, rgba3) = decode_png(&capture3);
+    for (width, height) in [(width1, height1), (width2, height2), (width3, height3)] {
+        assert_eq!(
+            (width, height),
+            (640, 480),
+            "an RTG screenshot's dimensions come from the driver-programmed mode"
+        );
+    }
+
+    red_pointer_pixels(width1, &rgba1, 100, 100);
+    red_pointer_pixels(width2, &rgba2, 500, 380);
+    red_pointer_pixels(width3, &rgba3, 42, 73);
+
+    const WHITE: [u8; 4] = [255, 255, 255, 255];
+    const BLACK: [u8; 4] = [0, 0, 0, 255];
+    let white3 = rgba3.chunks(4).filter(|px| *px == WHITE).count();
+    let black3 = rgba3.chunks(4).filter(|px| *px == BLACK).count();
+    assert!(
+        white3 >= 11_000,
+        "expected the SYS drawer's white furniture on capture 3, got {white3} \
+         white pixels -- 9,093 would mean the closed desktop (click opened \
+         nothing); see the original test's doc comment"
+    );
+    assert!(
+        black3 >= 9_500,
+        "expected the SYS drawer's black furniture/text on capture 3, got \
+         {black3} black pixels -- 6,599 would mean the closed desktop (click \
+         opened nothing); see the original test's doc comment"
+    );
+
+    let white1 = rgba1.chunks(4).filter(|px| *px == WHITE).count();
+    assert!(
+        white1 < 11_000,
+        "expected capture 1's closed-desktop white count (measured 9,093) to \
+         sit below the open-drawer floor used above, as a control showing \
+         that floor genuinely discriminates within this same run -- got \
+         {white1}"
+    );
+
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&serial_log_path);
+}
+
+/// `fixed`-mode sibling of `kickstart_3_2_2_a1200_boots_unattended_to_rtg_workbench_with_input_storage_network`,
+/// same `--max-frames 5700`/`--screenshot-frame 5200`/`--screenshot-every 220`
+/// and input script. Never boots the checked-in fixture directly -- the
+/// guest writes `SYS:unattended-boot.txt` onto it, so this uses its own
+/// fresh copy (same pattern as the original, and as the `--hostblk-writable`
+/// sanaconform sibling above).
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and the patched unattended HDF on disk; run with --ignored"]
+fn kickstart_3_2_2_a1200_boots_unattended_to_rtg_workbench_with_input_storage_network_fixed_mode() {
+    let rom = kickstart_a1200();
+    let hd_fixture = unattended_hd_image();
+    if !have_fixtures(&[&rom, &hd_fixture]) {
+        return;
+    }
+
+    let hd = std::env::temp_dir().join(format!(
+        "machine-hosted-unattended-fixed-mode-{}.hdf",
+        std::process::id()
+    ));
+    std::fs::copy(&hd_fixture, &hd).unwrap_or_else(|e| panic!("copy {hd_fixture} -> {hd:?}: {e}"));
+    let hd = hd.to_str().unwrap().to_string();
+
+    let script_path = std::env::temp_dir().join(format!(
+        "machine-hosted-unattended-fixed-mode-{}.input",
+        std::process::id()
+    ));
+    std::fs::write(
+        &script_path,
+        "SLEEP 5100\n\
+         MOVE 100 100\nSLEEP 150\n\
+         MOVE 500 380\nSLEEP 200\n\
+         MOVE 42 73\nSLEEP 10\n\
+         BUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 5\n\
+         BUTTONDOWN LEFT\nBUTTONUP LEFT\nSLEEP 300\n",
+    )
+    .expect("write input script");
+
+    let serial_log_path = std::env::temp_dir().join(format!(
+        "machine-hosted-unattended-fixed-mode-{}.serial.log",
+        std::process::id()
+    ));
+
+    let base_path = screenshot_path("unattended-fixed-mode");
+    let (status, stdout) = run(&[
+        "--rom",
+        &rom,
+        "--hostblk",
+        &hd,
+        "--hostblk-writable",
+        "--cpu-speed",
+        "fixed",
+        "--pcibridge",
+        "--rtgboard",
+        "640x480",
+        "--rtgboard-format",
+        "rgb565",
+        "--input-script",
+        script_path.to_str().unwrap(),
+        "--screenshot",
+        base_path.to_str().unwrap(),
+        "--screenshot-frame",
+        "5200",
+        "--screenshot-every",
+        "220",
+        "--max-frames",
+        "5700",
+        "--max-instructions",
+        "5000000000",
+        "--serial-log",
+        serial_log_path.to_str().unwrap(),
+        "--inspect",
+    ])
+    .unwrap();
+    eprintln!("exit: {status:?}");
+    eprintln!("{stdout}");
+
+    assert!(
+        stdout.contains("screenshot: frame 5640"),
+        "expected the final --screenshot-every capture to actually fire by frame 5640"
+    );
+
+    let serial_log = std::fs::read_to_string(&serial_log_path)
+        .unwrap_or_else(|e| panic!("read serial log {serial_log_path:?}: {e}"));
+
+    for marker in [
+        "rtgboard: FindCard: board at",
+        "rtgboard: InitCard: rtg.library version",
+        "rtgboard: SetGC 640x480 committed: APPLIED",
+        "rtgboard: SetPanning: offset 0x0 committed: APPLIED",
+    ] {
+        assert!(
+            serial_log.contains(marker),
+            "expected the driver's serial narration to contain {marker:?}; \
+             serial log:\n{serial_log}"
+        );
+    }
+    assert!(
+        !serial_log.contains("committed: REJECTED"),
+        "expected no rejected mode/panning commit; serial log:\n{serial_log}"
+    );
+
+    for marker in [
+        "VNETDEV: DevInit entry",
+        "VNETDEV: DevInit: capabilities common ",
+        "VNETDEV: DevInit: features negotiated (VERSION_1, NET_F_MAC)",
+        "VNETDEV: DevInit: MAC 02:6D:36:4B:00:01",
+        "VNETDEV: DevInit complete, DRIVER_OK set",
+        "VNETTEST opendevice: PASS",
+        "VNETTEST tx frame: dst FF:FF:FF:FF:FF:FF ethertype $88B5 payload \"M68KVNET-TX-0001\" (16 bytes)",
+        "VNETDEV: isr: first queue interrupt observed (device INTx via INT2)",
+        "VNETTEST cmd_read: PASS received frame ethertype $88B5 payload \"M68KVNET-RX-REPLY-0001\" (22 bytes)",
+        "VNETTEST result: ALL PASS",
+    ] {
+        assert!(
+            serial_log.contains(marker),
+            "expected the serial narration to contain {marker:?} -- \
+             serial log:\n{serial_log}"
+        );
+    }
+    assert!(
+        !serial_log.contains(" FAIL"),
+        "expected no failing check anywhere in the serial log:\n{serial_log}"
+    );
+
+    let expected_frame_hex = "ff ff ff ff ff ff 02 6d 36 4b 00 01 88 b5 4d 36 \
+        38 4b 56 4e 45 54 2d 54 58 2d 30 30 30 31 00 00 00 00 00 00 00 00 00 \
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
+    assert!(
+        stdout.contains("pcibridge net harness: 1 frame(s) transmitted by the guest"),
+        "expected --inspect to report exactly one transmitted frame:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("frame 0: 60 byte(s): {expected_frame_hex}")),
+        "expected the recorded frame's exact bytes:\n{stdout}"
+    );
+
+    assert!(
+        stdout.contains("MouseX 42  MouseY 73"),
+        "expected IntuitionBase->MouseX/MouseY to read back exactly (42, 73) \
+         on this RTG screen, un-doubled: {stdout}"
+    );
+    assert!(
+        stdout.contains("EVENT_COUNT 0  EVENT_OVERFLOW 0"),
+        "expected the input card's queue fully drained with no drops by the end of the run: {stdout}"
+    );
+
+    let capture1 = base_path.with_file_name(format!(
+        "{}-005200.png",
+        base_path.file_stem().unwrap().to_string_lossy()
+    ));
+    let capture2 = base_path.with_file_name(format!(
+        "{}-005420.png",
+        base_path.file_stem().unwrap().to_string_lossy()
+    ));
+    let capture3 = base_path.with_file_name(format!(
+        "{}-005640.png",
+        base_path.file_stem().unwrap().to_string_lossy()
+    ));
+
+    let (width1, height1, rgba1) = decode_png(&capture1);
+    let (width2, height2, rgba2) = decode_png(&capture2);
+    let (width3, height3, rgba3) = decode_png(&capture3);
+    for (width, height) in [(width1, height1), (width2, height2), (width3, height3)] {
+        assert_eq!(
+            (width, height),
+            (640, 480),
+            "an RTG screenshot's dimensions come from the driver-programmed mode"
+        );
+    }
+
+    red_pointer_pixels(width1, &rgba1, 100, 100);
+    red_pointer_pixels(width2, &rgba2, 500, 380);
+    red_pointer_pixels(width3, &rgba3, 42, 73);
+
+    const WHITE: [u8; 4] = [255, 255, 255, 255];
+    const BLACK: [u8; 4] = [0, 0, 0, 255];
+    let white3 = rgba3.chunks(4).filter(|px| *px == WHITE).count();
+    let black3 = rgba3.chunks(4).filter(|px| *px == BLACK).count();
+    assert!(
+        white3 >= 11_000,
+        "expected the SYS drawer's white furniture on capture 3, got {white3} \
+         white pixels -- 9,093 would mean the closed desktop (click opened \
+         nothing); see the original test's doc comment"
+    );
+    assert!(
+        black3 >= 9_500,
+        "expected the SYS drawer's black furniture/text on capture 3, got \
+         {black3} black pixels -- 6,599 would mean the closed desktop (click \
+         opened nothing); see the original test's doc comment"
+    );
+
+    let white1 = rgba1.chunks(4).filter(|px| *px == WHITE).count();
+    assert!(
+        white1 < 11_000,
+        "expected capture 1's closed-desktop white count (measured 9,093) to \
+         sit below the open-drawer floor used above, as a control showing \
+         that floor genuinely discriminates within this same run -- got \
+         {white1}"
+    );
+
+    let log = xdftool_read(&hd, "unattended-boot.txt");
+    assert!(
+        log.contains("UNATTENDED-BOOT-STORAGE-OK"),
+        "expected SYS:unattended-boot.txt to contain UNATTENDED-BOOT-STORAGE-OK -- log:\n{log}"
+    );
+
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&serial_log_path);
+    let _ = std::fs::remove_file(&hd);
+}
+
 /// The direct-map gate for the debug-profile suite (`docs/direct-mapping.md`,
 /// "Default policy"): `--direct-map auto` resolves to *off* under the
 /// debug profile `cargo test` builds this binary with, so without this
@@ -3572,5 +4238,548 @@ fn fixed_mode_boot_is_identical_with_direct_map_forced_on() {
     assert!(
         on.contains("PHASE1 HOSTED:"),
         "expected a final status line"
+    );
+}
+
+/// `docs/cpu-core-proposal.md` §5.3's record/replay lockstep
+/// (`docs/replay-log.md`): the self-replay gate (record a real boot,
+/// replay it, expect zero divergence) plus a log-corruption helper the
+/// five seeded-divergence tests below build on. A small binary parser for
+/// this crate's own `replay::Event` wire format (`crate::replay` in
+/// `src/replay.rs`) -- duplicated here deliberately rather than exposed
+/// from the library, since a test that could corrupt a log via the
+/// *encoder* it also decodes with would not be testing anything: this
+/// parser only needs to find event boundaries and byte-patch inside them,
+/// which does not require sharing code with the real (de)serializer.
+mod replay_gate {
+    use super::*;
+
+    /// Header layout, `src/replay.rs`'s `LogWriter`/`Header`: magic(8) +
+    /// version(4) + instructions_per_line(4) + rom_hash(8) +
+    /// chip_ram_size(4) + fast_ram_size(4) + initial_table(65536, one
+    /// byte per 64 KiB page, `PAGE_COUNT` = 2^32/2^16).
+    const HEADER_LEN: usize = 8 + 4 + 4 + 8 + 4 + 4 + 65536;
+
+    const TAG_IO_READ: u8 = 1;
+    const TAG_IO_WRITE: u8 = 2;
+    const TAG_IPL_CHANGE: u8 = 3;
+    const TAG_DEVICE_WRITE: u8 = 4;
+    const TAG_CLASSIFICATION_TRANSITION: u8 = 5;
+    const TAG_CHECKPOINT: u8 = 6;
+    const TAG_END: u8 = 0xFF;
+
+    /// One event's `(tag, start, end)` byte range within the log,
+    /// `start` at the tag byte, `end` exclusive.
+    fn parse_events(data: &[u8]) -> Vec<(u8, usize, usize)> {
+        let mut events = Vec::new();
+        let mut pos = HEADER_LEN;
+        while pos < data.len() {
+            let tag = data[pos];
+            let payload_start = pos + 1;
+            let reclen: usize = match tag {
+                TAG_IO_READ | TAG_IO_WRITE => 8 + 4 + 1 + 4,
+                TAG_IPL_CHANGE => 8 + 1,
+                TAG_DEVICE_WRITE => {
+                    let len_off = payload_start + 8 + 4;
+                    let len =
+                        u32::from_be_bytes(data[len_off..len_off + 4].try_into().unwrap()) as usize;
+                    8 + 4 + 4 + len
+                }
+                TAG_CLASSIFICATION_TRANSITION => 8 + 65536,
+                TAG_CHECKPOINT => 8 + 70,
+                TAG_END => 8 + 8 + 70 + 8 + 8, // + chip_ram_digest + fast_ram_digest (RAM-digest rework)
+                other => panic!("replay_gate::parse_events: unknown tag {other:#04x} at {pos}"),
+            };
+            let end = payload_start + reclen;
+            events.push((tag, pos, end));
+            pos = end;
+        }
+        events
+    }
+
+    /// The `n`-th (0-indexed) event of `tag`, panicking if there aren't
+    /// that many -- every seeded test below asserts its target actually
+    /// exists before corrupting it, rather than silently operating on an
+    /// empty match.
+    fn nth(events: &[(u8, usize, usize)], tag: u8, n: usize) -> (usize, usize) {
+        events
+            .iter()
+            .filter(|(t, _, _)| *t == tag)
+            .nth(n)
+            .map(|&(_, s, e)| (s, e))
+            .unwrap_or_else(|| panic!("no {n}-th event of tag {tag:#04x} in this log"))
+    }
+
+    pub struct Log {
+        pub bytes: Vec<u8>,
+    }
+
+    impl Log {
+        pub fn read(path: &Path) -> Self {
+            Log {
+                bytes: std::fs::read(path).unwrap_or_else(|e| panic!("read {path:?}: {e}")),
+            }
+        }
+
+        pub fn write(&self, path: &Path) {
+            std::fs::write(path, &self.bytes).unwrap_or_else(|e| panic!("write {path:?}: {e}"));
+        }
+
+        fn events(&self) -> Vec<(u8, usize, usize)> {
+            parse_events(&self.bytes)
+        }
+
+        /// Case (a): perturb one logged Io-read *value* (the low 4 bytes
+        /// of an `IoRead` record) -- an Io-read's value is never itself
+        /// asserted against anything on replay (it *is* the ground
+        /// truth the player returns), so detection can only come from a
+        /// later observable effect: the corrupted value changing guest
+        /// control flow enough to shift a subsequent I/O access's own
+        /// address/ordinal, which the very next `IoRead`/`IoWrite`
+        /// compare then catches. `n` selects which `IoRead` (0-indexed);
+        /// picking one that the guest actually branches on (a register
+        /// poll, not a discarded read) is what makes this observable --
+        /// see this test's own doc comment on how `n` was chosen.
+        pub fn perturb_io_read_value(&self, n: usize) -> Log {
+            let mut bytes = self.bytes.clone();
+            let (_, end) = nth(&self.events(), TAG_IO_READ, n);
+            for b in &mut bytes[end - 4..end] {
+                *b ^= 0xFF;
+            }
+            Log { bytes }
+        }
+
+        /// Case (b): drop the `n`-th `IplChange` event entirely.
+        pub fn drop_ipl_change(&self, n: usize) -> Log {
+            let mut bytes = self.bytes.clone();
+            let (start, end) = nth(&self.events(), TAG_IPL_CHANGE, n);
+            bytes.drain(start..end);
+            Log { bytes }
+        }
+
+        /// Case (c): flip one byte inside the `n`-th `DeviceWrite`
+        /// event's data payload (not its `addr`/`ordinal`/`len` header
+        /// fields) -- a corrupted byte the replayed guest later reads
+        /// back and acts on.
+        pub fn flip_device_write_byte(&self, n: usize) -> Log {
+            let mut bytes = self.bytes.clone();
+            let (start, _) = nth(&self.events(), TAG_DEVICE_WRITE, n);
+            let payload_start = start + 1 + 8 + 4 + 4; // tag + ordinal + addr + len
+            bytes[payload_start] ^= 0xFF;
+            Log { bytes }
+        }
+
+        /// Case (d): drop the `n`-th `ClassificationTransition` event.
+        pub fn drop_classification_transition(&self, n: usize) -> Log {
+            let mut bytes = self.bytes.clone();
+            let (start, end) = nth(&self.events(), TAG_CLASSIFICATION_TRANSITION, n);
+            bytes.drain(start..end);
+            Log { bytes }
+        }
+
+        /// Case (e): drop a `DeviceWrite` event whose target address lies
+        /// in chip RAM (`< 0x0020_0000`) -- the blitter's own synchronous
+        /// writes, as opposed to hostblk/pktport/pcibridge DMA (which in
+        /// this test's configuration lands in fast RAM, `>= 0x4000_0000`).
+        /// `from_end` counts backwards from the *last* chip-RAM
+        /// `DeviceWrite` (`0` = the last one, `1` = second-to-last, ...):
+        /// an early span is frequently overwritten by a later legitimate
+        /// blit before the recording ends, which erases the evidence a
+        /// whole-RAM digest at End would otherwise catch -- see this
+        /// test's own doc comment for why the *last* span, not an
+        /// arbitrary one, is what makes detection reliable.
+        pub fn drop_nth_chip_ram_device_write_from_end(&self, from_end: usize) -> Log {
+            let mut bytes = self.bytes.clone();
+            let events = self.events();
+            let chip_writes: Vec<(usize, usize)> = events
+                .iter()
+                .filter(|(t, _, _)| *t == TAG_DEVICE_WRITE)
+                .filter_map(|&(_, start, end)| {
+                    let addr_off = start + 1 + 8;
+                    let addr =
+                        u32::from_be_bytes(bytes[addr_off..addr_off + 4].try_into().unwrap());
+                    (addr < 0x0020_0000).then_some((start, end))
+                })
+                .collect();
+            let n = chip_writes
+                .len()
+                .checked_sub(1 + from_end)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "only {} chip-RAM DeviceWrite events in this log, cannot count {from_end} \
+                         back from the end",
+                        chip_writes.len()
+                    )
+                });
+            let (start, end) = chip_writes[n];
+            bytes.drain(start..end);
+            Log { bytes }
+        }
+    }
+
+    /// Records a short `fixed`-mode HD boot to a fresh temp log, returning
+    /// its path. `frames` controls both the recording's `--max-frames`
+    /// and (implicitly, via `--replay` reading the whole log) the
+    /// replay's own extent -- the player has no `--max-frames` of its own
+    /// (`docs/replay-log.md`: replay is bounded by the log, not by a
+    /// frame count).
+    pub fn record(
+        rom: &str,
+        hd: &str,
+        frames: u64,
+        name: &str,
+        checkpoint_interval: Option<u64>,
+    ) -> (std::path::PathBuf, String) {
+        let log_path = std::env::temp_dir().join(format!(
+            "machine-hosted-replay-{name}-{}.log",
+            std::process::id()
+        ));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_machine-hosted"));
+        cmd.args([
+            "--rom",
+            rom,
+            "--hostblk",
+            hd,
+            "--cpu-speed",
+            "fixed",
+            "--max-frames",
+            &frames.to_string(),
+            "--max-instructions",
+            "0",
+            "--record",
+            log_path.to_str().unwrap(),
+        ]);
+        if let Some(interval) = checkpoint_interval {
+            cmd.env("REPLAY_CHECKPOINT_INTERVAL", interval.to_string());
+        }
+        let output = cmd.output().expect("spawn machine-hosted --record");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        // Exit code 1 (`Outcome::LimitReached`) is the *expected* outcome
+        // here -- the recording deliberately runs to `--max-frames`, not
+        // to a clean halt -- so this only rejects a genuine setup error
+        // (3) or an unexpected wedge (2), not a bounded, successful
+        // recording. The `record:` event-count line is the actual proof
+        // the recording worked.
+        let exit_code = output.status.code().unwrap_or(-1);
+        assert!(
+            exit_code == 0 || exit_code == 1,
+            "recording failed: exit {exit_code}\n{stdout}",
+        );
+        assert!(
+            stdout.contains("record:") && stdout.contains("classification-transitions"),
+            "recording run did not print its own event-count summary:\n{stdout}"
+        );
+        (log_path, stdout)
+    }
+
+    /// Replays `log_path` against the same ROM/HD, returning
+    /// `(exit_success, stdout)`.
+    pub fn replay(rom: &str, hd: &str, log_path: &Path) -> (bool, String) {
+        let output = Command::new(env!("CARGO_BIN_EXE_machine-hosted"))
+            .args([
+                "--rom",
+                rom,
+                "--hostblk",
+                hd,
+                "--cpu-speed",
+                "fixed",
+                "--max-frames",
+                "0",
+                "--max-instructions",
+                "0",
+                "--replay",
+                log_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("spawn machine-hosted --replay");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    }
+}
+
+/// The self-replay gate (`docs/cpu-core-proposal.md` §5.3's C1 slice,
+/// `docs/replay-log.md`): record a real 500-frame HD boot under `--cpu-
+/// speed fixed`, confirm the recording run still reaches the same
+/// narration milestone an unrecorded `fixed`-mode boot does (the overlay-
+/// cleared marker), then replay the log and assert the player's own
+/// "clean" success line with zero divergences.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
+fn record_replay_self_replay_gate() {
+    let rom = kickstart_a1200();
+    let hd = hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+
+    let (log_path, recording_stdout) = replay_gate::record(&rom, &hd, 500, "self-replay", None);
+    assert!(
+        recording_stdout.contains("PHASE1 HOSTED: reached overlay-cleared"),
+        "recording run did not reach the overlay-cleared milestone:\n{recording_stdout}"
+    );
+    assert!(
+        recording_stdout.contains("record:")
+            && recording_stdout.contains("classification-transitions"),
+        "recording run did not print its own event-count summary:\n{recording_stdout}"
+    );
+
+    let (ok, replay_stdout) = replay_gate::replay(&rom, &hd, &log_path);
+    eprintln!("{replay_stdout}");
+    assert!(
+        ok,
+        "replay of an uncorrupted log must succeed (exit 0):\n{replay_stdout}"
+    );
+    assert!(
+        replay_stdout.contains("REPLAY CLEAN") && replay_stdout.contains("zero divergences"),
+        "expected the player's clean-replay success line:\n{replay_stdout}"
+    );
+}
+
+/// Seeded divergence (a): perturbing one logged `IoRead` value. Detection
+/// is indirect (see `Log::perturb_io_read_value`'s own doc comment): the
+/// player itself never validates a read's *value*, only that it serves
+/// whatever the log says, so the corruption is only caught once it has
+/// visibly changed guest control flow -- here, a few dozen instructions
+/// later, when a *different* I/O access than the corrupted one's own next
+/// occurrence turns up at an unexpected ordinal. `n = 10` (the 11th
+/// logged `IoRead`) was chosen empirically: this boot's very first
+/// `IoRead`s are the CPU's own RESET-vector SSP/PC fetches, which real
+/// Kickstart boot code discards within its first few instructions (it
+/// programs its own supervisor stack immediately) -- corrupting index 0
+/// was tried and, as expected once understood, produced no observable
+/// effect at all. Index 10 lands inside early polling activity and is
+/// reliably observed to diverge.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
+fn seeded_divergence_a_perturbed_io_read_value() {
+    let rom = kickstart_a1200();
+    let hd = hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+    let (log_path, _record_stdout) = replay_gate::record(&rom, &hd, 60, "seed-a", None);
+
+    let (ok_clean, clean_out) = replay_gate::replay(&rom, &hd, &log_path);
+    assert!(ok_clean, "uncorrupted log must replay clean:\n{clean_out}");
+    assert!(clean_out.contains("REPLAY CLEAN"));
+
+    let corrupted = replay_gate::Log::read(&log_path).perturb_io_read_value(10);
+    let corrupted_path = std::env::temp_dir().join(format!(
+        "machine-hosted-replay-seed-a-corrupted-{}.log",
+        std::process::id()
+    ));
+    corrupted.write(&corrupted_path);
+
+    let (ok_bad, bad_out) = replay_gate::replay(&rom, &hd, &corrupted_path);
+    eprintln!("{bad_out}");
+    assert!(!ok_bad, "corrupted log must not replay as a success");
+    assert!(
+        bad_out.contains("WEDGED") && bad_out.contains("replay divergence"),
+        "expected a reported replay divergence:\n{bad_out}"
+    );
+    assert!(
+        !bad_out.contains("REPLAY CLEAN"),
+        "a corrupted log must never report clean:\n{bad_out}"
+    );
+}
+
+/// Seeded divergence (b): dropping the first `IplChange` event. Detected
+/// as a log desync -- the player's next attempted I/O access finds a
+/// different event kind at the head of the queue (whatever followed the
+/// dropped `IplChange`), reported immediately rather than silently
+/// consuming the wrong event.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
+fn seeded_divergence_b_dropped_ipl_change() {
+    let rom = kickstart_a1200();
+    let hd = hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+    let (log_path, _record_stdout) = replay_gate::record(&rom, &hd, 60, "seed-b", None);
+
+    let (ok_clean, clean_out) = replay_gate::replay(&rom, &hd, &log_path);
+    assert!(ok_clean, "uncorrupted log must replay clean:\n{clean_out}");
+
+    let corrupted = replay_gate::Log::read(&log_path).drop_ipl_change(0);
+    let corrupted_path = std::env::temp_dir().join(format!(
+        "machine-hosted-replay-seed-b-corrupted-{}.log",
+        std::process::id()
+    ));
+    corrupted.write(&corrupted_path);
+
+    let (ok_bad, bad_out) = replay_gate::replay(&rom, &hd, &corrupted_path);
+    eprintln!("{bad_out}");
+    assert!(!ok_bad, "corrupted log must not replay as a success");
+    assert!(
+        bad_out.contains("WEDGED") && bad_out.contains("replay divergence"),
+        "expected a reported replay divergence:\n{bad_out}"
+    );
+}
+
+/// Seeded divergence (c): flipping one byte inside a `DeviceWrite`
+/// event's data payload. Targets index 600 of 627 device-writes in this
+/// 60-frame recording -- in this boot configuration, a hostblk/pktport
+/// DMA span into fast RAM (512-byte sector-sized spans, unlike the
+/// blitter's own small chip-RAM row writes) -- rather than an early one:
+/// the corrupted byte needs to be read back by the guest before it can
+/// change control flow, and DMA'd sector data is read back almost
+/// immediately (filesystem/RDB parsing).
+///
+/// **What this actually detects, confirmed rather than assumed:** a mid-
+/// run log desync (`replay log desync: expected an I/O event ...`), well
+/// before the log's `End` record is ever reached -- the corrupted byte
+/// changes guest behaviour quickly enough that this is caught the
+/// ordinary way, the same mechanism cases (a)/(b)/(d) use. The `Event::
+/// End` whole-RAM digest added after this test was written (see
+/// `seeded_divergence_e_*`'s own doc comment) is a backstop for
+/// divergences that *survive undetected* until the end of the log; it is
+/// not what fires here, since the mid-run desync is reached first and a
+/// `Player`'s divergence is sticky (only the *first* one is ever kept,
+/// `Player::record_divergence`'s own doc comment) -- this run's own
+/// output is exactly the desync line, never `RAM digest mismatch at
+/// End`. An early chip-RAM (blitter) span, by contrast, does *not* cause
+/// a mid-run desync in this boot configuration -- see
+/// `seeded_divergence_e_*` for that case, which relies entirely on the
+/// End-digest backstop instead.
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
+fn seeded_divergence_c_flipped_device_write_byte() {
+    let rom = kickstart_a1200();
+    let hd = hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+    let (log_path, _record_stdout) = replay_gate::record(&rom, &hd, 60, "seed-c", None);
+
+    let (ok_clean, clean_out) = replay_gate::replay(&rom, &hd, &log_path);
+    assert!(ok_clean, "uncorrupted log must replay clean:\n{clean_out}");
+
+    // Index 600 (of 627 in this 60-frame recording) is a hostblk DMA span
+    // into fast RAM, read back by the guest almost immediately (sector
+    // data feeding filesystem/RDB parsing) -- chosen empirically the same
+    // way case (a)'s `IoRead` index was: an early index landed on data
+    // never revisited within this short recording and was not detected.
+    let corrupted = replay_gate::Log::read(&log_path).flip_device_write_byte(600);
+    let corrupted_path = std::env::temp_dir().join(format!(
+        "machine-hosted-replay-seed-c-corrupted-{}.log",
+        std::process::id()
+    ));
+    corrupted.write(&corrupted_path);
+
+    let (ok_bad, bad_out) = replay_gate::replay(&rom, &hd, &corrupted_path);
+    eprintln!("{bad_out}");
+    assert!(!ok_bad, "corrupted log must not replay as a success");
+    assert!(
+        bad_out.contains("WEDGED") && bad_out.contains("replay divergence"),
+        "expected a reported replay divergence:\n{bad_out}"
+    );
+}
+
+/// Seeded divergence (d): dropping the first `ClassificationTransition`
+/// event. Expected detection point, per the milestone brief: "the Io-read
+/// address assert fires at the first access the stale table misclassifies".
+/// Confirmed: with the first transition (the overlay-clear retype) missing,
+/// the player keeps treating low chip RAM as `Io` past the point the real
+/// table switched it to `Ram`, so the very next access there is looked up
+/// against the log as an `IoRead`/`IoWrite` instead of served from
+/// `GuestMemory` -- observed here as an `IoWrite` mismatch (the address
+/// the player expected from the stale-Io path does not match what the log
+/// says came next, since the recorder itself stopped logging that address
+/// once its own table flipped to `Ram`).
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
+fn seeded_divergence_d_dropped_classification_transition() {
+    let rom = kickstart_a1200();
+    let hd = hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+    let (log_path, _record_stdout) = replay_gate::record(&rom, &hd, 60, "seed-d", None);
+
+    let (ok_clean, clean_out) = replay_gate::replay(&rom, &hd, &log_path);
+    assert!(ok_clean, "uncorrupted log must replay clean:\n{clean_out}");
+
+    let corrupted = replay_gate::Log::read(&log_path).drop_classification_transition(0);
+    let corrupted_path = std::env::temp_dir().join(format!(
+        "machine-hosted-replay-seed-d-corrupted-{}.log",
+        std::process::id()
+    ));
+    corrupted.write(&corrupted_path);
+
+    let (ok_bad, bad_out) = replay_gate::replay(&rom, &hd, &corrupted_path);
+    eprintln!("{bad_out}");
+    assert!(!ok_bad, "corrupted log must not replay as a success");
+    assert!(
+        bad_out.contains("WEDGED") && bad_out.contains("replay divergence"),
+        "expected a reported replay divergence:\n{bad_out}"
+    );
+}
+
+/// Seeded divergence (e): dropping one blitter-span `DeviceWrite` event
+/// (a chip-RAM-range span from the blitter's own synchronous writes, as
+/// opposed to a DMA span from hostblk/pktport/pcibridge).
+///
+/// **History, not just the current behaviour:** the first version of this
+/// test recorded that dropping an *early* chip-RAM span was never
+/// observed to diverge in a headless (no `--graphics`/screenshot) boot --
+/// register-only checkpoints (`docs/cpu-core-proposal.md` §5.3's own
+/// design: `D0-D7, A0-A7, PC, SR`, no RAM hash) cannot see a divergence
+/// confined to RAM content the guest CPU never reads back, and an early
+/// span in this boot's draw sequence is itself usually overwritten by a
+/// later legitimate blit before the recording ends anyway -- so even a
+/// whole-RAM comparison at the very end would find nothing left to
+/// disagree about. That finding was real and is kept in `docs/replay-
+/// log.md`'s history, but it also named the actual gap precisely enough
+/// to fix: a whole-RAM digest in the log's `End` record
+/// (`Event::End::chip_ram_digest`/`fast_ram_digest`), computed by the
+/// recorder from what really happened and recomputed by the player from
+/// its own replayed RAM, catches exactly this class -- *provided* the
+/// corrupted bytes are still different at the moment the log ends, which
+/// is why this test targets the **last** chip-RAM `DeviceWrite`
+/// (`Log::drop_nth_chip_ram_device_write_from_end(0)`) rather than an
+/// early one: the last span in the recording has no later blit left to
+/// paper over it.
+///
+/// **The caveat this does not remove:** detection is at End, not at the
+/// dropped event's own ordinal -- a digest mismatch says "the final RAM
+/// states disagree somewhere," not where. Localizing a RAM-only
+/// divergence to the instruction that caused it needs C2's checkpointed-
+/// RAM-snapshot bisection, deferred (`docs/cpu-core-proposal.md` §5.3's
+/// own risk section: "a ring with checkpointed RAM snapshots when a
+/// divergence window is known").
+#[test]
+#[ignore = "requires a user-supplied Kickstart ROM and HD image on disk; run with --ignored"]
+fn seeded_divergence_e_dropped_blitter_span_detected_via_ram_digest_at_end() {
+    let rom = kickstart_a1200();
+    let hd = hd_image();
+    if !have_fixtures(&[&rom, &hd]) {
+        return;
+    }
+    let (log_path, _record_stdout) = replay_gate::record(&rom, &hd, 60, "seed-e", None);
+
+    let (ok_clean, clean_out) = replay_gate::replay(&rom, &hd, &log_path);
+    assert!(ok_clean, "uncorrupted log must replay clean:\n{clean_out}");
+    assert!(clean_out.contains("REPLAY CLEAN"));
+
+    let corrupted = replay_gate::Log::read(&log_path).drop_nth_chip_ram_device_write_from_end(0);
+    let corrupted_path = std::env::temp_dir().join(format!(
+        "machine-hosted-replay-seed-e-corrupted-{}.log",
+        std::process::id()
+    ));
+    corrupted.write(&corrupted_path);
+
+    let (ok_bad, bad_out) = replay_gate::replay(&rom, &hd, &corrupted_path);
+    eprintln!("{bad_out}");
+    assert!(!ok_bad, "corrupted log must not replay as a success");
+    assert!(
+        bad_out.contains("WEDGED") && bad_out.contains("RAM digest mismatch at End"),
+        "expected a reported RAM-digest divergence at End:\n{bad_out}"
+    );
+    assert!(
+        bad_out.contains("chip RAM"),
+        "expected the mismatch to name chip RAM specifically:\n{bad_out}"
     );
 }

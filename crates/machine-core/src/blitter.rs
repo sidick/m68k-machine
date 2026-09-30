@@ -237,16 +237,36 @@ impl Blitter {
     ///
     /// Returns `true` if a blit actually ran, which the bus turns into
     /// the blitter-finished interrupt (`INTREQ` bit 6).
+    ///
+    /// Thin wrapper over [`Self::execute_logged`] with no device-write
+    /// log, for every caller (all of this module's own tests, and any
+    /// other code that just wants a blit to run) that does not care
+    /// about `docs/cpu-core-proposal.md` §5.3's record/replay log --
+    /// keeps those call sites unchanged.
     pub fn execute(&mut self, ram: &mut [u8; CHIP_RAM_SIZE]) -> bool {
+        self.execute_logged(ram, None)
+    }
+
+    /// As [`Self::execute`], but also records every word this blit
+    /// writes into chip RAM into `log` when it is `Some` --
+    /// `MachineBus::run_blitter` is the only caller that passes one, so
+    /// the same log `ram_slice_mut` grants feed also captures the
+    /// blitter's own direct writes (`crate::MachineBus::
+    /// set_device_write_log`'s doc comment on why both are needed).
+    pub(crate) fn execute_logged(
+        &mut self,
+        ram: &mut [u8; CHIP_RAM_SIZE],
+        log: Option<&mut crate::DeviceWriteLog>,
+    ) -> bool {
         if !self.pending {
             return false;
         }
         self.pending = false;
         self.zero = true;
         if self.bltcon1 & BLTCON1_LINE != 0 {
-            self.execute_line(ram);
+            self.execute_line(ram, log);
         } else {
-            self.execute_area(ram);
+            self.execute_area(ram, log);
         }
         true
     }
@@ -255,7 +275,11 @@ impl Blitter {
     /// with the A/B barrel shifters, the A first/last-word masks,
     /// per-channel modulos, ascending/descending direction, and
     /// inclusive/exclusive fill.
-    fn execute_area(&mut self, ram: &mut [u8; CHIP_RAM_SIZE]) {
+    fn execute_area(
+        &mut self,
+        ram: &mut [u8; CHIP_RAM_SIZE],
+        mut log: Option<&mut crate::DeviceWriteLog>,
+    ) {
         let con0 = self.bltcon0;
         let con1 = self.bltcon1;
         let use_a = con0 & BLTCON0_USEA != 0;
@@ -372,7 +396,7 @@ impl Blitter {
                 last_d = d;
 
                 if use_d {
-                    write_word(ram, dpt, d);
+                    write_word(ram, dpt, d, &mut log);
                     dpt = dpt.wrapping_add(step as u32);
                 }
             }
@@ -426,7 +450,11 @@ impl Blitter {
     /// oracle), but is not independently cross-checked the way the
     /// octant/accumulator math is — low confidence there relative to
     /// the rest of line mode.
-    fn execute_line(&mut self, ram: &mut [u8; CHIP_RAM_SIZE]) {
+    fn execute_line(
+        &mut self,
+        ram: &mut [u8; CHIP_RAM_SIZE],
+        mut log: Option<&mut crate::DeviceWriteLog>,
+    ) {
         let con0 = self.bltcon0;
         let lf = (con0 & 0x00FF) as u8;
         let use_a = con0 & BLTCON0_USEA != 0;
@@ -492,7 +520,7 @@ impl Blitter {
             }
             last_d = d;
             if use_c && line_pixel {
-                write_word(ram, dpt, d);
+                write_word(ram, dpt, d, &mut log);
             }
             dpt = cpt;
             bdat = bdat.rotate_left(1);
@@ -529,11 +557,25 @@ fn read_word(ram: &[u8; CHIP_RAM_SIZE], ptr: u32) -> u16 {
     u16::from_be_bytes([ram[off], ram[off + 1]])
 }
 
-fn write_word(ram: &mut [u8; CHIP_RAM_SIZE], ptr: u32, value: u16) {
+/// Writes one word to chip RAM at the sanitized address `chip_addr(ptr)`
+/// masks `ptr` down to, and records it into `log` (if attached) at that
+/// same sanitized address -- the address a caller reading
+/// [`crate::MachineBus::device_write_spans`] back needs to line up with
+/// what a wild pointer actually touched, not the raw guest-supplied
+/// `ptr`.
+fn write_word(
+    ram: &mut [u8; CHIP_RAM_SIZE],
+    ptr: u32,
+    value: u16,
+    log: &mut Option<&mut crate::DeviceWriteLog>,
+) {
     let off = chip_addr(ptr);
     let bytes = value.to_be_bytes();
     ram[off] = bytes[0];
     ram[off + 1] = bytes[1];
+    if let Some(log) = log.as_deref_mut() {
+        log.record(off as u32, 2);
+    }
 }
 
 /// All-bits-parallel evaluation of the 8-bit minterm `lf` on three

@@ -74,6 +74,13 @@ pub trait HookCpu {
     /// serviceable) before the next instruction fetch.
     fn set_irq(&mut self, level: u8);
 
+    /// The full status register (flags plus the supervisor/trace/IPL-mask
+    /// bits) -- `docs/cpu-core-proposal.md` §5.3's replay checkpoints need
+    /// this alongside `dar`/`pc` to compare complete CPU state at a
+    /// checkpoint or at the log's end, which `int_mask` alone (already
+    /// exposed above) does not cover.
+    fn sr(&self) -> u16;
+
     /// Take the real 68k A-line exception for a trap this core surfaced
     /// rather than auto-dispatching (this crate's `run.rs` module doc,
     /// "Traps are not auto-dispatched"). Returns the exception-entry
@@ -271,6 +278,9 @@ impl HookCpu for m68k::CpuCore {
     fn set_irq(&mut self, level: u8) {
         m68k::CpuCore::set_irq(self, level)
     }
+    fn sr(&self) -> u16 {
+        m68k::CpuCore::get_sr(self)
+    }
     fn take_aline_exception(&mut self, bus: &mut Bus) -> i32 {
         m68k::CpuCore::take_aline_exception(self, bus)
     }
@@ -319,6 +329,9 @@ impl HookCpu for M68kRsCore {
     }
     fn set_irq(&mut self, level: u8) {
         self.inner.set_irq(level)
+    }
+    fn sr(&self) -> u16 {
+        self.inner.sr()
     }
     fn take_aline_exception(&mut self, bus: &mut Bus) -> i32 {
         self.inner.take_aline_exception(bus)
@@ -505,6 +518,8 @@ mod tests {
                 None,
                 false,
                 false,
+                None,
+                None,
                 None,
                 None,
             )

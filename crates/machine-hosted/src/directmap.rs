@@ -152,17 +152,29 @@ pub const PAGE_COUNT: usize = 1 << (32 - PAGE_BITS);
 const RESERVATION_LEN: usize = 1usize << 32;
 
 #[inline]
-fn page_of(addr: u32) -> usize {
+pub(crate) fn page_of(addr: u32) -> usize {
     (addr >> PAGE_BITS) as usize
 }
 
 #[inline]
-fn page_base(page: usize) -> u32 {
+pub(crate) fn page_base(page: usize) -> u32 {
     (page as u32) << PAGE_BITS
 }
 
 /// One 64 KiB guest page's classification. See the module docs' "Page-
 /// type table" section for the invariant each variant carries.
+///
+/// This type (and the table-building logic below, [`build_page_table`])
+/// is also the classifier `crate::replay`'s recorder and player share
+/// (`docs/cpu-core-proposal.md` §5.3, `docs/replay-log.md`): a page-type
+/// table is exactly what both need to decide "pass through/RAM/ROM/open
+/// bus, or log/replay an I/O access", and it would be wrong to grow a
+/// second, independent classifier for the same job this module already
+/// does correctly. Neither the direct map's mmap reservation nor its
+/// `PROT_NONE` semantics are implied by the type itself -- only
+/// [`DirectMap`] attaches that meaning to `Ram`/`Rom` vs `Io`/`OpenBus`;
+/// `crate::replay` attaches a different one (serve from `GuestMemory`/log
+/// vs pass through/log) to the same four variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageType {
     /// Backed by real, writable host memory in the reservation (chip
@@ -179,6 +191,38 @@ pub enum PageType {
     /// `1` bits and writes are swallowed inline, without touching
     /// [`MachineBus`] at all (`bus.rs`'s access rules).
     OpenBus,
+}
+
+impl PageType {
+    /// Stable one-byte encoding for `crate::replay`'s log format (the
+    /// header's initial table and every `ClassificationTransition`
+    /// event). Never reordered -- a recorded log's bytes must decode the
+    /// same way regardless of which future variant order this enum ends
+    /// up with in source.
+    pub fn to_code(self) -> u8 {
+        match self {
+            PageType::Ram => 0,
+            PageType::Rom => 1,
+            PageType::Io => 2,
+            PageType::OpenBus => 3,
+        }
+    }
+
+    /// Inverse of [`Self::to_code`]. An unrecognised code (a corrupted or
+    /// truncated log, or a future version this build predates) decodes as
+    /// [`PageType::Io`] -- the safe, "fall through and ask the log"
+    /// choice, never `Ram`/`Rom` (which could otherwise mis-serve a
+    /// corrupted table's address as real memory) and never `OpenBus`
+    /// (which would silently swallow what might actually be logged
+    /// traffic).
+    pub fn from_code(code: u8) -> PageType {
+        match code {
+            0 => PageType::Ram,
+            1 => PageType::Rom,
+            3 => PageType::OpenBus,
+            _ => PageType::Io,
+        }
+    }
 }
 
 /// One anonymous POSIX shared-memory region: a random `shm_open` name,
@@ -320,14 +364,14 @@ impl Drop for ShmRegion {
 /// on placement change"). Deliberately allocation-free and cheap to
 /// compare -- a fixed-size array of `Copy` data, not a `Vec`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Fingerprint {
+pub(crate) struct Fingerprint {
     overlay: bool,
     placements: [Option<(u32, u32)>; autoconfig::MAX_BOARDS],
     fast_window: Option<(u32, u32)>,
 }
 
 impl Fingerprint {
-    fn of(bus: &MachineBus) -> Self {
+    pub(crate) fn of(bus: &MachineBus) -> Self {
         let mut placements = [None; autoconfig::MAX_BOARDS];
         for (i, slot) in placements.iter_mut().enumerate() {
             *slot = bus.autoconfig.placement(i).map(|c| (c.base, c.size_bytes));
@@ -338,6 +382,146 @@ impl Fingerprint {
             fast_window: bus.fast_ram_window(),
         }
     }
+}
+
+/// Pure page-type-table construction from `bus`'s current state --
+/// factored out of [`DirectMap::rebuild`] (`docs/cpu-core-proposal.md`
+/// §5.3's C1 replay harness, `crate::replay`) so both callers -- the
+/// direct map, and the recorder/player's own classifier -- run exactly
+/// one classification rule set, never two that could quietly drift apart.
+/// Allocates and returns a fresh table rather than mutating one in place;
+/// [`DirectMap::rebuild`] is now a two-line wrapper around this, and its
+/// own behaviour (and its differential/unit test coverage) is unchanged
+/// by the refactor.
+///
+/// `fast_ram_mapped` is the fast-RAM extent to type `Ram`, distinct from
+/// `bus.fast_ram_window()`'s bare declared/clamped window: [`DirectMap`]
+/// passes its own `fast_alias` (the actually-mapped, 64 KiB-page-rounded
+/// mmap alias -- see [`DirectMap::sync`]'s own comment on why a partial
+/// trailing page must stay `Io` on that path, since a raw pointer read
+/// past the real buffer would be undefined behaviour there). `crate::replay`'s
+/// recorder/player have no mmap alias to round -- they serve `Ram` pages
+/// through [`machine_core::GuestMemory::ram_slice`], which already clips
+/// to the real buffer and returns `None` rather than reading out of
+/// bounds -- so they pass `bus.fast_ram_window()` directly, unrounded.
+/// Either choice produces the same table when the window's length is
+/// already a whole number of 64 KiB pages, which is the common case;
+/// they can differ only in the sub-page tail of an unusually-sized fast
+/// RAM board, where the direct map's caller-provided extent controls
+/// what's safe to type `Ram` and the replay caller's own contract (fail
+/// closed via `Option`, never `unsafe`) makes rounding unnecessary.
+///
+/// Precedence: fixed architectural ranges first, then every
+/// AUTOCONFIG-placed board (which can, and for VRAM boards deliberately
+/// does, retype a page a fixed rule already touched -- see the
+/// CIA/custom/AUTOCONFIG-window ranges below, none of which any real
+/// board is ever placed over, so in practice there is no actual overlap
+/// on this machine's map, but the precedence is still fixed-then-placed
+/// so a hypothetical future overlap resolves predictably).
+pub fn build_page_table(
+    bus: &MachineBus,
+    rom_is_full_window: bool,
+    fast_ram_mapped: Option<(u32, u32)>,
+) -> Box<[PageType; PAGE_COUNT]> {
+    let mut pages = Box::new([PageType::OpenBus; PAGE_COUNT]);
+
+    // Chip RAM, split by the overlay flag: while it's mapped, the
+    // low `OVERLAY_END` bytes read ROM and write chip RAM
+    // (`MachineBus` handles both sides of that already), so those
+    // pages are `Io`, not `Ram`, while overlay is active.
+    // `OVERLAY_END` is an exact 64 KiB page boundary (`0x80000` =
+    // eight pages), so this split never needs a partial-page case.
+    let overlay = bus.overlay();
+    for page in page_of(CHIP_RAM_BASE)..page_of(CHIP_RAM_END) {
+        let in_overlay = overlay && page_base(page) < OVERLAY_END;
+        pages[page] = if in_overlay {
+            PageType::Io
+        } else {
+            PageType::Ram
+        };
+    }
+
+    for page in page_of(CIA_BASE)..page_of(CIA_END) {
+        pages[page] = PageType::Io;
+    }
+
+    pages[page_of(CUSTOM_BASE)] = PageType::Io;
+
+    for page in page_of(autoconfig::AUTOCONFIG_BASE)..page_of(autoconfig::AUTOCONFIG_END) {
+        pages[page] = PageType::Io;
+    }
+
+    // Ext ROM window: `Io` unconditionally (module docs explain why
+    // this is fine whether or not `--ext-rom` was actually given).
+    let ext_rom_end = rom_module::EXT_ROM_BASE + rom_module::EXT_ROM_WINDOW_SIZE as u32;
+    for page in page_of(rom_module::EXT_ROM_BASE)..page_of(ext_rom_end) {
+        pages[page] = PageType::Io;
+    }
+
+    // ROM window: `Rom` only when the image exactly fills it
+    // (module docs' "ROM" section); otherwise `Io`, so a read
+    // through the reservation is never attempted and
+    // `read_mirrored`'s wraparound is left to `MachineBus`.
+    let rom_end = ROM_BASE + ROM_WINDOW_SIZE as u32;
+    let rom_type = if rom_is_full_window {
+        PageType::Rom
+    } else {
+        PageType::Io
+    };
+    for page in page_of(ROM_BASE)..page_of(rom_end) {
+        pages[page] = rom_type;
+    }
+
+    // AUTOCONFIG-placed boards: iterate every configured slot, never
+    // a constant. The board whose base matches
+    // `bus.fast_ram_window()` is fast RAM; every other placed board
+    // (hostblk, pktport, input, rtgboard, pcibridge, graphics VRAM)
+    // is `Io` in this slice (module docs' "VRAM is deliberately not
+    // Ram" section).
+    let fast_window = bus.fast_ram_window();
+    for i in 0..autoconfig::MAX_BOARDS {
+        let Some(cfg) = bus.autoconfig.placement(i) else {
+            continue;
+        };
+        let is_fast_ram = fast_window.is_some_and(|(fbase, _)| fbase == cfg.base);
+        if is_fast_ram {
+            // `Ram` typing must come from `fast_ram_mapped` -- what is
+            // *actually* backed right now, per the caller's own contract
+            // -- not from `bus.fast_ram_window()`'s declared/clamped
+            // extent alone; see this function's own doc comment for why
+            // the two callers pass different things here.
+            let mapped = fast_ram_mapped
+                .filter(|&(base, _)| base == cfg.base)
+                .map_or(0, |(_, len)| len);
+            let ram_end = cfg.base.saturating_add(mapped);
+            for page in page_of(cfg.base)..page_of(ram_end) {
+                if page < PAGE_COUNT {
+                    pages[page] = PageType::Ram;
+                }
+            }
+            // The remainder of the *declared* window beyond the
+            // actually-mapped RAM part -- including a sub-page tail,
+            // or (when nothing is mapped at all) the whole window --
+            // stays `Io`, matching `MachineBus`'s own clamped-window
+            // semantics.
+            let decl_end = cfg.base.saturating_add(cfg.size_bytes);
+            let io_start_page = page_of(ram_end);
+            let io_end_page = page_of(decl_end.saturating_sub(1)).saturating_add(1);
+            for page in io_start_page..io_end_page.min(PAGE_COUNT) {
+                if pages[page] != PageType::Ram {
+                    pages[page] = PageType::Io;
+                }
+            }
+        } else {
+            let end = cfg.base.saturating_add(cfg.size_bytes);
+            let end_page = page_of(end.saturating_sub(1).max(cfg.base)).saturating_add(1);
+            for page in page_of(cfg.base)..end_page.min(PAGE_COUNT) {
+                pages[page] = PageType::Io;
+            }
+        }
+    }
+
+    pages
 }
 
 /// The direct address-space mapping: a 4 GiB `PROT_NONE` reservation,
@@ -560,126 +744,14 @@ impl DirectMap {
         self.fingerprint = fp;
     }
 
-    /// Full page-type-table rebuild from `bus`'s current state. See the
-    /// module docs' "Classification asks the bus" section for the
-    /// precedence: fixed architectural ranges first, then every
-    /// AUTOCONFIG-placed board (which can, and for VRAM boards
-    /// deliberately does, retype a page a fixed rule already touched --
-    /// see the CIA/custom/AUTOCONFIG-window ranges below, none of which
-    /// any real board is ever placed over, so in practice there is no
-    /// actual overlap on this machine's map, but the precedence is
-    /// still fixed-then-placed so a hypothetical future overlap resolves
-    /// predictably).
+    /// Full page-type-table rebuild from `bus`'s current state --
+    /// delegates to [`build_page_table`], passing `self.fast_alias` as
+    /// the "actually mapped" extent (see that function's own doc comment
+    /// for why this must be the mmap alias, not the bare declared/clamped
+    /// window). No behaviour change from before this was factored out:
+    /// this is the same computation, now shared with `crate::replay`.
     fn rebuild(&mut self, bus: &MachineBus) {
-        self.pages.fill(PageType::OpenBus);
-
-        // Chip RAM, split by the overlay flag: while it's mapped, the
-        // low `OVERLAY_END` bytes read ROM and write chip RAM
-        // (`MachineBus` handles both sides of that already), so those
-        // pages are `Io`, not `Ram`, while overlay is active.
-        // `OVERLAY_END` is an exact 64 KiB page boundary (`0x80000` =
-        // eight pages), so this split never needs a partial-page case.
-        let overlay = bus.overlay();
-        for page in page_of(CHIP_RAM_BASE)..page_of(CHIP_RAM_END) {
-            let in_overlay = overlay && page_base(page) < OVERLAY_END;
-            self.pages[page] = if in_overlay {
-                PageType::Io
-            } else {
-                PageType::Ram
-            };
-        }
-
-        for page in page_of(CIA_BASE)..page_of(CIA_END) {
-            self.pages[page] = PageType::Io;
-        }
-
-        self.pages[page_of(CUSTOM_BASE)] = PageType::Io;
-
-        for page in page_of(autoconfig::AUTOCONFIG_BASE)..page_of(autoconfig::AUTOCONFIG_END) {
-            self.pages[page] = PageType::Io;
-        }
-
-        // Ext ROM window: `Io` unconditionally (module docs explain why
-        // this is fine whether or not `--ext-rom` was actually given).
-        let ext_rom_end = rom_module::EXT_ROM_BASE + rom_module::EXT_ROM_WINDOW_SIZE as u32;
-        for page in page_of(rom_module::EXT_ROM_BASE)..page_of(ext_rom_end) {
-            self.pages[page] = PageType::Io;
-        }
-
-        // ROM window: `Rom` only when the image exactly fills it
-        // (module docs' "ROM" section); otherwise `Io`, so a read
-        // through the reservation is never attempted and
-        // `read_mirrored`'s wraparound is left to `MachineBus`.
-        let rom_end = ROM_BASE + ROM_WINDOW_SIZE as u32;
-        let rom_type = if self.rom_is_full_window {
-            PageType::Rom
-        } else {
-            PageType::Io
-        };
-        for page in page_of(ROM_BASE)..page_of(rom_end) {
-            self.pages[page] = rom_type;
-        }
-
-        // AUTOCONFIG-placed boards: iterate every configured slot, never
-        // a constant. The board whose base matches
-        // `bus.fast_ram_window()` is fast RAM; every other placed board
-        // (hostblk, pktport, input, rtgboard, pcibridge, graphics VRAM)
-        // is `Io` in this slice (module docs' "VRAM is deliberately not
-        // Ram" section).
-        let fast_window = bus.fast_ram_window();
-        for i in 0..autoconfig::MAX_BOARDS {
-            let Some(cfg) = bus.autoconfig.placement(i) else {
-                continue;
-            };
-            let is_fast_ram = fast_window.is_some_and(|(fbase, _)| fbase == cfg.base);
-            if is_fast_ram {
-                // Ram typing must come from `self.fast_alias` -- what is
-                // *actually* mapped in the reservation right now -- not
-                // from `bus.fast_ram_window()`'s declared/clamped extent
-                // alone. `fast_fd` can be `None` (no shm region for fast
-                // RAM at all, e.g. its own creation failed while chip
-                // RAM's still succeeded) or `alias()` in `sync` can have
-                // failed; either way `fast_alias` stays `None`, and
-                // typing pages `Ram` here regardless would violate the
-                // invariant that every `Ram` page is actually backed --
-                // the first guest access through the direct path would
-                // dereference `PROT_NONE` and crash the process instead
-                // of falling through to `MachineBus`. `sync` always
-                // remaps `fast_alias` (or clears it) *before* calling
-                // `rebuild`, so it is current here; the `base` filter is
-                // a defensive check against a stale entry, not something
-                // that should ever actually trigger given that ordering.
-                let mapped = self
-                    .fast_alias
-                    .filter(|&(base, _)| base == cfg.base)
-                    .map_or(0, |(_, len)| len);
-                let ram_end = cfg.base.saturating_add(mapped);
-                for page in page_of(cfg.base)..page_of(ram_end) {
-                    if page < PAGE_COUNT {
-                        self.pages[page] = PageType::Ram;
-                    }
-                }
-                // The remainder of the *declared* window beyond the
-                // actually-mapped RAM part -- including a sub-page tail,
-                // or (when nothing is mapped at all) the whole window --
-                // stays `Io`, matching `MachineBus`'s own clamped-window
-                // semantics.
-                let decl_end = cfg.base.saturating_add(cfg.size_bytes);
-                let io_start_page = page_of(ram_end);
-                let io_end_page = page_of(decl_end.saturating_sub(1)).saturating_add(1);
-                for page in io_start_page..io_end_page.min(PAGE_COUNT) {
-                    if self.pages[page] != PageType::Ram {
-                        self.pages[page] = PageType::Io;
-                    }
-                }
-            } else {
-                let end = cfg.base.saturating_add(cfg.size_bytes);
-                let end_page = page_of(end.saturating_sub(1).max(cfg.base)).saturating_add(1);
-                for page in page_of(cfg.base)..end_page.min(PAGE_COUNT) {
-                    self.pages[page] = PageType::Io;
-                }
-            }
-        }
+        self.pages = build_page_table(bus, self.rom_is_full_window, self.fast_alias);
     }
 
     #[inline]

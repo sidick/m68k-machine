@@ -9,8 +9,15 @@ note inline below on what it settled about this document's own
 speculation. Direct address-space mapping and the signal-fault cost
 measurement (the rest of C1) are now implemented as C1's third slice --
 see `docs/direct-mapping.md` for both (the fault cost is a **macOS**
-figure; the Linux measurement §4.6 names is still outstanding), and its
-closing section for the honest item-by-item C1 exit accounting.
+figure; the Linux measurement §4.6 names is still outstanding). The
+replay recorder and player themselves are now implemented too, as C1's
+final slice (`--record`/`--replay`, `fixed` mode only) -- see
+`docs/replay-log.md` for the log format, the seam decision this
+document's supervisor correction anticipated (record/replay support
+went *inside* `Bus`, option (a)), one trait addition it needed
+(`HookCpu::sr()`, for §5.3's register checkpoints), and the current
+item-by-item C1 exit accounting, which supersedes
+`docs/direct-mapping.md`'s.
 
 **Where:** `crates/machine-hosted/src/cpu.rs`.
 
@@ -340,8 +347,11 @@ both cycle mode and max mode's `interp` backend.
 
 ## What is deliberately not in this trait yet
 
-- No log recording or replaying -- see "How §5.3's replay log maps onto
-  the trait" above.
+- Log recording and replaying are no longer missing -- implemented as
+  C1's final slice (`docs/replay-log.md`), inside `Bus` per the
+  supervisor correction above, with one trait addition
+  (`HookCpu::sr()`). The "How §5.3's replay log maps onto the trait"
+  section above remains accurate as the design rationale.
 - Fixed-instructions-per-line deterministic mode (§5.2) is no longer
   missing -- see `docs/deterministic-mode.md`. It needed no changes to
   this trait: `run_guest_fixed` is built entirely on the same

@@ -331,13 +331,18 @@ recorded below.
 
 There are 27 `--max-frames` call sites across `crates/machine-hosted/
 tests/real_rom.rs`. Once the beam-freeze bug above was fixed, **every one
-of the 8 categories checked converged to the existing `cycle`-mode
+of the categories checked converged to the existing `cycle`-mode
 baseline at the same `--max-frames`, several to the exact documented
-reference pixel count.** Thirteen new `fixed`-mode sibling tests were
-added, all `--ignored` like their `cycle`-mode originals (except
-`aros_68k_pair_fixed_mode`, unconditional like its original since AROS
-assets are vendored in-repo) and none of the 27 existing `cycle`-mode
-tests were modified:
+reference pixel count.** This conversion happened in two slices: an
+initial 13 sibling tests covering 8 independently-tested mechanism
+categories (below, "first slice"), and a follow-up (C1's gate-conversion
+finish) covering the 4 remaining combination gates plus one AROS
+screenshot gate the first slice's sweep missed outright (below, "second
+slice"). 18 new `fixed`-mode sibling tests exist in total, all `--ignored`
+like their `cycle`-mode originals except `aros_68k_pair_fixed_mode` and
+`aros_68k_screenshot_shows_boot_screen_content_without_boot_media_fixed_mode`
+(both unconditional like their originals, since AROS assets are vendored
+in-repo). None of the 27 existing `cycle`-mode tests were modified:
 
 | Test | `--max-frames` | What was checked | Result |
 |---|---|---|---|
@@ -364,24 +369,51 @@ frame-count-sensitive"** -- which, per the bug above, they were not; they
 were bug-sensitive, and are frame-count-*insensitive* now that the bug is
 fixed.
 
-**Not yet converted, for time-budget reasons rather than any known
-issue:** `kickstart_3_2_2_a1200_workbench_renders_through_the_rtgboard_card_driver`,
-`scripted_pointer_and_double_click_work_on_the_rtgboard_rtg_screen`,
-`kickstart_3_2_2_a1200_boots_unattended_to_rtg_workbench_with_input_storage_network`,
-and `kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger_over_tcp`
-were not individually re-run under `fixed` mode or given siblings -- the
-eight categories above already cover screenshots (planar and RTG),
-scripted input, `hostblk`, `pcibridge`, virtio-net, and SANA-II, so the
-remaining four are combinations of mechanisms already independently
-confirmed, not untested mechanisms. Given the 100% hit rate across the
-eight tested, they are expected to pass at their existing `--max-frames`
-too; this is a reasonable expectation stated as such, not a claim of
-having verified it.
+**Second slice -- the previously-deferred combination gates, run and
+verified rather than left as an expectation:**
 
-**Deliberately not converted:**
-`kickstart_3_2_2_a1200_cpubench_reports_every_kernel_under_max_speed`
-hardcodes `--cpu-speed max` -- CPUBench's kernels self-calibrate against
-a real wall-clock second, which only `max` mode provides.
+| Test | `--max-frames` | What was checked | Result | Runtime |
+|---|---|---|---|---|
+| `aros_68k_screenshot_shows_boot_screen_content_without_boot_media` | 500 | AROS boot-logo screenshot, drawn content, ≥8 colours | pass -- 752x576, 14 distinct colours, 6,795 non-background pixels (unconditional CI test, run alongside `aros_68k_pair_fixed_mode`) | 3.72s |
+| `kickstart_3_2_2_a1200_romwack_break_in_reaches_the_debugger_over_tcp` | 500 | `rom-wack` banner and `XCPT: 8000002F` reached over a live `--serial-tcp` connection (a separate host->guest path from the `--serial-script` romwack sibling) | pass, unchanged | 15.37s |
+| `kickstart_3_2_2_a1200_workbench_renders_through_the_rtgboard_card_driver` | 5200 | rtgboard driver narration, 640x480 RTG screenshot of the real desktop | pass -- **31,906** non-background pixels, the exact reference figure the `cycle`-mode test's own doc comment records; final PC `0x00f8131c`, matching `cycle` mode's own idle-`STOP` PC | 15.39s |
+| `scripted_pointer_and_double_click_work_on_the_rtgboard_rtg_screen` | 5700 | scripted pointer moves + double-click on the RTG screen, three captures, `MouseX 42 MouseY 73` read-back, input queue fully drained | pass, unchanged -- final PC `0x00f8131c` | 16.43s |
+| `kickstart_3_2_2_a1200_boots_unattended_to_rtg_workbench_with_input_storage_network` | 5700 | rtgboard + virtio-net + scripted input + a guest-written `SYS:unattended-boot.txt` readback, all composed in one boot | pass, unchanged -- `UNATTENDED-BOOT-STORAGE-OK` readback confirmed, final PC `0x00f8131c` | 18.45s |
+
+All 5 pass -- the expectation the first slice recorded ("given the 100%
+hit rate across the eight tested, they are expected to pass ... this is a
+reasonable expectation stated as such, not a claim of having verified
+it") is now itself verified, not merely restated. Every one of these five
+gates reaches the same final PC (`0x00f8131c`, the idle `STOP` `cycle`
+mode also settles at) or the same marker-level evidence as its
+`cycle`-mode original, at the same `--max-frames`; no frame count moved,
+no reference pixel count moved. Combined with the first slice, **every
+category swept in `real_rom.rs` that is convertible in principle has now
+been converted and run**, 18 sibling tests total (16 `--ignored`, 2
+unconditional), covering every remaining `--max-frames` call site except
+the two below.
+
+**Deliberately not converted, confirmed by reading each test's own body
+rather than assumed:**
+
+- `kickstart_3_2_2_a1200_cpubench_reports_every_kernel_under_max_speed`
+  hardcodes `--cpu-speed max` -- CPUBench's own doc comment states cycle
+  mode budgets the guest CPU to 14.19 MHz (ADR 0006), which "would make
+  every rate this program reports meaningless, not just slow"; its eleven
+  kernels self-calibrate against a real wall-clock second, which only
+  `max` mode provides and `fixed` mode by design does not.
+- `max_cpu_speed_boots_to_workbench_and_keeps_real_time_across_wait_5`
+  asserts that a scripted `WAIT 5` gap measures `5.0s +/- 0.5s` of real
+  *wall-clock* time between two serial marks, and that self-reported
+  `busy` time stays a small minority of wall time -- both properties only
+  `max` mode's real-time pacing has; `fixed` mode has no wall-clock
+  relationship to guest time at all, by design, so neither assertion has
+  a `fixed`-mode analogue to make.
+
+No other test in `real_rom.rs` lacks a `_fixed_mode` sibling for a reason
+other than already being a `fixed`-mode-only gate itself
+(`fixed_mode_boot_is_deterministic_across_repeated_runs`,
+`fixed_mode_boot_is_identical_with_direct_map_forced_on`).
 
 ## What amending ADR 0006 would need to say (recommendation, not done here)
 
@@ -396,11 +428,16 @@ slice. If and when the owner accepts it, the amendment would need to:
    (real per-instruction cost) is not something `fixed` mode offers or
    claims to.
 2. Record that, once the per-instruction beam-tick fix above is in place,
-   frame-count parity with `cycle` mode held for every gate category
-   tested (13 of ~27), including several exact-pixel-count matches --
-   softer than "always holds," since 4 combination gates and the
-   CPUBench-style self-calibrating case were not (or, for CPUBench,
-   cannot be) verified the same way.
+   frame-count parity with `cycle` mode held for every convertible gate
+   category in `real_rom.rs` (18 `fixed`-mode siblings across two
+   conversion slices, covering every gate that can be converted; the
+   only two without siblings are `max`-mode-only by design), including
+   several exact-pixel-
+   count matches -- softer than "always holds," since the two remaining
+   gates are `max`-mode-only by design (real wall-clock pacing and
+   CPUBench's wall-clock self-calibration) and were never candidates for
+   a `fixed`-mode sibling in the first place, not gates that were tried
+   and failed.
 3. Record the default `N=424` and the measurement method above as the
    ADR's own reference figure, with a note that `N` is workload-dependent
    (the CPUBench cross-check) and this default is anchored to the boot-
