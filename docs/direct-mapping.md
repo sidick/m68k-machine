@@ -298,15 +298,19 @@ a Linux slot.
 harness needs before it can be run on a Linux box or KVM guest,
 recorded here so whoever has that host does not rediscover it:
 
-- `fault_cost.rs` has **no `cfg` gating today**: `DarwinUcontext`/
-  `DarwinMcontext64` are hand-declared local structs, so the file
-  *compiles* on Linux as-is but the `MODE_PC_ADVANCE` handler's cast
-  (`ctx as *mut DarwinUcontext`, then `ss.pc += 4`) would be
-  wrong-layout undefined behaviour there. It must not be run on Linux
-  unmodified. Gating the Darwin structs
-  `#[cfg(all(target_os = "macos", target_arch = "aarch64"))]` and
-  adding a `compile_error!` fallback for unported combinations would
-  make the trap impossible rather than merely documented.
+- **The gate this bullet recommended now exists** (2026-09-30): the
+  measurement lives in `src/bin/fault_cost/darwin_arm64.rs` behind
+  `#[cfg(all(target_os = "macos", target_arch = "aarch64"))]`, and
+  every other target builds a stub `main` that refuses to run and says
+  why. The original claim here that the file "compiles on Linux as-is"
+  was **wrong**, and CI proved it on the first push: the variant-3
+  faulting store is an AArch64 `str` via `asm!` whose `{val:w}`
+  template modifier does not exist on x86-64, so CI's Linux runner
+  failed `cargo clippy -p machine-hosted` outright. The trap the old
+  text worried about (running with wrong-layout Darwin structs on
+  Linux) is now impossible rather than documented; the port work below
+  is unchanged, and its landing spot is a sibling module behind the
+  matching Linux cfg.
 - The Linux/aarch64 port is small: unlike Apple targets, the `libc`
   crate *does* define `ucontext_t` for `linux`/`aarch64`, with an
   inline `uc_mcontext` whose `pc` field is directly assignable -- the
@@ -325,7 +329,7 @@ recorded here so whoever has that host does not rediscover it:
   so Linux delivering SIGSEGV where macOS delivers SIGBUS is
   reported, not a surprise.
 
-Harness: `crates/machine-hosted/src/bin/fault_cost.rs`; full run is
+Harness: `crates/machine-hosted/src/bin/fault_cost/` (gated as above); full run is
 `cargo build --release -p machine-hosted --bin fault_cost &&
 ./target/release/fault_cost`, strictly serial. Measured 2026-09-29:
 

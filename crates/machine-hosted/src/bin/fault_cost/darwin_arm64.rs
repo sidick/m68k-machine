@@ -704,7 +704,7 @@ enum Command {
     All,
 }
 
-fn main() {
+pub fn run() {
     let cli = Cli::parse();
 
     let inline_iters: u64 = if cli.quick { 200_000 } else { 200_000_000 };
