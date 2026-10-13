@@ -49,7 +49,7 @@ license = "MIT OR Apache-2.0"
 # `default-features = false`: the fork's default features pull in std-only
 # pieces (see the fork's Cargo.toml); this project only wants the core
 # interpreter, which works no_std + libm.
-m68k = { git = "https://github.com/sidick/m68k-rs", rev = "5d27b8c083e1e6db6c13596f96c36dcc5f347e7f", default-features = false }
+m68k = { git = "https://github.com/sidick/m68k-rs", rev = "6ab4da7b2a24e7e4fe90fd54f540678d371f371e", default-features = false }
 
 # The project owner's own crate. Was pinned by `rev` (like `m68k` above,
 # same author, same posture, different cause: there no release exists at
