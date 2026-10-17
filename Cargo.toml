@@ -64,7 +64,7 @@ m68k = { git = "https://github.com/sidick/m68k-rs", rev = "5d27b8c083e1e6db6c135
 # project was pinned to (verified: `1cf0b42` "Bump to 0.4.0" sits directly
 # on top of `9e123e0`, nothing else in between) -- back to a normal
 # crates.io dependency.
-amiga-rom = "0.4.0"
+amiga-rom = "0.5.0"
 
 # Release profile (docs/bus-fast-path-plan.md step 2). Fat LTO and one
 # codegen unit let the compiler inline `MachineBus` across the crate
