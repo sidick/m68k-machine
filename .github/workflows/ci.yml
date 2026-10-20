@@ -19,7 +19,7 @@ jobs:
     name: test (fmt, clippy, machine-core, machine-hosted)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # rust-toolchain.toml pins channel=stable plus rustfmt/clippy and the
       # two bare-metal targets; `rustup show` is enough to make rustup sync
@@ -73,7 +73,7 @@ jobs:
     name: qemu-virt (aarch64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Sync toolchain from rust-toolchain.toml
         run: rustup show
@@ -136,7 +136,7 @@ jobs:
     name: qemu-q35 (x86-64 UEFI)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Sync toolchain from rust-toolchain.toml
         run: rustup show
@@ -195,7 +195,7 @@ jobs:
     name: aros-smoke (AROS 68k ROM pair)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Sync toolchain from rust-toolchain.toml
         run: rustup show
@@ -272,7 +272,7 @@ jobs:
     name: amiga-gcc toolchain smoke test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Compile m68k/hello/hello.c in the amiga-gcc container
         run: |
